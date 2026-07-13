@@ -8,6 +8,7 @@ dependencies = [
     "accelerate>=1.10.1",
     "antlr4-python3-runtime==4.11",
     "backoff>=2.2.1",
+    "beaker-py>=2.5.7",
     "bitsandbytes>=0.44.1; platform_system != 'Darwin'",
     "datasets>=4.0.0",
     "debugpy>=1.8.13",
@@ -114,7 +115,6 @@ environments = [
 
 [dependency-groups]
 dev = [
-    "beaker-py>=2.5.7",
     "mkdocs-material>=9.6.8",
     "pytest>=8.3.4",
     "ruff>=0.11.13",

@@ -19,7 +19,11 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN="${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}"
 mkdir -p "${HOME}/.triton/autotune"
 
-head_node="$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n 1)"
+if [[ "${SLURM_JOB_NUM_NODES:-1}" -eq 1 ]]; then
+    head_node="$(hostname -s)"
+else
+    head_node="$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n 1)"
+fi
 # Prefer IPv4 from getent so workers do not need a nested srun.
 head_node_ip="$(getent ahostsv4 "${head_node}" | awk '{print $1; exit}')"
 if [[ -z "${head_node_ip}" ]]; then

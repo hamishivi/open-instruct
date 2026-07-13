@@ -16,7 +16,8 @@
 #
 # Optional overrides (export before sbatch, or edit #SBATCH above):
 #   PARTITION / ACCOUNT via: sbatch --partition=... --account=... this_script.sh
-#   EXP_NAME, RUN_NAME, WANDB_PROJECT, etc.
+#   EXP_NAME, RUN_NAME, WANDB_PROJECT, NUM_LEARNERS_PER_NODE,
+#   VLLM_NUM_ENGINES, UV_SYNC, APPTAINER_IMAGE, APPTAINER_BIND, etc.
 
 set -euo pipefail
 
@@ -29,6 +30,35 @@ DDMM=$(date +"%d%m")
 EXP_NAME="${EXP_NAME:-vip_glm52_hypers_${DDMM}_qwen3_4b_math}"
 RUN_NAME="${RUN_NAME:-${EXP_NAME}_$(date +%Y%m%d_%H%M%S)}"
 export WANDB_RUN_ID="${WANDB_RUN_ID:-${EXP_NAME}_$(date +%s)}"
+NUM_LEARNERS_PER_NODE="${NUM_LEARNERS_PER_NODE:-4}"
+VLLM_NUM_ENGINES="${VLLM_NUM_ENGINES:-4}"
+
+# Ensure Ray and the training dependencies are available inside the allocation.
+# Set UV_SYNC=0 when reusing an already-synced environment. On clusters whose
+# host glibc is too old for vLLM wheels, prepare .venv-container inside a modern
+# Apptainer image and set APPTAINER_IMAGE to run every Slurm task in that image.
+SRUN_PREFIX=()
+if [[ -n "${APPTAINER_IMAGE:-}" ]]; then
+  if [[ ! -f "${APPTAINER_IMAGE}" ]]; then
+    echo "ERROR: APPTAINER_IMAGE does not exist: ${APPTAINER_IMAGE}" >&2
+    exit 1
+  fi
+  if [[ ! -x "${REPO_ROOT}/.venv-container/bin/python" ]]; then
+    echo "ERROR: ${REPO_ROOT}/.venv-container is not prepared" >&2
+    exit 1
+  fi
+  export PATH="${REPO_ROOT}/.venv-container/bin:${PATH}"
+  SRUN_PREFIX=(apptainer exec --nv --env "PREPEND_PATH=${REPO_ROOT}/.venv-container/bin")
+  if [[ -n "${APPTAINER_BIND:-}" ]]; then
+    SRUN_PREFIX+=(--bind "${APPTAINER_BIND}")
+  fi
+  SRUN_PREFIX+=("${APPTAINER_IMAGE}")
+else
+  if [[ "${UV_SYNC:-1}" == "1" ]]; then
+    uv sync --frozen --no-dev
+  fi
+  export PATH="${REPO_ROOT}/.venv/bin:${PATH}"
+fi
 
 echo "=== VIP math glm52 hypers (Slurm) ==="
 echo "Job ID: ${SLURM_JOB_ID:-local}"
@@ -36,13 +66,14 @@ echo "Repo:   ${REPO_ROOT}"
 echo "Exp:    ${EXP_NAME}"
 echo "Run:    ${RUN_NAME}"
 echo "Nodes:  ${SLURM_JOB_NUM_NODES}  GPUs/node: ${SLURM_GPUS_ON_NODE:-${SLURM_GPUS_PER_NODE:-8}}"
+echo "Actors: learners=${NUM_LEARNERS_PER_NODE}  vLLM engines=${VLLM_NUM_ENGINES}"
 echo "===================================="
 
 # Start Ray on every allocated node (head on rank 0, workers block).
-srun --cpu-bind=none bash -c '
+srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
   source scripts/slurm/vip/ray_node_setup.sh
   if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
-    uv run python open_instruct/grpo_fast.py \
+    python open_instruct/grpo_fast.py \
       --exp_name "'"${EXP_NAME}"'" \
       --run_name "'"${RUN_NAME}"'" \
       --beta 0.0 \
@@ -71,10 +102,10 @@ srun --cpu-bind=none bash -c '
       --temperature 1.0 \
       --total_episodes 281600 \
       --deepspeed_stage 3 \
-      --num_learners_per_node 4 \
+      --num_learners_per_node "'"${NUM_LEARNERS_PER_NODE}"'" \
       --num_nodes 1 \
       --sequence_parallel_size 1 \
-      --vllm_num_engines 4 \
+      --vllm_num_engines "'"${VLLM_NUM_ENGINES}"'" \
       --vllm_tensor_parallel_size 1 \
       --vllm_top_p 1.0 \
       --lr_scheduler_type constant \

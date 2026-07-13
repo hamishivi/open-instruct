@@ -10,6 +10,7 @@ with `srun` (one task per node), then run `open_instruct/grpo_fast.py` on rank 0
 | `qwen3_4b_glm52_hypers.sh` | `scripts/train/vip/math_train_rl/qwen3_4b_glm52_hypers.sh` |
 | `dr_tulu_8b_glm52_hypers.sh` | `scripts/train/vip/dr_tulu/dr_tulu_8b_glm52_hypers.sh` |
 | `ray_node_setup.sh` | Slurm analogue of `configs/beaker_configs/ray_node_setup.sh` |
+| `setup_apptainer_env.sh` | Frozen `uv.lock` environment setup inside Apptainer |
 
 ## Quick start
 
@@ -38,3 +39,25 @@ sbatch --partition=gpu --account=myacct scripts/slurm/vip/qwen3_4b_glm52_hypers.
   value_num_epochs 2).
 - Requires `uv` + project deps installed on the compute nodes (or an env module
   that provides them).
+
+## Hyak H200 example
+
+Klone's host glibc is older than the binary requirement for vLLM 0.19.1. Build
+or pull a modern Apptainer image containing Python 3.12 and Git, then prepare the
+project environment from `uv.lock` inside that image:
+
+```bash
+export APPTAINER_IMAGE=/gscratch/h2lab/$USER/containers/vllm-openai-v0.19.1.sif
+sbatch --account=h2lab --partition=gpu-h200 --gpus-per-node=4 \
+  --export=ALL,APPTAINER_IMAGE \
+  scripts/slurm/vip/setup_apptainer_env.sh
+```
+
+For a 4-GPU math run, use two learner actors and two vLLM engines:
+
+```bash
+sbatch --account=h2lab --partition=gpu-h200 --gpus-per-node=4 \
+  --cpus-per-task=64 \
+  --export=ALL,APPTAINER_IMAGE,NUM_LEARNERS_PER_NODE=2,VLLM_NUM_ENGINES=2 \
+  scripts/slurm/vip/qwen3_4b_glm52_hypers.sh
+```
