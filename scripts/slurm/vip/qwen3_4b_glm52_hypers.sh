@@ -71,6 +71,11 @@ if [[ -n "${APPTAINER_IMAGE:-}" ]]; then
   fi
   export PATH="${CONTAINER_VENV}/bin:${PATH}"
   SRUN_PREFIX=(apptainer exec --nv --env "PREPEND_PATH=${CONTAINER_VENV}/bin")
+  # The locked PyTorch stack ships CUDA 12.8 libraries. Do not let a newer
+  # container toolkit (for example CUDA 12.9) override those wheel libraries;
+  # retain only Apptainer's host-driver bind on the global lookup path.
+  APPTAINER_LD_LIBRARY_PATH="${APPTAINER_LD_LIBRARY_PATH:-/.singularity.d/libs}"
+  SRUN_PREFIX+=(--env "LD_LIBRARY_PATH=${APPTAINER_LD_LIBRARY_PATH}")
   if [[ -n "${APPTAINER_BIND:-}" ]]; then
     SRUN_PREFIX+=(--bind "${APPTAINER_BIND}")
   fi

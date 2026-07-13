@@ -64,4 +64,6 @@ sbatch --account=h2lab --partition=gpu-h200 --gpus-per-node=4 \
 
 `APPTAINER_LOCAL_VENV=1` uses `uv sync --frozen --no-dev` to materialize the
 locked environment under the compute node's `/scr` SSD. This avoids slow Python
-imports from the many small environment files on Klone's shared filesystem.
+imports from the many small environment files on Klone's shared filesystem. The
+math launcher also keeps the locked environment's CUDA libraries ahead of the
+container toolkit, while retaining Apptainer's host NVIDIA driver bind.
