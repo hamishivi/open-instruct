@@ -17,7 +17,8 @@
 # Optional overrides (export before sbatch, or edit #SBATCH above):
 #   PARTITION / ACCOUNT via: sbatch --partition=... --account=... this_script.sh
 #   EXP_NAME, RUN_NAME, WANDB_PROJECT, NUM_LEARNERS_PER_NODE,
-#   VLLM_NUM_ENGINES, UV_SYNC, APPTAINER_IMAGE, APPTAINER_BIND, etc.
+#   VLLM_NUM_ENGINES, UV_SYNC, APPTAINER_IMAGE, APPTAINER_BIND,
+#   APPTAINER_LOCAL_VENV, etc.
 
 set -euo pipefail
 
@@ -43,14 +44,36 @@ if [[ -n "${APPTAINER_IMAGE:-}" ]]; then
     echo "ERROR: APPTAINER_IMAGE does not exist: ${APPTAINER_IMAGE}" >&2
     exit 1
   fi
-  if [[ ! -x "${REPO_ROOT}/.venv-container/bin/python" ]]; then
-    echo "ERROR: ${REPO_ROOT}/.venv-container is not prepared" >&2
+  CONTAINER_VENV="${REPO_ROOT}/.venv-container"
+  APPTAINER_LOCAL_BIND=""
+  if [[ "${APPTAINER_LOCAL_VENV:-0}" == "1" ]]; then
+    CONTAINER_VENV="${APPTAINER_LOCAL_VENV_DIR:-/scr/${USER}/open-instruct-${SLURM_JOB_ID}/.venv}"
+    APPTAINER_LOCAL_BIND="$(dirname "${CONTAINER_VENV}")"
+    mkdir -p "${APPTAINER_LOCAL_BIND}"
+    APPTAINER_SYNC_ARGS=(exec --nv)
+    if [[ -n "${APPTAINER_BIND:-}" ]]; then
+      APPTAINER_SYNC_ARGS+=(--bind "${APPTAINER_BIND}")
+    fi
+    APPTAINER_SYNC_ARGS+=(--bind "${APPTAINER_LOCAL_BIND}:${APPTAINER_LOCAL_BIND}")
+    echo "Syncing the locked uv environment to node-local storage: ${CONTAINER_VENV}"
+    apptainer "${APPTAINER_SYNC_ARGS[@]}" "${APPTAINER_IMAGE}" bash -c '
+      set -euo pipefail
+      cd "$1"
+      export UV_PROJECT_ENVIRONMENT="$2"
+      uv sync --frozen --no-dev
+    ' _ "${REPO_ROOT}" "${CONTAINER_VENV}"
+  fi
+  if [[ ! -x "${CONTAINER_VENV}/bin/python" ]]; then
+    echo "ERROR: ${CONTAINER_VENV} is not prepared" >&2
     exit 1
   fi
-  export PATH="${REPO_ROOT}/.venv-container/bin:${PATH}"
-  SRUN_PREFIX=(apptainer exec --nv --env "PREPEND_PATH=${REPO_ROOT}/.venv-container/bin")
+  export PATH="${CONTAINER_VENV}/bin:${PATH}"
+  SRUN_PREFIX=(apptainer exec --nv --env "PREPEND_PATH=${CONTAINER_VENV}/bin")
   if [[ -n "${APPTAINER_BIND:-}" ]]; then
     SRUN_PREFIX+=(--bind "${APPTAINER_BIND}")
+  fi
+  if [[ -n "${APPTAINER_LOCAL_BIND}" ]]; then
+    SRUN_PREFIX+=(--bind "${APPTAINER_LOCAL_BIND}:${APPTAINER_LOCAL_BIND}")
   fi
   SRUN_PREFIX+=("${APPTAINER_IMAGE}")
 else

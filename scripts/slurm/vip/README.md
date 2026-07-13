@@ -58,6 +58,10 @@ For a 4-GPU math run, use two learner actors and two vLLM engines:
 ```bash
 sbatch --account=h2lab --partition=gpu-h200 --gpus-per-node=4 \
   --cpus-per-task=64 \
-  --export=ALL,APPTAINER_IMAGE,NUM_LEARNERS_PER_NODE=2,VLLM_NUM_ENGINES=2 \
+  --export=ALL,APPTAINER_IMAGE,APPTAINER_LOCAL_VENV=1,NUM_LEARNERS_PER_NODE=2,VLLM_NUM_ENGINES=2 \
   scripts/slurm/vip/qwen3_4b_glm52_hypers.sh
 ```
+
+`APPTAINER_LOCAL_VENV=1` uses `uv sync --frozen --no-dev` to materialize the
+locked environment under the compute node's `/scr` SSD. This avoids slow Python
+imports from the many small environment files on Klone's shared filesystem.
