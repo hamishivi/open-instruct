@@ -100,6 +100,18 @@ class GRPOExperimentConfig(
     """the higher clip range. Sometimes we want this to be higher, see DAPO (https://arxiv.org/abs/2503.14476)"""
     truncated_importance_sampling_ratio_cap: float = 2.0
     """The maximum cap for truncated importance sampling ratio (0 means disabled)"""
+    tis_mask_lower: float = 0.0
+    """Absolute lower bound for the trust-region mask on the π_θ/π_rollout ratio.
+
+    When >0, tokens with ratio ≤ tis_mask_lower are multiplied by 0 in the pg loss.
+    Set to 0 to disable the lower side of the mask.
+    """
+    tis_mask_upper: float = 0.0
+    """Absolute upper bound for the trust-region mask on the π_θ/π_rollout ratio.
+
+    When >0, tokens with ratio ≥ tis_mask_upper are multiplied by 0 in the pg loss.
+    Set to 0 to disable the upper side of the mask.
+    """
     kl_estimator: Literal[0, 1, 2, 3] = 2
     """the KL estimator to use"""
     loss_denominator: str = "token"
@@ -162,8 +174,14 @@ class GRPOExperimentConfig(
     """If True, reset the policy optimizer's state after the value warmup window ends."""
     value_num_mini_batches: int | None = None
     """Optional separate mini-batch count for the value model's inner loop. Defaults to `num_mini_batches`."""
+    value_num_epochs: int = 1
+    """Number of training passes over the value model per RL step (independent of policy `num_epochs`)."""
     whiten_advantages: bool = False
     """If True, whiten GAE advantages across the batch before applying them."""
+    skip_tool_outputs: bool = False
+    """If True, GAE skips tool/observation tokens and bootstraps from the last action token to the
+    first token of the next action (skip-observation GAE). Requires `--use_value_model` and
+    `mask_tool_use=True` so tool-output positions have response_mask==0."""
 
     # SAE (Segmental Advantage Estimation)
     use_sae: bool = False
@@ -361,6 +379,22 @@ class GRPOExperimentConfig(
             raise ValueError("--length_adaptive_gae requires --use_value_model.")
         if self.decoupled_gae and not self.use_value_model:
             raise ValueError("--decoupled_gae requires --use_value_model.")
+        if self.skip_tool_outputs and not self.use_value_model:
+            raise ValueError("--skip_tool_outputs requires --use_value_model.")
+        if self.value_num_epochs <= 0:
+            raise ValueError(f"--value_num_epochs must be > 0, got {self.value_num_epochs}.")
+        if self.value_num_mini_batches is not None and self.value_num_mini_batches <= 0:
+            raise ValueError("`value_num_mini_batches` must be greater than 0 when set.")
+        if self.tis_mask_lower < 0.0 or self.tis_mask_upper < 0.0:
+            raise ValueError(
+                f"tis_mask_lower and tis_mask_upper must be ≥ 0 "
+                f"(got {self.tis_mask_lower=}, {self.tis_mask_upper=}). Use 0 to disable."
+            )
+        if self.tis_mask_lower > 0.0 and self.tis_mask_upper > 0.0 and self.tis_mask_lower >= self.tis_mask_upper:
+            raise ValueError(
+                "tis_mask_lower must be less than tis_mask_upper when both mask bounds are enabled, "
+                f"got {self.tis_mask_lower=} and {self.tis_mask_upper=}."
+            )
 
         # SAE validation
         if self.use_sae and not self.use_value_model:
@@ -402,6 +436,44 @@ def compute_tis_weights(
     unclamped = torch.where(response_mask, torch.exp(logprob_diff), unclamped)
     clamped = torch.clamp(unclamped, max=cap)
     return clamped, unclamped
+
+
+def combine_tis_terms(*terms: torch.Tensor | None) -> torch.Tensor | None:
+    """Multiply non-None TIS terms (clamped weights and/or binary masks) into one tensor."""
+    result: torch.Tensor | None = None
+    for term in terms:
+        if term is None:
+            continue
+        result = term if result is None else result * term
+    return result
+
+
+def compute_tis_mask(
+    new_logprobs: torch.Tensor,
+    vllm_logprobs: torch.Tensor,
+    response_mask: torch.Tensor,
+    lower_bound: float,
+    upper_bound: float,
+) -> torch.Tensor | None:
+    """Binary {0, 1} trust-region gate on the π_θ/π_rollout ratio.
+
+    Implements a two-sided absolute ratio gate: lower_bound < x < upper_bound. The ratio
+    is computed from the current trainer logprobs and the rollout (vLLM) logprobs directly.
+
+    Returns a float tensor the same shape as ``new_logprobs`` with 1.0 on in-range response
+    positions and 0.0 elsewhere, or ``None`` when both bounds are disabled. Non-response
+    positions and positions with NaN vllm logprobs are also set to 0.
+    """
+    if lower_bound <= 0.0 and upper_bound <= 0.0:
+        return None
+    with torch.no_grad():
+        logprob_diff = (new_logprobs - vllm_logprobs).clamp(-10.0, 10.0)
+        ratio = torch.exp(logprob_diff)
+        lower = lower_bound if lower_bound > 0.0 else float("-inf")
+        upper = upper_bound if upper_bound > 0.0 else float("inf")
+        valid = response_mask & ~torch.isnan(vllm_logprobs)
+        in_range = (ratio > lower) & (ratio < upper)
+        return (valid & in_range).to(new_logprobs.dtype)
 
 
 def resolve_old_logprob(

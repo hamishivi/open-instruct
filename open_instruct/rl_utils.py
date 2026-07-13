@@ -409,13 +409,26 @@ def calculate_advantages(values: np.ndarray, rewards: np.ndarray, gamma: float, 
 
 
 def calculate_advantages_packed(
-    values: np.ndarray, rewards: np.ndarray, gamma: float, lam: float, dones: np.ndarray, response_masks: np.ndarray
+    values: np.ndarray,
+    rewards: np.ndarray,
+    gamma: float,
+    lam: float,
+    dones: np.ndarray,
+    response_masks: np.ndarray,
+    skip_tool_outputs: bool = False,
 ):
     """Packed implementation of GAE. Each row is a packed sequence.
     The `dones` specifies the sequence boundaries, and the `response_masks` specifies the query boundaries.
+
+    When ``skip_tool_outputs=True``, GAE bootstraps from the last token of an action directly to the
+    first token of the next action, skipping tool/observation tokens (response_mask==0 gaps).
     """
     response_masks = response_masks.clip(0, 1)
     dones = dones.clip(0, 1)
+    if skip_tool_outputs:
+        advantages = _backward_gae(values, rewards, gamma, lam, dones, response_masks, skip_tool_outputs=True)
+        returns = advantages + values
+        return advantages, returns
     lastgaelam = 0
     advantages_reversed = []
     gen_length = values.shape[1]
@@ -425,10 +438,6 @@ def calculate_advantages_packed(
         nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
         delta = rewards[:, t] + gamma * nextvalues * nonterminal * nonquery - values[:, t]
         lastgaelam = delta + gamma * lam * lastgaelam * nonterminal * nonquery
-        # print(
-        #     f"t: {t}, rewards: {rewards[:, t]}, nextvalues: {nextvalues}, nonterminal: {nonterminal}, "
-        #     f"delta: {delta}, lastgaelam: {lastgaelam}"
-        # )
         advantages_reversed.append(lastgaelam)
     advantages = np.stack(advantages_reversed[::-1], axis=1)
     returns = advantages + values
@@ -445,6 +454,24 @@ def calculate_length_adaptive_lambda(response_length: int, alpha: float = 0.05) 
     return max(0.0, min(0.999, lam))
 
 
+def _next_response_token_indices(response_masks: np.ndarray, dones: np.ndarray) -> np.ndarray:
+    """For each position, index of the next response token in the same episode, or -1 if none.
+
+    Episode boundaries (``dones``) force a terminal bootstrap: the done token itself has next=-1,
+    while earlier tokens in the episode can still bootstrap onto the done token when it is a
+    response token.
+    """
+    batch_size, gen_length = response_masks.shape
+    next_idx = np.full((batch_size, gen_length), -1, dtype=np.int64)
+    for b in range(batch_size):
+        nxt = -1
+        for t in reversed(range(gen_length)):
+            next_idx[b, t] = -1 if dones[b, t] > 0 else nxt
+            if response_masks[b, t] > 0:
+                nxt = t
+    return next_idx
+
+
 def _backward_gae(
     values: np.ndarray,
     rewards: np.ndarray,
@@ -452,17 +479,43 @@ def _backward_gae(
     lam,  # scalar or ndarray of shape values
     dones: np.ndarray,
     response_masks: np.ndarray,
+    skip_tool_outputs: bool = False,
 ) -> np.ndarray:
     """Shared backward sweep for GAE. `lam` can be a scalar or a per-position array.
 
     Follows the VAPO/SAE convention where GAE propagates through query positions (only blocked by
     sequence boundaries via nonterminal). The delta is still zeroed at query positions since they
     carry no reward or value.
+
+    When ``skip_tool_outputs=True``, non-response tokens (query / tool outputs) get zero advantage
+    and response tokens bootstrap across those gaps to the next response token:
+    δ = r_t + γ V(a_{i+1,0}) - V(a_{i,N}), Â(a_{i,N}) = δ + γλ Â(a_{i+1,0}).
     """
     gen_length = values.shape[1]
+    lam_is_array = isinstance(lam, np.ndarray)
+
+    if skip_tool_outputs:
+        next_resp = _next_response_token_indices(response_masks, dones)
+        advantages = np.zeros_like(values, dtype=np.float64)
+        batch_idx = np.arange(values.shape[0])
+        for t in reversed(range(gen_length)):
+            nonterminal = 1.0 - dones[:, t]
+            is_response = response_masks[:, t] > 0
+            ni = next_resp[:, t]
+            nextvalues = np.zeros(values.shape[0], dtype=np.float64)
+            next_adv = np.zeros(values.shape[0], dtype=np.float64)
+            valid = ni >= 0
+            if valid.any():
+                nextvalues[valid] = values[batch_idx[valid], ni[valid]]
+                next_adv[valid] = advantages[batch_idx[valid], ni[valid]]
+            delta = rewards[:, t] + gamma * nextvalues * nonterminal - values[:, t]
+            current_lam = lam[:, t] if lam_is_array else lam
+            adv_t = delta + gamma * current_lam * next_adv * nonterminal
+            advantages[:, t] = np.where(is_response, adv_t, 0.0)
+        return advantages
+
     lastgaelam = 0.0
     advantages_reversed: list[np.ndarray] = []
-    lam_is_array = isinstance(lam, np.ndarray)
     for t in reversed(range(gen_length)):
         nonterminal = 1 - dones[:, t]
         nonquery = response_masks[:, t]
@@ -484,6 +537,7 @@ def calculate_advantages_packed_vapo(
     lam_critic: float = 1.0,
     length_adaptive: bool = False,
     length_adaptive_alpha: float = 0.05,
+    skip_tool_outputs: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Decoupled GAE (VAPO): critic uses lam_critic (typically 1.0) for unbiased MC returns,
     policy uses lam_policy (fixed or length-adaptive).
@@ -494,7 +548,9 @@ def calculate_advantages_packed_vapo(
     response_masks = response_masks.clip(0, 1)
     dones = dones.clip(0, 1)
 
-    advantages_critic = _backward_gae(values, rewards, gamma, lam_critic, dones, response_masks)
+    advantages_critic = _backward_gae(
+        values, rewards, gamma, lam_critic, dones, response_masks, skip_tool_outputs=skip_tool_outputs
+    )
     critic_returns = advantages_critic + values
 
     if length_adaptive:
@@ -509,10 +565,14 @@ def calculate_advantages_packed_vapo(
                 seq_lambda = calculate_length_adaptive_lambda(seq_resp_len, length_adaptive_alpha)
                 lam_policy_arr[b, start:end] = seq_lambda
                 start = end
-        policy_advantages = _backward_gae(values, rewards, gamma, lam_policy_arr, dones, response_masks)
+        policy_advantages = _backward_gae(
+            values, rewards, gamma, lam_policy_arr, dones, response_masks, skip_tool_outputs=skip_tool_outputs
+        )
         avg_lam = float(lam_policy_arr[response_masks > 0].mean()) if (response_masks > 0).any() else lam_policy
     else:
-        policy_advantages = _backward_gae(values, rewards, gamma, lam_policy, dones, response_masks)
+        policy_advantages = _backward_gae(
+            values, rewards, gamma, lam_policy, dones, response_masks, skip_tool_outputs=skip_tool_outputs
+        )
         avg_lam = lam_policy
 
     return policy_advantages, critic_returns, avg_lam
@@ -562,6 +622,7 @@ def calculate_advantages_packed_sae(
     response_masks: np.ndarray,
     logprobs: np.ndarray,
     sae_threshold: float = 0.2,
+    skip_tool_outputs: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Segmental Advantage Estimation (SAE).
 
@@ -572,7 +633,9 @@ def calculate_advantages_packed_sae(
     lambda_arr, _, avg_boundary_frac = _sae_lambda_array(
         values, logprobs, response_masks, sae_threshold, boundary_lam=lam
     )
-    advantages = _backward_gae(values, rewards, gamma, lambda_arr, dones, response_masks)
+    advantages = _backward_gae(
+        values, rewards, gamma, lambda_arr, dones, response_masks, skip_tool_outputs=skip_tool_outputs
+    )
     returns = advantages + values
     return advantages, returns, avg_boundary_frac
 
@@ -589,6 +652,7 @@ def calculate_advantages_packed_sae_vapo(
     lam_critic: float = 1.0,
     length_adaptive: bool = False,
     length_adaptive_alpha: float = 0.05,
+    skip_tool_outputs: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """SAE + decoupled GAE.
 
@@ -600,7 +664,9 @@ def calculate_advantages_packed_sae_vapo(
     response_masks = response_masks.clip(0, 1)
     dones = dones.clip(0, 1)
 
-    advantages_critic = _backward_gae(values, rewards, gamma, lam_critic, dones, response_masks)
+    advantages_critic = _backward_gae(
+        values, rewards, gamma, lam_critic, dones, response_masks, skip_tool_outputs=skip_tool_outputs
+    )
     critic_returns = advantages_critic + values
 
     if length_adaptive:
@@ -622,7 +688,9 @@ def calculate_advantages_packed_sae_vapo(
     lambda_arr, _, avg_boundary_frac = _sae_lambda_array(
         values, logprobs, response_masks, sae_threshold, boundary_lam=boundary_lam
     )
-    policy_advantages = _backward_gae(values, rewards, gamma, lambda_arr, dones, response_masks)
+    policy_advantages = _backward_gae(
+        values, rewards, gamma, lambda_arr, dones, response_masks, skip_tool_outputs=skip_tool_outputs
+    )
 
     return policy_advantages, critic_returns, avg_boundary_frac
 

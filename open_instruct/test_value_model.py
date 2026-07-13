@@ -24,6 +24,7 @@ import unittest
 import numpy as np
 import torch
 
+from open_instruct import grpo_utils
 from open_instruct.rl_utils import (
     PackedSequences,
     calculate_advantages_packed,
@@ -97,6 +98,52 @@ class TestGAEVariants(unittest.TestCase):
         self.assertEqual(calculate_length_adaptive_lambda(1, alpha=1.0), 0.0)
         # alpha*length = 100 -> lambda close to 1
         self.assertGreater(calculate_length_adaptive_lambda(100, alpha=1.0), 0.98)
+
+    def test_skip_tool_outputs_bootstraps_across_observation_gap(self):
+        # Prompt [0], action0 [1,2], tool [3,4], action1 [5,6] with terminal reward at t=6.
+        # Values differ so skipping the tool gap changes the bootstrap at t=2.
+        values = np.array([[0.0, 1.0, 2.0, 10.0, 10.0, 3.0, 4.0]], dtype=np.float64)
+        rewards = np.zeros((1, 7), dtype=np.float64)
+        rewards[0, 6] = 1.0
+        dones = np.zeros((1, 7), dtype=np.float64)
+        dones[0, 6] = 1.0
+        response_masks = np.array([[0, 1, 1, 0, 0, 1, 1]], dtype=np.float64)
+
+        adv_skip, _ = calculate_advantages_packed(
+            values, rewards, gamma=1.0, lam=1.0, dones=dones, response_masks=response_masks, skip_tool_outputs=True
+        )
+        adv_std, _ = calculate_advantages_packed(
+            values, rewards, gamma=1.0, lam=1.0, dones=dones, response_masks=response_masks, skip_tool_outputs=False
+        )
+
+        # Tool / prompt tokens get zero advantage when skipping.
+        np.testing.assert_allclose(adv_skip[0, [0, 3, 4]], 0.0)
+        # Last action token before the gap bootstraps to V(a_{i+1,0})=values[5]=3, not V(tool)=10.
+        # With lam=1, gamma=1 and no intermediate rewards: A[2] = (0 + 3 - 2) + A[5].
+        self.assertAlmostEqual(adv_skip[0, 2], (3.0 - 2.0) + adv_skip[0, 5], places=6)
+        # Standard GAE would bootstrap onto the tool token value instead.
+        self.assertNotAlmostEqual(adv_skip[0, 2], adv_std[0, 2], places=6)
+
+
+class TestTISMask(unittest.TestCase):
+    def test_upper_and_lower_bounds(self):
+        ratios = torch.tensor([[0.49, 0.5, 1.0, 1.99, 2.0, 3.0]])
+        new_logprobs = torch.log(ratios)
+        vllm_logprobs = torch.zeros_like(new_logprobs)
+        response_mask = torch.ones_like(new_logprobs, dtype=torch.bool)
+
+        mask = grpo_utils.compute_tis_mask(
+            new_logprobs, vllm_logprobs, response_mask, lower_bound=0.5, upper_bound=2.0
+        )
+        expected = torch.tensor([[0.0, 0.0, 1.0, 1.0, 0.0, 0.0]])
+        torch.testing.assert_close(mask, expected)
+
+    def test_disabled_returns_none(self):
+        self.assertIsNone(
+            grpo_utils.compute_tis_mask(
+                torch.zeros(1, 2), torch.zeros(1, 2), torch.ones(1, 2, dtype=torch.bool), 0.0, 0.0
+            )
+        )
 
 
 def _data_loader_available() -> bool:
@@ -201,10 +248,7 @@ class TestRubricConditioning(unittest.TestCase):
         # Empty rubrics list -> empty conditioning string.
         self.assertEqual(build_conditioning_text("rubrics", ground_truth=self._gt([])), "")
         # No rubrics field -> empty.
-        self.assertEqual(
-            build_conditioning_text("rubrics", ground_truth=json.dumps({"query": "q"})),
-            "",
-        )
+        self.assertEqual(build_conditioning_text("rubrics", ground_truth=json.dumps({"query": "q"})), "")
 
     def test_handles_invalid_json_gracefully(self):
         self.assertEqual(build_conditioning_text("rubrics", ground_truth="not json"), "")

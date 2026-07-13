@@ -748,7 +748,7 @@ class PolicyTrainerRayProcess(RayProcess):
         effective_value_mini_batches = (
             args.value_num_mini_batches if args.value_num_mini_batches is not None else args.num_mini_batches
         )
-        num_value_scheduler_steps = args.num_training_steps * args.num_epochs * effective_value_mini_batches
+        num_value_scheduler_steps = args.num_training_steps * args.value_num_epochs * effective_value_mini_batches
         warm_up_steps = int(num_value_scheduler_steps * args.warmup_ratio)
         if args.value_warmup_steps > 0:
             warm_up_steps = max(warm_up_steps, args.value_warmup_steps)
@@ -1613,6 +1613,7 @@ class PolicyTrainerRayProcess(RayProcess):
                 lam_critic=1.0,
                 length_adaptive=args.length_adaptive_gae,
                 length_adaptive_alpha=args.length_adaptive_gae_alpha,
+                skip_tool_outputs=args.skip_tool_outputs,
             )
             metrics["value/sae_boundary_frac"] = bf
             return policy_adv, critic_returns, metrics
@@ -1627,6 +1628,7 @@ class PolicyTrainerRayProcess(RayProcess):
                 response_masks=response_masks_np,
                 logprobs=logprobs_np,
                 sae_threshold=args.sae_threshold,
+                skip_tool_outputs=args.skip_tool_outputs,
             )
             metrics["value/sae_boundary_frac"] = bf
             return adv, returns, metrics
@@ -1641,6 +1643,7 @@ class PolicyTrainerRayProcess(RayProcess):
                 lam_critic=1.0,
                 length_adaptive=args.length_adaptive_gae,
                 length_adaptive_alpha=args.length_adaptive_gae_alpha,
+                skip_tool_outputs=args.skip_tool_outputs,
             )
             metrics["value/avg_lambda"] = avg_lam
             return policy_adv, critic_returns, metrics
@@ -1651,6 +1654,7 @@ class PolicyTrainerRayProcess(RayProcess):
             lam=args.gae_lambda,
             dones=dones_np,
             response_masks=response_masks_np,
+            skip_tool_outputs=args.skip_tool_outputs,
         )
         return adv, returns, metrics
 
@@ -2081,6 +2085,9 @@ class PolicyTrainerRayProcess(RayProcess):
         # Do multiple epochs of training on on-policy data (PPO-style), with a fresh random shuffle in each epoch
         with Timer("[Training Processes] Loss calculation", noop=self.rank != 0):
             loss_stats_B = grpo_utils.create_loss_stats(num_samples, device, record_entropy=self.args.record_entropy)
+            tis_mask_enabled = self.args.tis_mask_lower > 0.0 or self.args.tis_mask_upper > 0.0
+            tis_mask_kept_tokens = torch.zeros((), device=device)
+            tis_mask_total_tokens = torch.zeros((), device=device)
             for epoch_idx in range(self.args.num_epochs):
                 # Pre-compute total tokens for each accumulation group if using "token" normalization
                 # This ensures all minibatches in an accumulation group are normalized by the same total
@@ -2157,6 +2164,17 @@ class PolicyTrainerRayProcess(RayProcess):
                         response_mask_BT,
                         self.args.truncated_importance_sampling_ratio_cap,
                     )
+                    tis_mask_BT = grpo_utils.compute_tis_mask(
+                        new_logprobs_BT,
+                        vllm_logprobs_BT,
+                        response_mask_BT,
+                        self.args.tis_mask_lower,
+                        self.args.tis_mask_upper,
+                    )
+                    combined_tis_BT = grpo_utils.combine_tis_terms(tis_clamped_BT, tis_mask_BT)
+                    if tis_mask_BT is not None:
+                        tis_mask_kept_tokens += tis_mask_BT.sum()
+                        tis_mask_total_tokens += response_mask_BT.sum()
 
                     pg_losses_BT, pg_losses2_BT, pg_loss_max_BT, kl_BT = grpo_utils.compute_grpo_loss(
                         new_logprobs=new_logprobs_BT,
@@ -2164,7 +2182,7 @@ class PolicyTrainerRayProcess(RayProcess):
                         advantages=data_BT.advantages[i][:, 1:],
                         ref_logprobs=ref_logprobs_BT[i] if self.args.load_ref_policy else None,
                         config=self.args,
-                        tis_weights=tis_clamped_BT,
+                        tis_weights=combined_tis_BT,
                     )
 
                     per_token_loss_BT = pg_loss_max_BT + self.args.beta * kl_BT
@@ -2217,79 +2235,80 @@ class PolicyTrainerRayProcess(RayProcess):
                     )
                     value_losses: list[float] = []
                     value_clipfracs: list[float] = []
-                    for i in range(num_samples):
-                        ctx = value_loss_inputs[i]
-                        resp_mask = ctx["response_mask"]
-                        value_mask = ctx["value_mask"]
-                        returns = ctx["returns"]
-                        old_values = ctx["old_values"]
-                        # Re-forward with grad on the value model (with conditioning if enabled).
-                        if self.args.value_model_ground_truth_conditioning:
-                            value_source_BT = sp_value_data_BT if sp_value_data_BT is not None else data_BT
-                            gts_pack = (
-                                value_source_BT.ground_truths[i][0]
-                                if value_source_BT.ground_truths is not None
-                                else []
-                            ) or []
-                            sibs_pack = (
-                                value_source_BT.sibling_rollouts[i][0]
-                                if value_source_BT.sibling_rollouts is not None
-                                else None
+                    for _value_epoch_idx in range(self.args.value_num_epochs):
+                        for i in range(num_samples):
+                            ctx = value_loss_inputs[i]
+                            resp_mask = ctx["response_mask"]
+                            value_mask = ctx["value_mask"]
+                            returns = ctx["returns"]
+                            old_values = ctx["old_values"]
+                            # Re-forward with grad on the value model (with conditioning if enabled).
+                            if self.args.value_model_ground_truth_conditioning:
+                                value_source_BT = sp_value_data_BT if sp_value_data_BT is not None else data_BT
+                                gts_pack = (
+                                    value_source_BT.ground_truths[i][0]
+                                    if value_source_BT.ground_truths is not None
+                                    else []
+                                ) or []
+                                sibs_pack = (
+                                    value_source_BT.sibling_rollouts[i][0]
+                                    if value_source_BT.sibling_rollouts is not None
+                                    else None
+                                )
+                                hints_pack = value_source_BT.hints[i][0] if value_source_BT.hints is not None else None
+                                dummy_grad_outputs: list = []
+                                new_values = self._forward_value_with_conditioning(
+                                    value_source_BT.query_responses[i],
+                                    value_source_BT.position_ids[i],
+                                    value_source_BT.response_masks[i].bool(),
+                                    gts_pack,
+                                    sibs_pack,
+                                    hints_for_pack=hints_pack,
+                                    sequential=True,
+                                    dummy_grad_outputs=dummy_grad_outputs,
+                                    original_batch_seq_lens=[t.shape[-1] for t in value_source_BT.query_responses],
+                                )
+                            else:
+                                dummy_grad_outputs = []
+                                new_values = self.forward_value(
+                                    data_BT.query_responses[i], data_BT.position_ids[i], resp_mask
+                                )
+                            new_values = self._align_value_predictions(new_values, returns.shape, "value loss forward")
+                            assert new_values.shape == returns.shape == old_values.shape, (
+                                f"value loss tensors must align: new={new_values.shape}, "
+                                f"returns={returns.shape}, old={old_values.shape}"
                             )
-                            hints_pack = value_source_BT.hints[i][0] if value_source_BT.hints is not None else None
-                            dummy_grad_outputs: list = []
-                            new_values = self._forward_value_with_conditioning(
-                                value_source_BT.query_responses[i],
-                                value_source_BT.position_ids[i],
-                                value_source_BT.response_masks[i].bool(),
-                                gts_pack,
-                                sibs_pack,
-                                hints_for_pack=hints_pack,
-                                sequential=True,
-                                dummy_grad_outputs=dummy_grad_outputs,
-                                original_batch_seq_lens=[t.shape[-1] for t in value_source_BT.query_responses],
+                            per_tok, v_clipfrac = value_model_utils.value_clipped_mse_loss(
+                                new_values, returns, old_values, value_mask, self.args.vf_clip_range
                             )
-                        else:
-                            dummy_grad_outputs = []
-                            new_values = self.forward_value(
-                                data_BT.query_responses[i], data_BT.position_ids[i], resp_mask
-                            )
-                        new_values = self._align_value_predictions(new_values, returns.shape, "value loss forward")
-                        assert new_values.shape == returns.shape == old_values.shape, (
-                            f"value loss tensors must align: new={new_values.shape}, "
-                            f"returns={returns.shape}, old={old_values.shape}"
-                        )
-                        per_tok, v_clipfrac = value_model_utils.value_clipped_mse_loss(
-                            new_values, returns, old_values, value_mask, self.args.vf_clip_range
-                        )
-                        denom = value_mask.sum().clamp(min=1).float()
-                        v_loss = (per_tok.sum() / denom) * self.args.value_loss_coef
-                        v_loss = v_loss * (self.args.world_size // self.args.sequence_parallel_size)
-                        # Fold dummy outputs into v_loss with zero weight so that backward
-                        # traverses the same number of ZeRO-3 allgather layers on all DP ranks.
-                        # Ranks with fewer real sub-sequences ran dummy forwards; without this,
-                        # their backward would have fewer allgathers than ranks with more subs.
-                        v_loss = v_loss.reshape(-1).sum()
-                        # Fold dummy_grad_outputs in first so the SP path (which routes real
-                        # forwards into dummy_grad_outputs even when new_values has no grad)
-                        # makes v_loss require_grad without triggering an extra dummy forward
-                        # on only a subset of DP ranks.
-                        if dummy_grad_outputs:
-                            v_loss = v_loss + sum(0.0 * d.reshape(-1).sum() for d in dummy_grad_outputs)
-                        if not v_loss.requires_grad:
-                            self._dummy_value_forward(
-                                data_BT.query_responses[i].dtype, device, dummy_grad_outputs=dummy_grad_outputs
-                            )
-                            v_loss = v_loss + sum(0.0 * d.reshape(-1).sum() for d in dummy_grad_outputs)
-                        v_loss = v_loss.reshape(-1).sum()
-                        is_value_boundary = (i + 1) % value_accum_steps == 0 or (i + 1) == num_samples
-                        self.value_model.set_gradient_accumulation_boundary(is_value_boundary)
-                        self.value_model.backward(v_loss)
-                        if is_value_boundary:
-                            torch.cuda.empty_cache()
-                            self.value_model.step()
-                        value_losses.append(float(v_loss.detach()))
-                        value_clipfracs.append(float(v_clipfrac.detach()))
+                            denom = value_mask.sum().clamp(min=1).float()
+                            v_loss = (per_tok.sum() / denom) * self.args.value_loss_coef
+                            v_loss = v_loss * (self.args.world_size // self.args.sequence_parallel_size)
+                            # Fold dummy outputs into v_loss with zero weight so that backward
+                            # traverses the same number of ZeRO-3 allgather layers on all DP ranks.
+                            # Ranks with fewer real sub-sequences ran dummy forwards; without this,
+                            # their backward would have fewer allgathers than ranks with more subs.
+                            v_loss = v_loss.reshape(-1).sum()
+                            # Fold dummy_grad_outputs in first so the SP path (which routes real
+                            # forwards into dummy_grad_outputs even when new_values has no grad)
+                            # makes v_loss require_grad without triggering an extra dummy forward
+                            # on only a subset of DP ranks.
+                            if dummy_grad_outputs:
+                                v_loss = v_loss + sum(0.0 * d.reshape(-1).sum() for d in dummy_grad_outputs)
+                            if not v_loss.requires_grad:
+                                self._dummy_value_forward(
+                                    data_BT.query_responses[i].dtype, device, dummy_grad_outputs=dummy_grad_outputs
+                                )
+                                v_loss = v_loss + sum(0.0 * d.reshape(-1).sum() for d in dummy_grad_outputs)
+                            v_loss = v_loss.reshape(-1).sum()
+                            is_value_boundary = (i + 1) % value_accum_steps == 0 or (i + 1) == num_samples
+                            self.value_model.set_gradient_accumulation_boundary(is_value_boundary)
+                            self.value_model.backward(v_loss)
+                            if is_value_boundary:
+                                torch.cuda.empty_cache()
+                                self.value_model.step()
+                            value_losses.append(float(v_loss.detach()))
+                            value_clipfracs.append(float(v_clipfrac.detach()))
 
                 if value_losses:
                     self.local_metrics["loss/value_avg"] = sum(value_losses) / len(value_losses)
@@ -2298,6 +2317,11 @@ class PolicyTrainerRayProcess(RayProcess):
                         gn = float(self.value_model.get_global_grad_norm())
                         if math.isfinite(gn):
                             self.local_metrics["value/grad_norm"] = gn
+            if tis_mask_enabled:
+                frac_kept = (
+                    tis_mask_kept_tokens / tis_mask_total_tokens if tis_mask_total_tokens > 0 else torch.zeros(())
+                )
+                self.local_metrics["debug/tis_mask_frac_kept"] = float(frac_kept)
             for k, v in sae_step_metrics.items():
                 self.local_metrics[k] = v
 
@@ -2629,6 +2653,10 @@ def setup_runtime_variables(
     if tools_config.enabled and (args.use_vllm_logprobs or args.truncated_importance_sampling_ratio_cap > 0.0):
         assert streaming_config.mask_tool_use, (
             "Must mask tool use when using vLLM logprobs or truncated importance sampling."
+        )
+    if args.skip_tool_outputs:
+        assert streaming_config.mask_tool_use, (
+            "--skip_tool_outputs requires mask_tool_use=True so tool-output tokens have response_mask==0."
         )
     if args.eval_pass_at_k < 1:
         raise ValueError(f"eval_pass_at_k must be >= 1, got {args.eval_pass_at_k}.")
@@ -3143,9 +3171,7 @@ def weight_sync_thread(
                 # In-flight updates only skip draining active requests before the update.
                 engine_update_refs = [ref for refs in weight_broadcast_results for ref in refs]
                 if engine_update_refs:
-                    logger.info(
-                        f"[Weight Sync Thread] Waiting for {len(engine_update_refs)} vLLM engine update RPCs"
-                    )
+                    logger.info(f"[Weight Sync Thread] Waiting for {len(engine_update_refs)} vLLM engine update RPCs")
                     ray_get_with_progress(
                         engine_update_refs,
                         desc="[Weight Sync Thread] Waiting for vLLM engine update RPCs",
