@@ -45,6 +45,7 @@ uv run python mason.py \
     --advantage_normalization_type centered \
     --active_sampling \
     --num_samples_per_prompt_rollout 1 \
+    --filter_zero_std_samples False \
     --num_unique_prompts_rollout 256 \
     --num_mini_batches 1 \
     --learning_rate 1e-6 \
