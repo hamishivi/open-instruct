@@ -35,6 +35,10 @@ export WANDB_RUN_ID="${WANDB_RUN_ID:-${EXP_NAME}_$(date +%s)}"
 # weight-transfer engine. The fallback is safe here because serialization stays
 # within this trusted, single-user Slurm allocation.
 export VLLM_ALLOW_INSECURE_SERIALIZATION="${VLLM_ALLOW_INSECURE_SERIALIZATION:-1}"
+# Hyak's default proxy bypass list includes localhost but not its numeric
+# loopback address. vLLM's internal OpenAI client uses 127.0.0.1 explicitly.
+export no_proxy="127.0.0.1,localhost${no_proxy:+,${no_proxy}}"
+export NO_PROXY="${no_proxy}"
 NUM_LEARNERS_PER_NODE="${NUM_LEARNERS_PER_NODE:-4}"
 VLLM_NUM_ENGINES="${VLLM_NUM_ENGINES:-4}"
 WANDB_ENTITY_NAME="${WANDB_ENTITY:-hamishivi}"
