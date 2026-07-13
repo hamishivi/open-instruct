@@ -33,6 +33,8 @@ RUN_NAME="${RUN_NAME:-${EXP_NAME}_$(date +%Y%m%d_%H%M%S)}"
 export WANDB_RUN_ID="${WANDB_RUN_ID:-${EXP_NAME}_$(date +%s)}"
 NUM_LEARNERS_PER_NODE="${NUM_LEARNERS_PER_NODE:-4}"
 VLLM_NUM_ENGINES="${VLLM_NUM_ENGINES:-4}"
+WANDB_ENTITY_NAME="${WANDB_ENTITY:-hamishivi}"
+WANDB_PROJECT_NAME="${WANDB_PROJECT:-VIP}"
 
 # Ensure Ray and the training dependencies are available inside the allocation.
 # Set UV_SYNC=0 when reusing an already-synced environment. On clusters whose
@@ -139,6 +141,8 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
       --save_freq 100 \
       --gradient_checkpointing \
       --with_tracking \
+      --wandb_entity "'"${WANDB_ENTITY_NAME}"'" \
+      --wandb_project "'"${WANDB_PROJECT_NAME}"'" \
       --push_to_hub False \
       --use_value_model \
       --value_learning_rate 2e-6 \

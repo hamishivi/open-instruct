@@ -17,6 +17,8 @@
 DDMM=$(date +"%d%m")
 exp_name=vip_glm52_hypers_${DDMM}_qwen3_4b_math
 BEAKER_IMAGE="${1:-${BEAKER_USER}/open-instruct-integration-test}"
+WANDB_ENTITY_NAME="${WANDB_ENTITY:-hamishivi}"
+WANDB_PROJECT_NAME="${WANDB_PROJECT:-VIP}"
 
 uv run python mason.py \
     --cluster ai2/jupiter \
@@ -73,6 +75,8 @@ uv run python mason.py \
     --save_freq 100 \
     --gradient_checkpointing \
     --with_tracking \
+    --wandb_entity "${WANDB_ENTITY_NAME}" \
+    --wandb_project "${WANDB_PROJECT_NAME}" \
     --push_to_hub False \
     --use_value_model \
     --value_learning_rate 2e-6 \
