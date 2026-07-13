@@ -43,7 +43,6 @@ uv run python mason.py \
     --tis_mask_lower 0.8 \
     --tis_mask_upper 3.0 \
     --advantage_normalization_type centered \
-    --active_sampling \
     --num_samples_per_prompt_rollout 1 \
     --filter_zero_std_samples False \
     --num_unique_prompts_rollout 256 \
