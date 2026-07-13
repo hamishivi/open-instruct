@@ -18,7 +18,7 @@
 #   PARTITION / ACCOUNT via: sbatch --partition=... --account=... this_script.sh
 #   EXP_NAME, RUN_NAME, WANDB_PROJECT, NUM_LEARNERS_PER_NODE,
 #   VLLM_NUM_ENGINES, UV_SYNC, APPTAINER_IMAGE, APPTAINER_BIND,
-#   APPTAINER_LOCAL_VENV, etc.
+#   APPTAINER_LOCAL_VENV, VLLM_ALLOW_INSECURE_SERIALIZATION, etc.
 
 set -euo pipefail
 
@@ -31,6 +31,10 @@ DDMM=$(date +"%d%m")
 EXP_NAME="${EXP_NAME:-vip_glm52_hypers_${DDMM}_qwen3_4b_math}"
 RUN_NAME="${RUN_NAME:-${EXP_NAME}_$(date +%Y%m%d_%H%M%S)}"
 export WANDB_RUN_ID="${WANDB_RUN_ID:-${EXP_NAME}_$(date +%s)}"
+# vLLM 0.19's fast serializer cannot encode torch.dtype objects emitted by the
+# weight-transfer engine. The fallback is safe here because serialization stays
+# within this trusted, single-user Slurm allocation.
+export VLLM_ALLOW_INSECURE_SERIALIZATION="${VLLM_ALLOW_INSECURE_SERIALIZATION:-1}"
 NUM_LEARNERS_PER_NODE="${NUM_LEARNERS_PER_NODE:-4}"
 VLLM_NUM_ENGINES="${VLLM_NUM_ENGINES:-4}"
 WANDB_ENTITY_NAME="${WANDB_ENTITY:-hamishivi}"
