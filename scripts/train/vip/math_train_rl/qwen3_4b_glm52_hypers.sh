@@ -47,7 +47,7 @@ uv run python mason.py \
     --advantage_normalization_type centered \
     --num_samples_per_prompt_rollout 1 \
     --filter_zero_std_samples False \
-    --num_unique_prompts_rollout 256 \
+    --num_unique_prompts_rollout 128 \
     --num_mini_batches 1 \
     --learning_rate 1e-6 \
     --per_device_train_batch_size 1 \
@@ -79,7 +79,7 @@ uv run python mason.py \
     --wandb_project "${WANDB_PROJECT_NAME}" \
     --push_to_hub False \
     --use_value_model \
-    --value_learning_rate 2e-6 \
+    --value_learning_rate 5e-6 \
     --value_num_epochs 2 \
     --gae_lambda 0.95 \
     --decoupled_gae \
