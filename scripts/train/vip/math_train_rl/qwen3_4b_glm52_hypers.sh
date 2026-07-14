@@ -84,6 +84,7 @@ uv run python mason.py \
     --gae_lambda 0.95 \
     --decoupled_gae \
     --length_adaptive_gae \
+    --length_adaptive_gae_alpha 1.5 \
     --skip_tool_outputs \
     --gamma 1.0 \
     --value_loss_coef 0.5 \
