@@ -899,6 +899,7 @@ class PolicyTrainerRayProcess(RayProcess):
         response_mask: torch.Tensor,
         ground_truths_pack: list[str],
         response_logprobs_full: "torch.Tensor | None" = None,
+        siblings_pack: list[list[dict]] | None = None,
     ) -> dict[str, Any]:
         """Build all gen-value prompts and scatter metadata for one packed rollout.
 
@@ -968,6 +969,7 @@ class PolicyTrainerRayProcess(RayProcess):
             )
 
             gt_str = ground_truths_pack[s_idx] if s_idx < len(ground_truths_pack) else ""
+            siblings = siblings_pack[s_idx] if siblings_pack is not None and s_idx < len(siblings_pack) else None
 
             scores_start = len(prompts)
             for bdry in boundaries:
@@ -976,6 +978,7 @@ class PolicyTrainerRayProcess(RayProcess):
                     partial_response=partial_text,
                     conditioning=conditioning,
                     ground_truth=gt_str if conditioning != "none" else "",
+                    siblings=siblings,
                     score_min=score_min,
                     score_max=score_max,
                     problem=problem_text,
@@ -1114,6 +1117,7 @@ class PolicyTrainerRayProcess(RayProcess):
         response_mask: torch.Tensor,
         ground_truths_pack: list[str],
         response_logprobs_full: "torch.Tensor | None" = None,
+        siblings_pack: list[list[dict]] | None = None,
     ) -> tuple[torch.Tensor, list[dict]]:
         """Score one packed rollout with the gen-value vLLM pool.
 
@@ -1126,6 +1130,7 @@ class PolicyTrainerRayProcess(RayProcess):
             response_mask,
             ground_truths_pack,
             response_logprobs_full=response_logprobs_full,
+            siblings_pack=siblings_pack,
         )
         return self._score_gen_value_requests([request])[0]
 
@@ -1824,6 +1829,9 @@ class PolicyTrainerRayProcess(RayProcess):
                     gen_value_requests: list[dict[str, Any]] = []
                     for i in range(num_samples):
                         gts_pack = (data_BT.ground_truths[i][0] if data_BT.ground_truths is not None else []) or []
+                        siblings_pack = (
+                            data_BT.sibling_rollouts[i][0] if data_BT.sibling_rollouts is not None else None
+                        )
                         gv_logprobs_full = None
                         if (
                             getattr(self.args, "gen_value_segmentation", "fixed") == "sae"
@@ -1838,6 +1846,7 @@ class PolicyTrainerRayProcess(RayProcess):
                                 data_BT.response_masks[i],
                                 list(gts_pack),
                                 response_logprobs_full=gv_logprobs_full,
+                                siblings_pack=siblings_pack,
                             )
                         )
                     sae_step_metrics["gen_value/num_segment_prompts"] = float(
@@ -2032,9 +2041,11 @@ class PolicyTrainerRayProcess(RayProcess):
             # the previous code called .put_nowait.remote(...) which raised
             # AttributeError and was silently swallowed, so training pairs were
             # being dropped on the floor and the REINFORCE thread never learned.
-            if _gen_value_training_pairs and self._gen_value_training_queue is not None:
+            if _use_gen_value and self._gen_value_training_queue is not None:
                 try:
-                    self._gen_value_training_queue.put_nowait(_gen_value_training_pairs)
+                    self._gen_value_training_queue.put_nowait(
+                        {"policy_step": training_step, "producer_rank": self.rank, "pairs": _gen_value_training_pairs}
+                    )
                 except Full:
                     logger.warning(
                         "[GenValue] training-pair queue is full; dropping %d pairs. "
@@ -2696,6 +2707,7 @@ def setup_runtime_variables(
     streaming_config.value_model_ground_truth_conditioning = args.value_model_ground_truth_conditioning
     streaming_config.gt_conditioning_template = args.gt_conditioning_template
     streaming_config.rollout_context_num_siblings = args.rollout_context_num_siblings
+    streaming_config.gen_value_conditioning = getattr(args, "gen_value_conditioning", "none")
     return args
 
 
@@ -3225,6 +3237,7 @@ def one_training_step(
     chat_template_name: str,
     model_dims: utils.ModelDims,
     actor_manager: ActorManager | None = None,
+    model_save_callback=None,
 ) -> int:
     """Train the model for one step. Returns the number of tokens processed."""
     update_ref_policy_future = []
@@ -3248,7 +3261,15 @@ def one_training_step(
             )
             ray_get_with_progress(update_ref_policy_future, desc=f"Updating reference policy at step {training_step}")
 
-    save_time = maybe_save_checkpoint(args, training_step, policy_group, chat_template_name, tokenizer, wandb_url)
+    save_time = maybe_save_checkpoint(
+        args,
+        training_step,
+        policy_group,
+        chat_template_name,
+        tokenizer,
+        wandb_url,
+        model_save_callback=model_save_callback,
+    )
 
     ray.get(actor_manager.report_training_step_time.remote(train_timer.duration))
 
@@ -3351,6 +3372,7 @@ def maybe_save_checkpoint(
     chat_template_name: str,
     tokenizer: PreTrainedTokenizer,
     wandb_url: str,
+    model_save_callback=None,
 ) -> float:
     save_time = 0
     if args.save_freq > 0 and (
@@ -3367,6 +3389,8 @@ def maybe_save_checkpoint(
                 ],
                 desc=f"Saving model at step {training_step}",
             )
+            if model_save_callback is not None:
+                model_save_callback(step_dir, training_step)
             if args.try_launch_beaker_eval_jobs_on_weka and is_beaker_job():
                 leaderboard_name = f"{args.hf_repo_revision}_step_{training_step}"
                 for i in range(args.world_size):
@@ -3634,6 +3658,8 @@ def run_training(
     data_prep_actor,
     checkpoint_state=None,
     base_env_config: EnvConfig | None = None,
+    checkpoint_callback=None,
+    model_save_callback=None,
 ):
     if base_env_config is None:
         base_env_config = EnvConfig()
@@ -3810,6 +3836,7 @@ def run_training(
             tc.chat_template_name,
             model_dims,
             actor_manager,
+            model_save_callback=model_save_callback,
         )
         num_total_tokens += num_step_tokens
 
@@ -3835,6 +3862,9 @@ def run_training(
                 # Save DataPreparationActor state
                 data_prep_actor = ray.get_actor(data_loader_lib.DATA_PREP_ACTOR_NAME)
                 client_state["data_prep_actor_state"] = ray.get(data_prep_actor.get_state.remote())
+
+                if checkpoint_callback is not None:
+                    client_state.update(checkpoint_callback(args.checkpoint_state_dir, training_step))
 
                 ray_get_with_progress(
                     [
@@ -3880,6 +3910,8 @@ def run_training(
         raise ValueError(f"Training didn't run since {resume_training_step=} > {args.num_training_steps=}")
 
     save_final_model(args, policy_group, tokenizer, training_step, wandb_url, tc.chat_template_name)
+    if model_save_callback is not None:
+        model_save_callback(args.output_dir, training_step)
 
 
 def _discover_tools_from_datasets(dataset_mixer_list: list[str], dataset_mixer_list_splits: list[str]) -> set[str]:

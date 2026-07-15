@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import logging
 import os
+import pathlib
 import queue as queue_lib
 import random
 import threading
@@ -82,7 +83,7 @@ logger = logging.getLogger(__name__)
 _GEN_VALUE_SAMPLE_SIZE = 4  # prompts sampled per step for background scoring
 
 
-@ray.remote(num_gpus=1)
+@ray.remote(num_gpus=1, num_cpus=1)
 class GenValueTrainerActor:
     """Ray actor that holds the gen-value model (PyTorch) and performs REINFORCE updates.
 
@@ -109,13 +110,20 @@ class GenValueTrainerActor:
         score_max: float,
         tensor_parallel_size: int = 1,
         max_prompt_tokens: int = 8192,
+        reinforce_coef: float = 0.1,
+        expected_producers: int = 1,
+        checkpoint_file: str | None = None,
     ) -> None:
         self._lr = learning_rate
         self._score_min = score_min
         self._score_max = score_max
         self._tp_size = tensor_parallel_size
         self._max_prompt_tokens = max_prompt_tokens
+        self._reinforce_coef = reinforce_coef
+        self._expected_producers = expected_producers
         self._step_count = 0
+        self._trained_producers_by_policy_step: dict[int, set[int]] = {}
+        self._latest_trained_policy_step = 0
 
         self._model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16).cuda()
         self._model.config.use_cache = False
@@ -126,6 +134,8 @@ class GenValueTrainerActor:
         if self._tokenizer.pad_token_id is None:
             self._tokenizer.pad_token_id = self._tokenizer.eos_token_id
         self._optimizer = torch.optim.AdamW(self._model.parameters(), lr=learning_rate)
+        if checkpoint_file is not None:
+            self._load_checkpoint(checkpoint_file)
 
         self._vllm_engines: list | None = None
         self._model_update_group: Any | None = None
@@ -136,7 +146,57 @@ class GenValueTrainerActor:
             return None
         return value_model_utils.rescale_gen_value_score(raw, self._score_min, self._score_max)
 
-    def reinforce_step(self, training_pairs: list[dict]) -> dict:
+    def _load_checkpoint(self, checkpoint_file: str) -> None:
+        state = torch.load(checkpoint_file, map_location="cpu", weights_only=False)
+        self._model.load_state_dict(state["model"])
+        self._optimizer.load_state_dict(state["optimizer"])
+        self._step_count = int(state.get("reinforce_steps", 0))
+        self._latest_trained_policy_step = int(state.get("latest_trained_policy_step", 0))
+        logger.info(
+            "[GenValue] Restored trainer checkpoint %s at policy step %d (%d REINFORCE updates).",
+            checkpoint_file,
+            self._latest_trained_policy_step,
+            self._step_count,
+        )
+
+    def save_checkpoint(self, checkpoint_state_dir: str, policy_step: int) -> dict[str, Any]:
+        checkpoint_dir = pathlib.Path(checkpoint_state_dir) / "gen_value_model"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"trainer_step_{policy_step}.pt"
+        checkpoint_file = checkpoint_dir / filename
+        temporary_file = checkpoint_file.with_suffix(".tmp")
+        state = {
+            "model": {name: tensor.detach().cpu() for name, tensor in self._model.state_dict().items()},
+            "optimizer": self._optimizer.state_dict(),
+            "reinforce_steps": self._step_count,
+            "latest_trained_policy_step": self._latest_trained_policy_step,
+        }
+        torch.save(state, temporary_file)
+        os.replace(temporary_file, checkpoint_file)
+        return {
+            "gen_value_trainer_saved": True,
+            "gen_value_trainer_checkpoint": str(checkpoint_file.relative_to(checkpoint_state_dir)),
+            "gen_value_latest_trained_policy_step": self._latest_trained_policy_step,
+        }
+
+    def save_model(self, output_dir: str) -> None:
+        gen_value_output_dir = pathlib.Path(output_dir) / "gen_value_model"
+        gen_value_output_dir.mkdir(parents=True, exist_ok=True)
+        self._model.save_pretrained(gen_value_output_dir, safe_serialization=True)
+        self._tokenizer.save_pretrained(gen_value_output_dir)
+
+    def _mark_policy_batch_trained(self, policy_step: int | None, producer_rank: int | None) -> None:
+        if policy_step is None or producer_rank is None:
+            return
+        producers = self._trained_producers_by_policy_step.setdefault(int(policy_step), set())
+        producers.add(int(producer_rank))
+        if len(producers) >= self._expected_producers:
+            self._latest_trained_policy_step = max(self._latest_trained_policy_step, int(policy_step))
+            self._trained_producers_by_policy_step.pop(int(policy_step), None)
+
+    def reinforce_step(
+        self, training_pairs: list[dict], policy_step: int | None = None, producer_rank: int | None = None
+    ) -> dict:
         """Apply one REINFORCE gradient step with the MSE-shaped critic reward.
 
         For each pair we compute ``R_v = 1 - (r - v_hat)^2``, with both ``r`` and
@@ -145,7 +205,11 @@ class GenValueTrainerActor:
         critic still receives a consistent gradient signal on malformed outputs.
         """
         if not training_pairs:
-            return {}
+            self._mark_policy_batch_trained(policy_step, producer_rank)
+            return {
+                "gen_value/reinforce_steps": self._step_count,
+                "gen_value/latest_trained_policy_step": self._latest_trained_policy_step,
+            }
 
         self._optimizer.zero_grad()
         total_loss = 0.0
@@ -159,8 +223,14 @@ class GenValueTrainerActor:
         for pair in training_pairs:
             if pair["outcome"] is None:
                 continue
+            prompt_ids = self._tokenizer(pair["prompt"], add_special_tokens=False).input_ids
+            generated_ids = self._tokenizer(pair["generated"], add_special_tokens=False).input_ids
+            if not generated_ids:
+                skipped_empty_generation += 1
+                continue
+            if len(prompt_ids) > self._max_prompt_tokens:
+                prompt_ids = prompt_ids[-self._max_prompt_tokens :]
             outcome = max(0.0, min(1.0, float(pair["outcome"])))
-            prompt = pair["prompt"]
             generated = pair["generated"]
 
             v_hat = self._score_from_text(generated)
@@ -174,14 +244,6 @@ class GenValueTrainerActor:
             squared_error = (outcome - effective_v_hat) ** 2
             reward = 1.0 - squared_error
 
-            prompt_ids = self._tokenizer(prompt, add_special_tokens=False).input_ids
-            generated_ids = self._tokenizer(generated, add_special_tokens=False).input_ids
-            if not generated_ids:
-                skipped_empty_generation += 1
-                continue
-            if len(prompt_ids) > self._max_prompt_tokens:
-                prompt_ids = prompt_ids[-self._max_prompt_tokens :]
-
             input_ids = torch.tensor([prompt_ids + generated_ids], dtype=torch.long, device="cuda")
             attention_mask = torch.ones_like(input_ids)
             target_ids = input_ids[:, -len(generated_ids) :]
@@ -189,15 +251,11 @@ class GenValueTrainerActor:
             # Only materialize logits needed to score the generated answer tokens.
             # Full-sequence logits for 8k-token prompts can allocate several extra GiB.
             outputs = self._model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                logits_to_keep=len(generated_ids) + 1,
+                input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=len(generated_ids) + 1
             )
             logits = outputs.logits[:, :-1, :]
             lm_loss = torch.nn.functional.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]).float(),
-                target_ids.reshape(-1),
-                reduction="mean",
+                logits.reshape(-1, logits.shape[-1]).float(), target_ids.reshape(-1), reduction="mean"
             )
             log_prob = -lm_loss  # mean log-prob of generated tokens
 
@@ -209,19 +267,30 @@ class GenValueTrainerActor:
             mses.append(squared_error)
 
         if not rewards:
-            return {}
+            self._mark_policy_batch_trained(policy_step, producer_rank)
+            return {
+                "gen_value/reinforce_steps": self._step_count,
+                "gen_value/latest_trained_policy_step": self._latest_trained_policy_step,
+            }
 
+        gradient_scale = self._reinforce_coef / len(rewards)
+        for parameter in self._model.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(gradient_scale)
+        total_loss *= gradient_scale
         torch.nn.utils.clip_grad_norm_(self._model.parameters(), 1.0)
         self._optimizer.step()
         self._step_count += 1
+        self._mark_policy_batch_trained(policy_step, producer_rank)
 
         metrics = {
-            "gen_value/reinforce_loss": total_loss / len(rewards),
+            "gen_value/reinforce_loss": total_loss,
             "gen_value/reward_mean": sum(rewards) / len(rewards),
             "gen_value/outcome_mean": sum(outcomes) / len(outcomes),
             "gen_value/mse": sum(mses) / len(mses),
             "gen_value/parse_rate": parsed_count / len(rewards),
             "gen_value/reinforce_steps": self._step_count,
+            "gen_value/latest_trained_policy_step": self._latest_trained_policy_step,
         }
         if skipped_empty_generation:
             metrics["gen_value/skipped_empty_generation"] = skipped_empty_generation
@@ -246,14 +315,8 @@ class GenValueTrainerActor:
         master_address = ray._private.services.get_node_ip_address().strip("[]")
         master_port = utils.find_free_port()
         world_size = len(vllm_engines) * self._tp_size + 1
-        master_info = {
-            "master_address": master_address,
-            "master_port": master_port,
-            "world_size": world_size,
-        }
-        init_infos = [
-            master_info | {"rank_offset": i * self._tp_size + 1} for i, _ in enumerate(vllm_engines)
-        ]
+        master_info = {"master_address": master_address, "master_port": master_port, "world_size": world_size}
+        init_infos = [master_info | {"rank_offset": i * self._tp_size + 1} for i, _ in enumerate(vllm_engines)]
 
         # Submit the vLLM-side init RPCs first (async) so the NCCL handshake can
         # proceed on both sides in parallel, then wait.
@@ -263,27 +326,34 @@ class GenValueTrainerActor:
         ]
         torch.cuda.set_device(0)
         self._model_update_group = NCCLWeightTransferEngine.trainer_init(master_info)
-        utils.ray_get_with_progress(
-            refs, desc="Initializing gen-value vLLM weight transfer engines", timeout=600
-        )
+        utils.ray_get_with_progress(refs, desc="Initializing gen-value vLLM weight transfer engines", timeout=600)
 
-    def broadcast_to_vllm(self, model_step: int) -> list:
+    def broadcast_to_vllm(self, model_step: int) -> dict[str, Any]:
         """Push current PyTorch weights to the gen-value vLLM pool over NCCL.
 
-        Returns the list of engine-side ``update_weights`` ObjectRefs so the
-        caller can wait on them (mirrors ``PolicyTrainerRayProcess.broadcast_to_vllm``).
+        Returns engine-side ``update_weights`` ObjectRefs together with the exact
+        critic update watermarks represented by the broadcast.
         """
         if not self._vllm_engines or self._model_update_group is None:
-            return []
+            return {
+                "engine_refs": [],
+                "latest_trained_policy_step": self._latest_trained_policy_step,
+                "reinforce_steps": self._step_count,
+            }
         torch.cuda.empty_cache()
         torch.cuda.set_device(0)
-        return vllm_utils.broadcast_weights_to_vllm(
+        engine_refs = vllm_utils.broadcast_weights_to_vllm(
             model=self._model,
             vllm_engines=self._vllm_engines,
             model_update_group=self._model_update_group,
             model_step=model_step,
             gather_whole_model=True,
         )
+        return {
+            "engine_refs": engine_refs,
+            "latest_trained_policy_step": self._latest_trained_policy_step,
+            "reinforce_steps": self._step_count,
+        }
 
     def get_step_count(self) -> int:
         return self._step_count
@@ -336,6 +406,10 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
                 "grpo_fast_genvalue.py requires --use_generative_value_model. "
                 "Use grpo_fast.py for runs without a generative value model."
             )
+        if not self.use_value_model:
+            raise ValueError("--use_generative_value_model requires --use_value_model.")
+        if self.gen_value_vllm_num_engines <= 0:
+            raise ValueError("--gen_value_vllm_num_engines must be > 0 for generative-value training.")
         if self.gen_value_segmentation not in {"sae", "fixed"}:
             raise ValueError(
                 f"--gen_value_segmentation must be 'sae' or 'fixed', got {self.gen_value_segmentation!r}."
@@ -353,6 +427,10 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
                 "--gen_value_reinforce_max_prompt_tokens must be > 0, "
                 f"got {self.gen_value_reinforce_max_prompt_tokens}."
             )
+        if self.gen_value_reinforce_coef < 0:
+            raise ValueError(f"--gen_value_reinforce_coef must be >= 0, got {self.gen_value_reinforce_coef}.")
+        if self.gen_value_sync_freq < 0:
+            raise ValueError(f"--gen_value_sync_freq must be >= 0, got {self.gen_value_sync_freq}.")
         if self.gen_value_conditioning not in value_model_utils.GEN_VALUE_CONDITIONING_TYPES:
             raise ValueError(
                 f"--gen_value_conditioning must be one of "
@@ -508,7 +586,12 @@ def _gen_value_scoring_loop(
 
 
 def _gen_value_reinforce_loop(
-    trainer_actor: Any, training_queue: Any, stop_event: threading.Event, metrics_Q: Queue
+    trainer_actor: Any,
+    training_queue: Any,
+    stop_event: threading.Event,
+    metrics_Q: Queue,
+    progress_state: dict[str, int],
+    progress_lock: threading.Lock,
 ) -> None:
     """Background thread: drain the training-pairs queue and call ``GenValueTrainerActor.reinforce_step``.
 
@@ -526,12 +609,25 @@ def _gen_value_reinforce_loop(
             # AttributeError (no .remote on a bound method) and was swallowed
             # by the bare `except Exception`, so this thread was spinning
             # without ever consuming a pair.
-            pairs = training_queue.get(timeout=1.0)
+            batch = training_queue.get(timeout=1.0)
         except queue_lib.Empty:
             continue
-        if pairs is None or len(pairs) == 0:
+        if batch is None:
             continue
-        metrics = ray.get(trainer_actor.reinforce_step.remote(pairs))
+        if isinstance(batch, dict):
+            pairs = batch.get("pairs", [])
+            policy_step = batch.get("policy_step")
+            producer_rank = batch.get("producer_rank")
+        else:
+            pairs = batch
+            policy_step = None
+            producer_rank = None
+        metrics = ray.get(
+            trainer_actor.reinforce_step.remote(pairs, policy_step=policy_step, producer_rank=producer_rank)
+        )
+        with progress_lock:
+            progress_state["reinforce_steps"] = int(metrics.get("gen_value/reinforce_steps", 0))
+            progress_state["latest_trained_policy_step"] = int(metrics.get("gen_value/latest_trained_policy_step", 0))
         if metrics:
             _put_gen_value_metrics(metrics_Q, metrics, "REINFORCE")
         logger.debug("[GenValue] REINFORCE step: %s", metrics)
@@ -539,11 +635,8 @@ def _gen_value_reinforce_loop(
 
 
 def _sync_gen_value_weights(
-    gen_value_trainer: Any,
-    gen_value_vllm_engines: list,
-    model_step: int,
-    engines_lock: threading.Lock,
-) -> None:
+    gen_value_trainer: Any, gen_value_vllm_engines: list, model_step: int, engines_lock: threading.Lock
+) -> dict[str, float]:
     """Push updated gen-value weights to the gen-value vLLM pool over NCCL.
 
     Mirrors the policy-side weight sync in ``grpo_fast.weight_sync_thread``:
@@ -557,16 +650,28 @@ def _sync_gen_value_weights(
     in-flight request on vLLM's single asyncio loop.
     """
     if not gen_value_vllm_engines:
-        return
+        return {}
     logger.debug("[GenValue] Syncing weights at model_step=%d.", model_step)
 
     with engines_lock:
-        engine_refs = ray.get(gen_value_trainer.broadcast_to_vllm.remote(model_step))
+        sync_result = ray.get(gen_value_trainer.broadcast_to_vllm.remote(model_step))
+        engine_refs = sync_result["engine_refs"]
         if engine_refs:
             ray.get(engine_refs)
         ray.get([engine.wake_up.remote() for engine in gen_value_vllm_engines])
 
-    logger.debug("[GenValue] Weight sync complete (%d engine(s)).", len(gen_value_vllm_engines))
+    latest_trained_step = int(sync_result["latest_trained_policy_step"])
+    logger.debug(
+        "[GenValue] Weight sync complete (%d engine(s), latest trained policy step=%d).",
+        len(gen_value_vllm_engines),
+        latest_trained_step,
+    )
+    return {
+        "gen_value/latest_synced_policy_step": latest_trained_step,
+        "gen_value/training_lag": float(max(0, model_step - latest_trained_step)),
+        "gen_value/serving_lag": float(max(0, model_step - latest_trained_step)),
+        "gen_value/synced_reinforce_steps": float(sync_result["reinforce_steps"]),
+    }
 
 
 def main():
@@ -600,15 +705,25 @@ def main():
         vllm_num_engines=vllm_config.vllm_num_engines,
         vllm_tensor_parallel_size=vllm_config.vllm_tensor_parallel_size,
     )
-    gen_value_extra_gpus = args.gen_value_vllm_num_engines * args.gen_value_vllm_tensor_parallel_size
+    gen_value_pool_gpus = args.gen_value_vllm_num_engines * args.gen_value_vllm_tensor_parallel_size
+    gen_value_trainer_gpus = 1
+    gen_value_extra_gpus = gen_value_pool_gpus + gen_value_trainer_gpus
+    combined_reqs = dict(base_reqs)
+    combined_reqs["additional_topology_gpus"] = gen_value_extra_gpus
+    combined_reqs["additional_topology_cpus"] = gen_value_pool_gpus + 1
+    combined_reqs["min_total_cluster_gpus"] = base_reqs["min_total_cluster_gpus"] + gen_value_extra_gpus
+    combined_reqs["min_total_cluster_cpus"] = base_reqs["min_total_cluster_cpus"] + gen_value_pool_gpus + 1
     logger.info(
-        "Gen-value adds %d GPU(s) for second vLLM pool (%d engine(s) × TP%d). "
+        "Gen-value adds %d GPU(s): %d for the second vLLM pool (%d engine(s) × TP%d) "
+        "and %d for the trainer. "
         "Policy needs ≥%d GPU(s); combined total ≥%d GPU(s).",
         gen_value_extra_gpus,
+        gen_value_pool_gpus,
         args.gen_value_vllm_num_engines,
         args.gen_value_vllm_tensor_parallel_size,
+        gen_value_trainer_gpus,
         base_reqs["min_total_cluster_gpus"],
-        base_reqs["min_total_cluster_gpus"] + gen_value_extra_gpus,
+        combined_reqs["min_total_cluster_gpus"],
     )
 
     # ── Step 1: mirror grpo_fast.main() pre-ray setup ─────────────────────────
@@ -634,6 +749,7 @@ def main():
             "env_vars": {k: v for k, v in os.environ.items() if k not in _grpo_fast.EXCLUDED_ENV_VARS},
         }
     )
+    _grpo_fast.wait_for_grpo_fast_minimum_cluster_resources(args, combined_reqs)
 
     pool_size = tools_config.pool_size
     if pool_size is None:
@@ -806,9 +922,16 @@ def main():
     # GenValueTrainerActor.reinforce_step().
     gen_value_trainer: Any = None
     gen_value_training_queue: Any = None
+    gen_value_checkpoint_file: str | None = None
 
     if gen_value_vllm_engines:
         gv_lr = args.gen_value_learning_rate or 1e-6
+        if checkpoint_state and checkpoint_state.get("gen_value_trainer_saved", False):
+            gen_value_checkpoint_file = checkpoint_state.get("gen_value_trainer_checkpoint")
+            if not gen_value_checkpoint_file:
+                raise ValueError("Checkpoint says the generative-value trainer was saved, but no path was recorded.")
+            if not os.path.isabs(gen_value_checkpoint_file):
+                gen_value_checkpoint_file = os.path.join(args.checkpoint_state_dir, gen_value_checkpoint_file)
         gen_value_trainer = GenValueTrainerActor.remote(
             gen_value_model_path,
             gv_lr,
@@ -816,6 +939,9 @@ def main():
             args.gen_value_score_max,
             tensor_parallel_size=args.gen_value_vllm_tensor_parallel_size,
             max_prompt_tokens=args.gen_value_reinforce_max_prompt_tokens,
+            reinforce_coef=args.gen_value_reinforce_coef,
+            expected_producers=args.world_size,
+            checkpoint_file=gen_value_checkpoint_file,
         )
         ray.get(gen_value_trainer.ready.remote())
         logger.info("======== ✅ Gen-value trainer actor ready (lr=%.2e) =========", gv_lr)
@@ -827,6 +953,15 @@ def main():
         if args.gen_value_sync_freq > 0:
             ray.get(gen_value_trainer.setup_model_update_group.remote(gen_value_vllm_engines))
             logger.info("======== ✅ Gen-value NCCL weight-transfer group initialised =========")
+            if gen_value_checkpoint_file is not None:
+                restored_step = int(checkpoint_state.get("gen_value_latest_trained_policy_step", 0))
+                sync_result = ray.get(gen_value_trainer.broadcast_to_vllm.remote(restored_step))
+                if sync_result["engine_refs"]:
+                    ray.get(sync_result["engine_refs"])
+                ray.get([engine.wake_up.remote() for engine in gen_value_vllm_engines])
+                logger.info(
+                    "======== ✅ Restored gen-value weights published at policy step %d =========", restored_step
+                )
 
         gen_value_training_queue = ray_queue.Queue(maxsize=200)
 
@@ -849,6 +984,11 @@ def main():
     # dicts here; _one_training_step_with_genvalue drains them and merges into
     # data_thread_metrics so they land in the main pretty-print + wandb log.
     gen_value_metrics_Q: Queue = Queue(maxsize=64)
+    gen_value_progress_lock = threading.Lock()
+    gen_value_progress_state = {
+        "reinforce_steps": 0,
+        "latest_trained_policy_step": int((checkpoint_state or {}).get("gen_value_latest_trained_policy_step", 0)),
+    }
     gen_value_thread: threading.Thread | None = None
     gen_value_reinforce_future: futures.Future | None = None
 
@@ -884,11 +1024,18 @@ def main():
             gen_value_training_queue,
             gen_value_stop_event,
             gen_value_metrics_Q,
+            gen_value_progress_state,
+            gen_value_progress_lock,
         )
 
     # Wrap one_training_step to fire the scoring trigger and (periodically) sync gen-value weights.
     _original_one_training_step = _grpo_fast.one_training_step
-    _gv_policy_step_count = [0]  # mutable counter shared with closure
+    restored_synced_step = (
+        int((checkpoint_state or {}).get("gen_value_latest_trained_policy_step", 0))
+        if gen_value_checkpoint_file is not None and args.gen_value_sync_freq > 0
+        else 0
+    )
+    _latest_synced_policy_step = [restored_synced_step]
 
     def _raise_if_gen_value_reinforce_failed() -> None:
         if gen_value_reinforce_future is not None and gen_value_reinforce_future.done():
@@ -910,25 +1057,55 @@ def main():
                     break
 
         result = _original_one_training_step(*step_args, **step_kwargs)
-        _gv_policy_step_count[0] += 1
+        policy_step = int(step_args[6] if len(step_args) > 6 else step_kwargs["training_step"])
+        progress_metrics: dict[str, Any] = {
+            "gen_value/latest_enqueued_policy_step": policy_step,
+            "gen_value/training_queue_size": gen_value_training_queue.qsize()
+            if gen_value_training_queue is not None
+            else 0,
+        }
+        if gen_value_trainer is not None:
+            with gen_value_progress_lock:
+                trainer_progress = dict(gen_value_progress_state)
+            latest_trained_step = int(trainer_progress["latest_trained_policy_step"])
+            progress_metrics.update(
+                {
+                    "gen_value/latest_trained_policy_step": latest_trained_step,
+                    "gen_value/training_lag": float(max(0, policy_step - latest_trained_step)),
+                    "gen_value/reinforce_steps": trainer_progress["reinforce_steps"],
+                }
+            )
         # Sync FIRST, then fire the scoring trigger. Scoring needs to run on the
         # latest weights, and firing before sync risks a generate_completions
         # in flight when broadcast_weights_to_vllm calls engine.sleep() -- that
         # deadlocks engine.wake_up() on vLLM's asyncio loop.
         sync_freq = args.gen_value_sync_freq
-        if sync_freq > 0 and gen_value_trainer is not None and _gv_policy_step_count[0] % sync_freq == 0:
-            _sync_gen_value_weights(
-                gen_value_trainer,
-                gen_value_vllm_engines,
-                _gv_policy_step_count[0],
-                gen_value_engines_lock,
+        if sync_freq > 0 and gen_value_trainer is not None and policy_step % sync_freq == 0:
+            sync_metrics = _sync_gen_value_weights(
+                gen_value_trainer, gen_value_vllm_engines, policy_step, gen_value_engines_lock
             )
+            progress_metrics.update(sync_metrics)
+            _latest_synced_policy_step[0] = int(sync_metrics["gen_value/latest_synced_policy_step"])
+        progress_metrics["gen_value/latest_synced_policy_step"] = _latest_synced_policy_step[0]
+        progress_metrics["gen_value/serving_lag"] = float(max(0, policy_step - _latest_synced_policy_step[0]))
+        _put_gen_value_metrics(gen_value_metrics_Q, progress_metrics, "progress")
         if gen_value_vllm_engines:
             gen_value_step_trigger.set()
         _raise_if_gen_value_reinforce_failed()
         return result
 
     _grpo_fast.one_training_step = _one_training_step_with_genvalue
+
+    def _save_gen_value_checkpoint(checkpoint_state_dir: str, training_step: int) -> dict[str, Any]:
+        if gen_value_trainer is None:
+            return {}
+        return ray.get(gen_value_trainer.save_checkpoint.remote(checkpoint_state_dir, training_step))
+
+    def _save_gen_value_model(output_dir: str, training_step: int) -> None:
+        if gen_value_trainer is None:
+            return
+        ray.get(gen_value_trainer.save_model.remote(output_dir))
+        logger.info("Saved generative-value model at policy step %d to %s", training_step, output_dir)
 
     # ── Step 6: run policy training loop ─────────────────────────────────────
     primary_exception: BaseException | None = None
@@ -956,6 +1133,8 @@ def main():
             model_dims,
             checkpoint_state,
             base_env_config,
+            checkpoint_callback=_save_gen_value_checkpoint,
+            model_save_callback=_save_gen_value_model,
         )
 
         if args.push_to_hub and (not dist.is_initialized() or dist.get_rank() == 0):

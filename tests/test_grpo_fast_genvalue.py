@@ -1,12 +1,23 @@
+# ruff: noqa: E402, I001
 """Unit tests for grpo_fast_genvalue helpers (no GPU required)."""
-import math
+
+from unittest.mock import MagicMock
 
 import pytest
 
-from open_instruct.grpo_fast_genvalue import GenValueExperimentConfig, _get_gen_value_max_model_len, segment_rollout
+pytest.importorskip("vllm")
+
+from open_instruct.dataset_transformation import INPUT_IDS_PROMPT_KEY
+from open_instruct.grpo_fast_genvalue import (
+    GenValueExperimentConfig,
+    _build_sample_scoring_prompts,
+    _get_gen_value_max_model_len,
+)
+from open_instruct.value_model_utils import segment_rollout
 
 
 # ── segment_rollout ────────────────────────────────────────────────────────────
+
 
 def test_segment_rollout_fixed_basic():
     tokens = list(range(10))
@@ -71,10 +82,12 @@ def test_segment_rollout_fixed_sorted():
 
 # ── GenValueExperimentConfig validation ───────────────────────────────────────
 
+
 def _base_kwargs():
     """Minimal valid kwargs for GenValueExperimentConfig (all fields have defaults)."""
     return dict(
         use_generative_value_model=True,
+        use_value_model=True,
         gen_value_segmentation="fixed",
         gen_value_chunk_size=256,
         gen_value_score_min=0.0,
@@ -94,6 +107,27 @@ def test_genvalue_config_requires_flag():
     kwargs = _base_kwargs()
     kwargs["use_generative_value_model"] = False
     with pytest.raises(ValueError, match="requires --use_generative_value_model"):
+        GenValueExperimentConfig(**kwargs)
+
+
+def test_genvalue_config_requires_value_model_path():
+    kwargs = _base_kwargs()
+    kwargs["use_value_model"] = False
+    with pytest.raises(ValueError, match="requires --use_value_model"):
+        GenValueExperimentConfig(**kwargs)
+
+
+def test_genvalue_config_requires_serving_engine():
+    kwargs = _base_kwargs()
+    kwargs["gen_value_vllm_num_engines"] = 0
+    with pytest.raises(ValueError, match="gen_value_vllm_num_engines must be > 0"):
+        GenValueExperimentConfig(**kwargs)
+
+
+def test_genvalue_config_rejects_negative_reinforce_coef():
+    kwargs = _base_kwargs()
+    kwargs["gen_value_reinforce_coef"] = -0.1
+    with pytest.raises(ValueError, match="gen_value_reinforce_coef must be >= 0"):
         GenValueExperimentConfig(**kwargs)
 
 
@@ -158,16 +192,13 @@ def test_get_gen_value_max_model_len_includes_generation_budget():
     class StreamingConfig:
         pack_length = 10_240
 
-    assert _get_gen_value_max_model_len(StreamingConfig, cfg) == 21_504
+    assert _get_gen_value_max_model_len(StreamingConfig, cfg) == 41_984
 
 
 # ── _build_sample_scoring_prompts (pure-Python, no GPU) ───────────────────────
 
-def test_build_sample_scoring_prompts_length():
-    from unittest.mock import MagicMock
-    from open_instruct.grpo_fast_genvalue import _build_sample_scoring_prompts
-    from open_instruct.dataset_transformation import INPUT_IDS_PROMPT_KEY
 
+def test_build_sample_scoring_prompts_length():
     # Build a tiny fake dataset
     tokenizer = MagicMock()
     tokenizer.decode.return_value = "What is 2+2?"

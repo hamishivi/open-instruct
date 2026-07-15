@@ -78,6 +78,13 @@ def format_grpo_fast_startup_requirements(requirements: dict) -> str:
             f"ActorManager CPU={format_resource_amount(requirements['actor_manager_cpus'])})"
         ),
     ]
+    if requirements.get("additional_topology_gpus", 0) or requirements.get("additional_topology_cpus", 0):
+        lines.insert(
+            2,
+            "Additional topology resources="
+            f"(GPU={format_resource_amount(requirements.get('additional_topology_gpus', 0))}, "
+            f"CPU={format_resource_amount(requirements.get('additional_topology_cpus', 0))})",
+        )
     return "\n".join(lines)
 
 

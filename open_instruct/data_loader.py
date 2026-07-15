@@ -1559,11 +1559,21 @@ class DataPreparationActor:
             packed_sequences.advantages = packed_advantages
 
             if self.config.use_value_model:
+                gen_value_conditioning = getattr(self.config, "gen_value_conditioning", "none")
                 need_gt = (
                     self.config.value_model_ground_truth_conditioning
                     or self.config.gt_conditioning_template in value_model_utils.TEMPLATES_REQUIRING_GT
+                    or gen_value_conditioning == "gt"
                 )
-                need_siblings = self.config.gt_conditioning_template in value_model_utils.TEMPLATES_REQUIRING_SIBLINGS
+                need_siblings = (
+                    self.config.gt_conditioning_template in value_model_utils.TEMPLATES_REQUIRING_SIBLINGS
+                    or gen_value_conditioning in value_model_utils.TEMPLATES_REQUIRING_SIBLINGS
+                )
+                sibling_template = (
+                    gen_value_conditioning
+                    if gen_value_conditioning in value_model_utils.TEMPLATES_REQUIRING_SIBLINGS
+                    else self.config.gt_conditioning_template
+                )
                 populate_value_model_fields(
                     packed_sequences=packed_sequences,
                     scores=scores,
@@ -1576,7 +1586,7 @@ class DataPreparationActor:
                     need_ground_truths=need_gt,
                     need_siblings=need_siblings,
                     num_siblings_to_sample=value_model_utils.resolve_num_siblings_to_sample(
-                        self.config.gt_conditioning_template,
+                        sibling_template,
                         self.config.rollout_context_num_siblings,
                         self.config.num_samples_per_prompt_rollout,
                     ),
