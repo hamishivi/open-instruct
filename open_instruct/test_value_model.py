@@ -86,12 +86,33 @@ class TestGAEVariants(unittest.TestCase):
 
     def test_sae_vapo_combines_variants(self):
         v, r, d, m, logp = self._inputs()
-        pa, cr, bf = calculate_advantages_packed_sae_vapo(
+        pa, cr, metrics = calculate_advantages_packed_sae_vapo(
             v, r, gamma=1.0, dones=d, response_masks=m, logprobs=logp, sae_threshold=0.2, lam_policy=0.5
         )
         self.assertEqual(pa.shape, v.shape)
         self.assertEqual(cr.shape, v.shape)
-        self.assertGreater(bf, 0)
+        self.assertGreater(metrics["value/sae_boundary_frac"], 0)
+        self.assertEqual(metrics["value/sae_segments_mean"], 2.0)
+        self.assertEqual(metrics["value/sae_boundary_lambda_mean"], 0.5)
+
+    def test_segment_adaptive_sae_preserves_whole_response_retention(self):
+        v, r, d, m, logp = self._inputs()
+        alpha = 1.5
+        _, _, metrics = calculate_advantages_packed_sae_vapo(
+            v,
+            r,
+            gamma=1.0,
+            dones=d,
+            response_masks=m,
+            logprobs=logp,
+            sae_threshold=0.2,
+            segment_adaptive=True,
+            segment_adaptive_alpha=alpha,
+        )
+        num_boundaries = 1
+        expected_lambda = np.exp(-1.0 / (alpha * num_boundaries))
+        self.assertAlmostEqual(metrics["value/sae_boundary_lambda_mean"], expected_lambda)
+        self.assertAlmostEqual(expected_lambda**num_boundaries, np.exp(-1.0 / alpha))
 
     def test_length_adaptive_lambda(self):
         # alpha*length = 1 -> lambda = 0

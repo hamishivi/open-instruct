@@ -1601,7 +1601,7 @@ class PolicyTrainerRayProcess(RayProcess):
         metrics: dict[str, float] = {}
         if args.use_sae and args.decoupled_gae:
             assert logprobs_np is not None
-            policy_adv, critic_returns, bf = calculate_advantages_packed_sae_vapo(
+            policy_adv, critic_returns, sae_metrics = calculate_advantages_packed_sae_vapo(
                 values=values_np,
                 rewards=rewards_np,
                 gamma=args.gamma,
@@ -1613,9 +1613,11 @@ class PolicyTrainerRayProcess(RayProcess):
                 lam_critic=1.0,
                 length_adaptive=args.length_adaptive_gae,
                 length_adaptive_alpha=args.length_adaptive_gae_alpha,
+                segment_adaptive=args.segment_adaptive_gae,
+                segment_adaptive_alpha=args.segment_adaptive_gae_alpha,
                 skip_tool_outputs=args.skip_tool_outputs,
             )
-            metrics["value/sae_boundary_frac"] = bf
+            metrics.update(sae_metrics)
             return policy_adv, critic_returns, metrics
         if args.use_sae:
             assert logprobs_np is not None

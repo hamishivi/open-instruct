@@ -162,6 +162,10 @@ class GRPOExperimentConfig(
     """If True, scale the policy lambda per sub-sequence: lam = clamp(1 - 1/(alpha*len), 0, 0.999)."""
     length_adaptive_gae_alpha: float = 0.05
     """Alpha for length-adaptive lambda."""
+    segment_adaptive_gae: bool = False
+    """If True, adapt SAE's boundary lambda to the number of segments in each response."""
+    segment_adaptive_gae_alpha: float = 1.5
+    """Alpha controlling whole-response trace retention for segment-adaptive SAE."""
     value_warmup_steps: int = 0
     """If >0, freeze the policy for this many steps while the value model trains on rollouts."""
     policy_warmup_steps: int = 0
@@ -377,6 +381,16 @@ class GRPOExperimentConfig(
             )
         if self.length_adaptive_gae and not self.use_value_model:
             raise ValueError("--length_adaptive_gae requires --use_value_model.")
+        if self.segment_adaptive_gae and not self.use_value_model:
+            raise ValueError("--segment_adaptive_gae requires --use_value_model.")
+        if self.segment_adaptive_gae and not self.use_sae:
+            raise ValueError("--segment_adaptive_gae requires --use_sae.")
+        if self.segment_adaptive_gae and not self.decoupled_gae:
+            raise ValueError("--segment_adaptive_gae currently requires --decoupled_gae.")
+        if self.segment_adaptive_gae and self.length_adaptive_gae:
+            raise ValueError("--segment_adaptive_gae and --length_adaptive_gae are mutually exclusive.")
+        if self.segment_adaptive_gae and self.segment_adaptive_gae_alpha <= 0.0:
+            raise ValueError(f"--segment_adaptive_gae_alpha must be > 0, got {self.segment_adaptive_gae_alpha}.")
         if self.decoupled_gae and not self.use_value_model:
             raise ValueError("--decoupled_gae requires --use_value_model.")
         if self.skip_tool_outputs and not self.use_value_model:
