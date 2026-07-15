@@ -691,7 +691,7 @@ def calculate_advantages_packed_sae_vapo(
     length_adaptive: bool = False,
     length_adaptive_alpha: float = 0.05,
     segment_adaptive: bool = False,
-    segment_adaptive_alpha: float = 1.5,
+    segment_adaptive_alpha: float = 0.5,
     skip_tool_outputs: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
     """SAE + decoupled GAE.

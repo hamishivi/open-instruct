@@ -164,7 +164,7 @@ class GRPOExperimentConfig(
     """Alpha for length-adaptive lambda."""
     segment_adaptive_gae: bool = False
     """If True, adapt SAE's boundary lambda to the number of segments in each response."""
-    segment_adaptive_gae_alpha: float = 1.5
+    segment_adaptive_gae_alpha: float = 0.5
     """Alpha controlling whole-response trace retention for segment-adaptive SAE."""
     value_warmup_steps: int = 0
     """If >0, freeze the policy for this many steps while the value model trains on rollouts."""
