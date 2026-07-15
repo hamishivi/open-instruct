@@ -25,4 +25,4 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 export no_proxy="127.0.0.1,localhost${no_proxy:+,${no_proxy}}"
 export NO_PROXY="${no_proxy}"
 
-srun --cpu-bind=none bash scripts/train/debug/genac_smoke.sh
+srun --cpu-bind=none bash scripts/train/debug/genac_smoke.sh "$@"
