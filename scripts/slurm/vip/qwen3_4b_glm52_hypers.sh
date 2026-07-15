@@ -19,7 +19,7 @@
 #   EXP_NAME, RUN_NAME, WANDB_PROJECT, NUM_LEARNERS_PER_NODE,
 #   VLLM_NUM_ENGINES, ASYNC_STEPS, POLICY_LEARNING_RATE,
 #   VALUE_LEARNING_RATE, VALUE_NUM_EPOCHS, LENGTH_ADAPTIVE_GAE_ALPHA,
-#   UV_SYNC, APPTAINER_IMAGE, APPTAINER_BIND,
+#   SAE_THRESHOLD, UV_SYNC, APPTAINER_IMAGE, APPTAINER_BIND,
 #   APPTAINER_LOCAL_VENV, VLLM_ALLOW_INSECURE_SERIALIZATION, etc.
 
 set -euo pipefail
@@ -45,9 +45,10 @@ NUM_LEARNERS_PER_NODE="${NUM_LEARNERS_PER_NODE:-4}"
 VLLM_NUM_ENGINES="${VLLM_NUM_ENGINES:-4}"
 ASYNC_STEPS="${ASYNC_STEPS:-2}"
 POLICY_LEARNING_RATE="${POLICY_LEARNING_RATE:-1e-6}"
-VALUE_LEARNING_RATE="${VALUE_LEARNING_RATE:-2e-6}"
-VALUE_NUM_EPOCHS="${VALUE_NUM_EPOCHS:-1}"
-LENGTH_ADAPTIVE_GAE_ALPHA="${LENGTH_ADAPTIVE_GAE_ALPHA:-0.05}"
+VALUE_LEARNING_RATE="${VALUE_LEARNING_RATE:-5e-6}"
+VALUE_NUM_EPOCHS="${VALUE_NUM_EPOCHS:-2}"
+LENGTH_ADAPTIVE_GAE_ALPHA="${LENGTH_ADAPTIVE_GAE_ALPHA:-1.5}"
+SAE_THRESHOLD="${SAE_THRESHOLD:-0.2}"
 WANDB_ENTITY_NAME="${WANDB_ENTITY:-hamishivi}"
 WANDB_PROJECT_NAME="${WANDB_PROJECT:-VIP}"
 
@@ -113,7 +114,7 @@ echo "Run:    ${RUN_NAME}"
 echo "Nodes:  ${SLURM_JOB_NUM_NODES}  GPUs/node: ${SLURM_GPUS_ON_NODE:-${SLURM_GPUS_PER_NODE:-8}}"
 echo "Actors: learners=${NUM_LEARNERS_PER_NODE}  vLLM engines=${VLLM_NUM_ENGINES}"
 echo "Async:  steps=${ASYNC_STEPS}"
-echo "Tuning: policy_lr=${POLICY_LEARNING_RATE}  value_lr=${VALUE_LEARNING_RATE}  value_epochs=${VALUE_NUM_EPOCHS}  gae_alpha=${LENGTH_ADAPTIVE_GAE_ALPHA}"
+echo "Tuning: policy_lr=${POLICY_LEARNING_RATE}  value_lr=${VALUE_LEARNING_RATE}  value_epochs=${VALUE_NUM_EPOCHS}  gae_alpha=${LENGTH_ADAPTIVE_GAE_ALPHA}  sae_threshold=${SAE_THRESHOLD}"
 echo "===================================="
 
 # Start Ray on every allocated node (head on rank 0, workers block).
@@ -173,6 +174,8 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
       --decoupled_gae \
       --length_adaptive_gae \
       --length_adaptive_gae_alpha "'"${LENGTH_ADAPTIVE_GAE_ALPHA}"'" \
+      --use_sae \
+      --sae_threshold "'"${SAE_THRESHOLD}"'" \
       --skip_tool_outputs \
       --gamma 1.0 \
       --value_loss_coef 0.5 \
