@@ -128,7 +128,6 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
       --beta 0.0 \
       --async_steps "'"${ASYNC_STEPS}"'" \
       --inflight_updates \
-      --no_resampling_pass_rate 0.875 \
       --use_vllm_logprobs True \
       --truncated_importance_sampling_ratio_cap 0 \
       --tis_mask_lower 0.8 \
