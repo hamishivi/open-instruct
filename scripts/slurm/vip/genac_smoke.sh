@@ -18,6 +18,9 @@ export PATH="${REPO_ROOT}/.venv/bin:${PATH}"
 if [[ -d "${REPO_ROOT}/.vllm-overlay" ]]; then
     export PYTHONPATH="${REPO_ROOT}/.vllm-overlay${PYTHONPATH:+:${PYTHONPATH}}"
 fi
+if [[ -z "${CUDA_HOME:-}" ]] && ! command -v nvcc >/dev/null 2>&1; then
+    export CUDA_HOME="${REPO_ROOT}/scripts/slurm/vip/cuda_stub"
+fi
 export NCCL_CUMEM_ENABLE=0
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ALLOW_INSECURE_SERIALIZATION=1

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Tillicum provides the CUDA driver/runtime but not the nvcc driver. DeepSpeed
+# probes `nvcc -V` while registering optional operators, even when none will be
+# JIT-compiled. This shim only answers that version probe; it is not a compiler.
+if [[ "${1:-}" == "-V" || "${1:-}" == "--version" ]]; then
+    echo "Cuda compilation tools, release 12.8, V12.8.93"
+    exit 0
+fi
+
+echo "nvcc is unavailable on this Tillicum node" >&2
+exit 127
