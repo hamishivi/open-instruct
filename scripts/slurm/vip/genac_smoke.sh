@@ -15,6 +15,9 @@ cd "${REPO_ROOT}"
 mkdir -p logs
 
 export PATH="${REPO_ROOT}/.venv/bin:${PATH}"
+if [[ -d "${REPO_ROOT}/.vllm-overlay" ]]; then
+    export PYTHONPATH="${REPO_ROOT}/.vllm-overlay${PYTHONPATH:+:${PYTHONPATH}}"
+fi
 export NCCL_CUMEM_ENABLE=0
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ALLOW_INSECURE_SERIALIZATION=1
