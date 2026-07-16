@@ -1131,8 +1131,9 @@ def main():
             weight_sync_metrics_Q,
             actor_manager,
             model_dims,
-            checkpoint_state,
-            base_env_config,
+            data_prep_actor=_data_prep_actor,
+            checkpoint_state=checkpoint_state,
+            base_env_config=base_env_config,
             checkpoint_callback=_save_gen_value_checkpoint,
             model_save_callback=_save_gen_value_model,
         )
