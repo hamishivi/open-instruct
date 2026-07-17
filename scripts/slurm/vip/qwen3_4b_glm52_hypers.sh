@@ -86,6 +86,7 @@ if [[ -n "${APPTAINER_IMAGE:-}" ]]; then
       --bind /usr/bin/git:/usr/bin/git
       --bind /usr/libexec/git-core:/usr/libexec/git-core
       --bind /lib64/libcrypto.so.1.1:/lib64/libcrypto.so.1.1
+      --env LD_LIBRARY_PATH=/lib64:/.singularity.d/libs:/usr/local/nvidia/lib64:/usr/local/cuda/lib64
     )
     APPTAINER_SYNC_ARGS+=(--bind "${APPTAINER_LOCAL_BIND}:${APPTAINER_LOCAL_BIND}")
     echo "Syncing the locked uv environment to node-local storage: ${CONTAINER_VENV}"
