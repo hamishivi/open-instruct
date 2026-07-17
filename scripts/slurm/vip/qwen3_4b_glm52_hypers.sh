@@ -19,7 +19,9 @@
 #   EXP_NAME, RUN_NAME, WANDB_PROJECT, NUM_LEARNERS_PER_NODE,
 #   VLLM_NUM_ENGINES, ASYNC_STEPS, POLICY_LEARNING_RATE,
 #   VALUE_LEARNING_RATE, VALUE_NUM_EPOCHS, SAE_THRESHOLD,
-#   SEGMENT_ADAPTIVE_GAE_ALPHA, UV_SYNC, APPTAINER_IMAGE,
+#   SEGMENT_ADAPTIVE_GAE_ALPHA, NUM_SAMPLES_PER_PROMPT_ROLLOUT,
+#   NUM_UNIQUE_PROMPTS_ROLLOUT, NO_RESAMPLING_PASS_RATE,
+#   UV_SYNC, APPTAINER_IMAGE,
 #   APPTAINER_BIND,
 #   APPTAINER_LOCAL_VENV, VLLM_ALLOW_INSECURE_SERIALIZATION, etc.
 
@@ -50,6 +52,9 @@ VALUE_LEARNING_RATE="${VALUE_LEARNING_RATE:-5e-6}"
 VALUE_NUM_EPOCHS="${VALUE_NUM_EPOCHS:-2}"
 SAE_THRESHOLD="${SAE_THRESHOLD:-0.2}"
 SEGMENT_ADAPTIVE_GAE_ALPHA="${SEGMENT_ADAPTIVE_GAE_ALPHA:-0.5}"
+NUM_SAMPLES_PER_PROMPT_ROLLOUT="${NUM_SAMPLES_PER_PROMPT_ROLLOUT:-1}"
+NUM_UNIQUE_PROMPTS_ROLLOUT="${NUM_UNIQUE_PROMPTS_ROLLOUT:-128}"
+NO_RESAMPLING_PASS_RATE="${NO_RESAMPLING_PASS_RATE:-none}"
 WANDB_ENTITY_NAME="${WANDB_ENTITY:-hamishivi}"
 WANDB_PROJECT_NAME="${WANDB_PROJECT:-VIP}"
 
@@ -115,6 +120,7 @@ echo "Run:    ${RUN_NAME}"
 echo "Nodes:  ${SLURM_JOB_NUM_NODES}  GPUs/node: ${SLURM_GPUS_ON_NODE:-${SLURM_GPUS_PER_NODE:-8}}"
 echo "Actors: learners=${NUM_LEARNERS_PER_NODE}  vLLM engines=${VLLM_NUM_ENGINES}"
 echo "Async:  steps=${ASYNC_STEPS}"
+echo "Rollout: samples_per_prompt=${NUM_SAMPLES_PER_PROMPT_ROLLOUT}  unique_prompts=${NUM_UNIQUE_PROMPTS_ROLLOUT}  no_resampling_pass_rate=${NO_RESAMPLING_PASS_RATE}"
 echo "Tuning: policy_lr=${POLICY_LEARNING_RATE}  value_lr=${VALUE_LEARNING_RATE}  value_epochs=${VALUE_NUM_EPOCHS}  sae_threshold=${SAE_THRESHOLD}  segment_gae_alpha=${SEGMENT_ADAPTIVE_GAE_ALPHA}"
 echo "===================================="
 
@@ -122,6 +128,10 @@ echo "===================================="
 srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
   source scripts/slurm/vip/ray_node_setup.sh
   if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
+    no_resampling_args=()
+    if [[ "'"${NO_RESAMPLING_PASS_RATE}"'" != "none" ]]; then
+      no_resampling_args=(--no_resampling_pass_rate "'"${NO_RESAMPLING_PASS_RATE}"'")
+    fi
     python open_instruct/grpo_fast.py \
       --exp_name "'"${EXP_NAME}"'" \
       --run_name "'"${RUN_NAME}"'" \
@@ -133,9 +143,10 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
       --tis_mask_lower 0.8 \
       --tis_mask_upper 3.0 \
       --advantage_normalization_type centered \
-      --num_samples_per_prompt_rollout 1 \
+      --num_samples_per_prompt_rollout "'"${NUM_SAMPLES_PER_PROMPT_ROLLOUT}"'" \
+      "${no_resampling_args[@]}" \
       --filter_zero_std_samples False \
-      --num_unique_prompts_rollout 128 \
+      --num_unique_prompts_rollout "'"${NUM_UNIQUE_PROMPTS_ROLLOUT}"'" \
       --num_mini_batches 1 \
       --learning_rate "'"${POLICY_LEARNING_RATE}"'" \
       --per_device_train_batch_size 1 \
