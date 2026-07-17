@@ -21,7 +21,7 @@
 #   VALUE_LEARNING_RATE, VALUE_NUM_EPOCHS, SAE_THRESHOLD,
 #   SEGMENT_ADAPTIVE_GAE_ALPHA, NUM_SAMPLES_PER_PROMPT_ROLLOUT,
 #   NUM_UNIQUE_PROMPTS_ROLLOUT, NO_RESAMPLING_PASS_RATE,
-#   UV_SYNC, APPTAINER_IMAGE,
+#   TOTAL_EPISODES, UV_SYNC, APPTAINER_IMAGE,
 #   APPTAINER_BIND,
 #   APPTAINER_LOCAL_VENV, VLLM_ALLOW_INSECURE_SERIALIZATION, etc.
 
@@ -55,6 +55,7 @@ SEGMENT_ADAPTIVE_GAE_ALPHA="${SEGMENT_ADAPTIVE_GAE_ALPHA:-0.5}"
 NUM_SAMPLES_PER_PROMPT_ROLLOUT="${NUM_SAMPLES_PER_PROMPT_ROLLOUT:-1}"
 NUM_UNIQUE_PROMPTS_ROLLOUT="${NUM_UNIQUE_PROMPTS_ROLLOUT:-128}"
 NO_RESAMPLING_PASS_RATE="${NO_RESAMPLING_PASS_RATE:-none}"
+TOTAL_EPISODES="${TOTAL_EPISODES:-281600}"
 WANDB_ENTITY_NAME="${WANDB_ENTITY:-hamishivi}"
 WANDB_PROJECT_NAME="${WANDB_PROJECT:-VIP}"
 
@@ -121,6 +122,7 @@ echo "Nodes:  ${SLURM_JOB_NUM_NODES}  GPUs/node: ${SLURM_GPUS_ON_NODE:-${SLURM_G
 echo "Actors: learners=${NUM_LEARNERS_PER_NODE}  vLLM engines=${VLLM_NUM_ENGINES}"
 echo "Async:  steps=${ASYNC_STEPS}"
 echo "Rollout: samples_per_prompt=${NUM_SAMPLES_PER_PROMPT_ROLLOUT}  unique_prompts=${NUM_UNIQUE_PROMPTS_ROLLOUT}  no_resampling_pass_rate=${NO_RESAMPLING_PASS_RATE}"
+echo "Schedule: total_episodes=${TOTAL_EPISODES}"
 echo "Tuning: policy_lr=${POLICY_LEARNING_RATE}  value_lr=${VALUE_LEARNING_RATE}  value_epochs=${VALUE_NUM_EPOCHS}  sae_threshold=${SAE_THRESHOLD}  segment_gae_alpha=${SEGMENT_ADAPTIVE_GAE_ALPHA}"
 echo "===================================="
 
@@ -159,7 +161,7 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
       --chat_template_name qwen_instruct_user_boxed_math \
       --non_stop_penalty False \
       --temperature 1.0 \
-      --total_episodes 281600 \
+      --total_episodes "'"${TOTAL_EPISODES}"'" \
       --deepspeed_stage 3 \
       --num_learners_per_node "'"${NUM_LEARNERS_PER_NODE}"'" \
       --num_nodes 1 \
