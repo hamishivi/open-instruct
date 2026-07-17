@@ -79,6 +79,14 @@ if [[ -n "${APPTAINER_IMAGE:-}" ]]; then
     if [[ -n "${APPTAINER_BIND:-}" ]]; then
       APPTAINER_SYNC_ARGS+=(--bind "${APPTAINER_BIND}")
     fi
+    # uv needs the Git executable whenever a locked Git dependency is not
+    # already available in its artifact cache. The training image intentionally
+    # omits Git, so expose the host binary and its helper programs during sync.
+    APPTAINER_SYNC_ARGS+=(
+      --bind /usr/bin/git:/usr/bin/git
+      --bind /usr/libexec/git-core:/usr/libexec/git-core
+      --bind /lib64/libcrypto.so.1.1:/lib64/libcrypto.so.1.1
+    )
     APPTAINER_SYNC_ARGS+=(--bind "${APPTAINER_LOCAL_BIND}:${APPTAINER_LOCAL_BIND}")
     echo "Syncing the locked uv environment to node-local storage: ${CONTAINER_VENV}"
     apptainer "${APPTAINER_SYNC_ARGS[@]}" "${APPTAINER_IMAGE}" bash -c '
