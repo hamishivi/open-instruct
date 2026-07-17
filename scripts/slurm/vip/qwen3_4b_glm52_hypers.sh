@@ -74,6 +74,7 @@ if [[ -n "${APPTAINER_IMAGE:-}" ]]; then
   if [[ "${APPTAINER_LOCAL_VENV:-0}" == "1" ]]; then
     CONTAINER_VENV="${APPTAINER_LOCAL_VENV_DIR:-/scr/${USER}/open-instruct-${SLURM_JOB_ID}/.venv}"
     APPTAINER_LOCAL_BIND="$(dirname "${CONTAINER_VENV}")"
+    APPTAINER_UV_CACHE_DIR="${UV_CACHE_DIR:-/gscratch/h2lab/${USER}/uv-cache}"
     mkdir -p "${APPTAINER_LOCAL_BIND}"
     APPTAINER_SYNC_ARGS=(exec --nv)
     if [[ -n "${APPTAINER_BIND:-}" ]]; then
@@ -87,6 +88,8 @@ if [[ -n "${APPTAINER_IMAGE:-}" ]]; then
       --bind /usr/libexec/git-core:/usr/libexec/git-core
       --bind /lib64/libcrypto.so.1.1:/lib64/libcrypto.so.1.1
       --env LD_LIBRARY_PATH=/lib64:/.singularity.d/libs:/usr/local/nvidia/lib64:/usr/local/cuda/lib64
+      --env "UV_CACHE_DIR=${APPTAINER_UV_CACHE_DIR}"
+      --env UV_LINK_MODE=copy
     )
     APPTAINER_SYNC_ARGS+=(--bind "${APPTAINER_LOCAL_BIND}:${APPTAINER_LOCAL_BIND}")
     echo "Syncing the locked uv environment to node-local storage: ${CONTAINER_VENV}"
