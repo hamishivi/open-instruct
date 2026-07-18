@@ -18,7 +18,7 @@
 #   PARTITION / ACCOUNT via: sbatch --partition=... --account=... this_script.sh
 #   EXP_NAME, RUN_NAME, WANDB_PROJECT, NUM_LEARNERS_PER_NODE,
 #   VLLM_NUM_ENGINES, ASYNC_STEPS, POLICY_LEARNING_RATE,
-#   VALUE_LEARNING_RATE, VALUE_NUM_EPOCHS, SAE_THRESHOLD,
+#   VALUE_LEARNING_RATE, VALUE_NUM_EPOCHS, VALUE_LOSS, SAE_THRESHOLD,
 #   SEGMENT_ADAPTIVE_GAE_ALPHA, NUM_SAMPLES_PER_PROMPT_ROLLOUT,
 #   NUM_UNIQUE_PROMPTS_ROLLOUT, NO_RESAMPLING_PASS_RATE,
 #   TOTAL_EPISODES, UV_SYNC, APPTAINER_IMAGE,
@@ -50,6 +50,7 @@ ASYNC_STEPS="${ASYNC_STEPS:-2}"
 POLICY_LEARNING_RATE="${POLICY_LEARNING_RATE:-1e-6}"
 VALUE_LEARNING_RATE="${VALUE_LEARNING_RATE:-5e-6}"
 VALUE_NUM_EPOCHS="${VALUE_NUM_EPOCHS:-2}"
+VALUE_LOSS="${VALUE_LOSS:-mse}"
 SAE_THRESHOLD="${SAE_THRESHOLD:-0.2}"
 SEGMENT_ADAPTIVE_GAE_ALPHA="${SEGMENT_ADAPTIVE_GAE_ALPHA:-0.5}"
 NUM_SAMPLES_PER_PROMPT_ROLLOUT="${NUM_SAMPLES_PER_PROMPT_ROLLOUT:-1}"
@@ -58,6 +59,14 @@ NO_RESAMPLING_PASS_RATE="${NO_RESAMPLING_PASS_RATE:-none}"
 TOTAL_EPISODES="${TOTAL_EPISODES:-281600}"
 WANDB_ENTITY_NAME="${WANDB_ENTITY:-hamishivi}"
 WANDB_PROJECT_NAME="${WANDB_PROJECT:-VIP}"
+
+case "${VALUE_LOSS}" in
+  mse|classification) ;;
+  *)
+    echo "ERROR: VALUE_LOSS must be mse or classification, got: ${VALUE_LOSS}" >&2
+    exit 1
+    ;;
+esac
 
 # Ensure Ray and the training dependencies are available inside the allocation.
 # Set UV_SYNC=0 when reusing an already-synced environment. On clusters whose
@@ -184,7 +193,12 @@ echo "Actors: learners=${NUM_LEARNERS_PER_NODE}  vLLM engines=${VLLM_NUM_ENGINES
 echo "Async:  steps=${ASYNC_STEPS}"
 echo "Rollout: samples_per_prompt=${NUM_SAMPLES_PER_PROMPT_ROLLOUT}  unique_prompts=${NUM_UNIQUE_PROMPTS_ROLLOUT}  no_resampling_pass_rate=${NO_RESAMPLING_PASS_RATE}"
 echo "Schedule: total_episodes=${TOTAL_EPISODES}"
-echo "Tuning: policy_lr=${POLICY_LEARNING_RATE}  value_lr=${VALUE_LEARNING_RATE}  value_epochs=${VALUE_NUM_EPOCHS}  sae_threshold=${SAE_THRESHOLD}  segment_gae_alpha=${SEGMENT_ADAPTIVE_GAE_ALPHA}"
+echo "Tuning: policy_lr=${POLICY_LEARNING_RATE}  value_lr=${VALUE_LEARNING_RATE}  value_epochs=${VALUE_NUM_EPOCHS}  value_loss=${VALUE_LOSS}  sae_threshold=${SAE_THRESHOLD}  segment_gae_alpha=${SEGMENT_ADAPTIVE_GAE_ALPHA}"
+if [[ "${VALUE_LOSS}" == "classification" ]]; then
+  echo "Value conditioning: disabled (classification value loss is incompatible with ground-truth conditioning)"
+else
+  echo "Value conditioning: answer_prefix"
+fi
 echo "===================================="
 
 # Start Ray on every allocated node (head on rank 0, workers block).
@@ -194,6 +208,10 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
     no_resampling_args=()
     if [[ "'"${NO_RESAMPLING_PASS_RATE}"'" != "none" ]]; then
       no_resampling_args=(--no_resampling_pass_rate "'"${NO_RESAMPLING_PASS_RATE}"'")
+    fi
+    value_conditioning_args=(--value_model_ground_truth_conditioning --gt_conditioning_template answer_prefix)
+    if [[ "'"${VALUE_LOSS}"'" == "classification" ]]; then
+      value_conditioning_args=()
     fi
     python open_instruct/grpo_fast.py \
       --exp_name "'"${EXP_NAME}"'" \
@@ -244,6 +262,7 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
       --use_value_model \
       --value_learning_rate "'"${VALUE_LEARNING_RATE}"'" \
       --value_num_epochs "'"${VALUE_NUM_EPOCHS}"'" \
+      --value_loss "'"${VALUE_LOSS}"'" \
       --gae_lambda 0.95 \
       --decoupled_gae \
       --use_sae \
@@ -254,8 +273,7 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
       --gamma 1.0 \
       --value_loss_coef 0.5 \
       --vf_clip_range 0.2 \
-      --value_model_ground_truth_conditioning \
-      --gt_conditioning_template answer_prefix \
+      "${value_conditioning_args[@]}" \
       --value_warmup_steps 100 \
       --reset_optimizer_after_value_warmup
   fi
