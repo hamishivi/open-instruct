@@ -36,8 +36,11 @@ from open_instruct.rl_utils import (
 from open_instruct.value_model_utils import (
     build_conditioning_text,
     build_generative_value_prompt,
+    causal_value_mask,
+    compute_value_loss,
     is_postfix_template,
     parse_generative_value_score,
+    predict_values,
     resolve_num_siblings_to_sample,
     segment_rollout,
     value_clipped_mse_loss,
@@ -131,7 +134,7 @@ class TestGAEVariants(unittest.TestCase):
         response_masks = np.array([[0, 1, 1, 0, 0, 1, 1]], dtype=np.float64)
 
         adv_skip, _ = calculate_advantages_packed(
-            values, rewards, gamma=1.0, lam=1.0, dones=dones, response_masks=response_masks, skip_tool_outputs=True
+            values, rewards, gamma=1.0, lam=1.0, dones=dones, response_masks=response_masks
         )
         adv_std, _ = calculate_advantages_packed(
             values, rewards, gamma=1.0, lam=1.0, dones=dones, response_masks=response_masks, skip_tool_outputs=False
@@ -312,6 +315,43 @@ class TestScoreParsing(unittest.TestCase):
 
 
 class TestValueLoss(unittest.TestCase):
+    def test_defaults(self):
+        config = grpo_utils.GRPOExperimentConfig()
+        self.assertEqual(config.value_loss, "mse")
+        self.assertEqual(config.value_loss_coef, 1.0)
+        self.assertTrue(config.skip_tool_outputs)
+
+    def test_causal_value_mask_uses_shifted_action_coordinates(self):
+        response_mask = torch.tensor([[False, False, True, False, True]])
+        expected = torch.tensor([[False, True, False, True]])
+        torch.testing.assert_close(causal_value_mask(response_mask), expected)
+
+    def test_classification_loss_preserves_continuous_targets(self):
+        probabilities = torch.tensor([[[0.75, 0.25], [0.25, 0.75]]])
+        logits = probabilities.log()
+        returns = torch.tensor([[0.25, 0.75]])
+        mask = torch.tensor([[True, True]])
+
+        per_token, clipfrac = compute_value_loss(
+            logits, returns, old_values=None, mask=mask, loss_type="classification", clip_range=0.2
+        )
+
+        expected = -(probabilities * probabilities.log()).sum(dim=-1)
+        torch.testing.assert_close(per_token, expected)
+        torch.testing.assert_close(clipfrac, torch.tensor(0.0))
+        torch.testing.assert_close(predict_values(logits, "classification"), returns)
+
+    def test_classification_loss_rejects_out_of_range_targets(self):
+        with self.assertRaisesRegex(ValueError, "outside \\[0, 1\\]"):
+            compute_value_loss(
+                torch.zeros(1, 1, 2),
+                torch.tensor([[1.1]]),
+                old_values=None,
+                mask=torch.tensor([[True]]),
+                loss_type="classification",
+                clip_range=0.2,
+            )
+
     def test_mse_loss_no_clip(self):
         new_v = torch.tensor([[1.0, 2.0, 3.0]])
         ret = torch.tensor([[1.0, 1.0, 1.0]])
@@ -327,9 +367,9 @@ class TestValueLoss(unittest.TestCase):
         mask = torch.tensor([[True, True]])
         per_tok, clipfrac = value_clipped_mse_loss(new_v, ret, old_v, mask, clip_range=0.1)
         # PPO2 clipping is pessimistic: it uses the MAX of clipped and unclipped losses, so the
-        # final per-token loss is dominated by (new - ret)^2 here (= 100), giving 50 after the
-        # 0.5 factor. clipfrac stays 0 because the clipped loss never exceeds the unclipped one.
-        self.assertAlmostEqual(float(per_tok[0, 0]), 50.0, places=5)
+        # final per-token loss is dominated by (new - ret)^2 here (= 100). The configurable
+        # coefficient is applied by the trainer, not this helper.
+        self.assertAlmostEqual(float(per_tok[0, 0]), 100.0, places=5)
         self.assertEqual(per_tok.shape, new_v.shape)
         self.assertGreaterEqual(float(clipfrac), 0.0)
 

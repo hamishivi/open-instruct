@@ -146,8 +146,10 @@ class GRPOExperimentConfig(
     (AutoModelForSequenceClassification) and reuse its `score` head as the value head."""
     init_value_from_pretrained_checkpoint: str | None = None
     """Path to a directory containing a previously-saved `value_model.bin` to load into the value model."""
-    value_loss_coef: float = 0.5
-    """Coefficient for the value MSE loss (multiplied inside the value backward)."""
+    value_loss: Literal["mse", "classification"] = "mse"
+    """Value-model objective. Classification uses soft two-bin targets over [0, 1]."""
+    value_loss_coef: float = 1.0
+    """Coefficient for the value loss (multiplied inside the value backward)."""
     value_learning_rate: float | None = None
     """Learning rate for the value model. Falls back to `learning_rate` if None."""
     vf_clip_range: float = 0.2
@@ -182,10 +184,10 @@ class GRPOExperimentConfig(
     """Number of training passes over the value model per RL step (independent of policy `num_epochs`)."""
     whiten_advantages: bool = False
     """If True, whiten GAE advantages across the batch before applying them."""
-    skip_tool_outputs: bool = False
+    skip_tool_outputs: bool = True
     """If True, GAE skips tool/observation tokens and bootstraps from the last action token to the
-    first token of the next action (skip-observation GAE). Requires `--use_value_model` and
-    `mask_tool_use=True` so tool-output positions have response_mask==0."""
+    first token of the next action (skip-observation GAE). When using tools, `mask_tool_use=True`
+    ensures tool-output positions have response_mask==0."""
 
     # SAE (Segmental Advantage Estimation)
     use_sae: bool = False
@@ -379,6 +381,8 @@ class GRPOExperimentConfig(
                 "Cannot combine --init_value_from_rm and --init_value_from_pretrained_checkpoint; "
                 "pick one initialization source for the value model."
             )
+        if self.value_loss == "classification" and self.init_value_from_rm:
+            raise ValueError("--value_loss classification does not support --init_value_from_rm.")
         if self.length_adaptive_gae and not self.use_value_model:
             raise ValueError("--length_adaptive_gae requires --use_value_model.")
         if self.segment_adaptive_gae and not self.use_value_model:
@@ -393,8 +397,6 @@ class GRPOExperimentConfig(
             raise ValueError(f"--segment_adaptive_gae_alpha must be > 0, got {self.segment_adaptive_gae_alpha}.")
         if self.decoupled_gae and not self.use_value_model:
             raise ValueError("--decoupled_gae requires --use_value_model.")
-        if self.skip_tool_outputs and not self.use_value_model:
-            raise ValueError("--skip_tool_outputs requires --use_value_model.")
         if self.value_num_epochs <= 0:
             raise ValueError(f"--value_num_epochs must be > 0, got {self.value_num_epochs}.")
         if self.value_num_mini_batches is not None and self.value_num_mini_batches <= 0:
@@ -424,6 +426,8 @@ class GRPOExperimentConfig(
             )
         if self.value_model_ground_truth_conditioning and not self.use_value_model:
             raise ValueError("--value_model_ground_truth_conditioning requires --use_value_model.")
+        if self.value_loss == "classification" and self.value_model_ground_truth_conditioning:
+            raise ValueError("--value_loss classification does not support value-model ground-truth conditioning.")
         if self.rollout_context_num_siblings < -1:
             raise ValueError(f"--rollout_context_num_siblings must be >=-1, got {self.rollout_context_num_siblings}.")
 

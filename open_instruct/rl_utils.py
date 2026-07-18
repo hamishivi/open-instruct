@@ -415,7 +415,7 @@ def calculate_advantages_packed(
     lam: float,
     dones: np.ndarray,
     response_masks: np.ndarray,
-    skip_tool_outputs: bool = False,
+    skip_tool_outputs: bool = True,
 ):
     """Packed implementation of GAE. Each row is a packed sequence.
     The `dones` specifies the sequence boundaries, and the `response_masks` specifies the query boundaries.

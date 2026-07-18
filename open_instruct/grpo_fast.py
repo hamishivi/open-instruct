@@ -698,11 +698,14 @@ class PolicyTrainerRayProcess(RayProcess):
             )
             self.value_model.config.use_cache = False
             hidden_size = self.value_model.config.hidden_size
-            value_head = torch.nn.Linear(hidden_size, 1, bias=False, dtype=torch.bfloat16)
+            value_head_size = 2 if args.value_loss == "classification" else 1
+            value_head = torch.nn.Linear(hidden_size, value_head_size, bias=False, dtype=torch.bfloat16)
             std = 1.0 / (hidden_size + 1) ** 0.5
             torch.nn.init.normal_(value_head.weight, mean=0.0, std=std)
             self.value_model.lm_head = value_head
-            logger.info(f"{self.rank=}: Replaced LM head with scalar value head (hidden={hidden_size})")
+            logger.info(
+                f"{self.rank=}: Replaced LM head with value head (hidden={hidden_size}, outputs={value_head_size})"
+            )
 
         disable_dropout_in_model(self.value_model)
 
@@ -1573,22 +1576,27 @@ class PolicyTrainerRayProcess(RayProcess):
             self._value_alignment_warning_logged = True
         return aligned
 
+    def forward_value_logits(
+        self, query_responses: torch.Tensor, position_ids: torch.Tensor, response_mask: torch.Tensor
+    ) -> torch.Tensor:
+        assert self.value_model is not None, "value_model is not initialized"
+        output = self.value_model(input_ids=query_responses, position_ids=position_ids)
+        logits = getattr(output, "logits", output)[:, :-1]
+        target_shape = torch.Size((*response_mask.shape, logits.shape[-1]))
+        if logits.shape != target_shape:
+            target_len = target_shape[-2]
+            logits = logits[:, :target_len]
+            if logits.shape[-2] < target_len:
+                pad = logits.new_zeros(logits.shape[0], target_len - logits.shape[-2], logits.shape[-1])
+                logits = torch.cat((logits, pad), dim=-2)
+        return logits
+
     def forward_value(
         self, query_responses: torch.Tensor, position_ids: torch.Tensor, response_mask: torch.Tensor
     ) -> torch.Tensor:
-        """Compute per-token values for a packed sequence.
-
-        Returns the `Linear(h, 1)` output (shape: batch, seq_len-1), shifted by 1 so values[t]
-        aligns with a prediction about token t+1. Non-response positions are zeroed.
-
-        The forward intentionally does NOT splice ground-truth conditioning; that lives in
-        `_forward_value_with_gt` which wraps this call.
-        """
-        assert self.value_model is not None, "value_model is not initialized"
-        output = self.value_model(input_ids=query_responses, position_ids=position_ids)
-        logits = getattr(output, "logits", output)
-        logits = logits[:, :-1]
-        values = logits.squeeze(-1).float()
+        """Compute scalar per-token values for a packed sequence."""
+        logits = self.forward_value_logits(query_responses, position_ids, response_mask)
+        values = value_model_utils.predict_values(logits, self.args.value_loss)
         values = self._align_value_predictions(values, response_mask.shape, "forward_value")
         values = torch.where(response_mask, values, torch.zeros_like(values))
         return values
@@ -1855,7 +1863,7 @@ class PolicyTrainerRayProcess(RayProcess):
                     gen_value_results = self._score_gen_value_requests(gen_value_requests)
 
                 for i in range(num_samples):
-                    resp_mask = data_BT.response_masks[i][:, 1:].bool()
+                    resp_mask = value_model_utils.causal_value_mask(data_BT.response_masks[i])
                     gv_pairs: list[dict] = []
                     if _use_gen_value:
                         values_BT, gv_pairs = gen_value_results[i]
@@ -1979,9 +1987,7 @@ class PolicyTrainerRayProcess(RayProcess):
                                 _gen_value_adv_incorrect.extend([float(x) for x in adv_tokens])
                                 _gen_value_terminal_vhat_incorrect.append(terminal_vhat)
 
-                    # value_mask uses [:, :-1] so V(s_t) is supervised at the correct response
-                    # positions (not shifted left like response_masks[:, 1:] would do).
-                    value_mask = data_BT.response_masks[i][:, :-1].bool()
+                    value_mask = resp_mask
                     if value_loss_inputs is not None:
                         value_loss_inputs.append(
                             {
@@ -2257,6 +2263,7 @@ class PolicyTrainerRayProcess(RayProcess):
                             old_values = ctx["old_values"]
                             # Re-forward with grad on the value model (with conditioning if enabled).
                             if self.args.value_model_ground_truth_conditioning:
+                                value_logits = None
                                 value_source_BT = sp_value_data_BT if sp_value_data_BT is not None else data_BT
                                 gts_pack = (
                                     value_source_BT.ground_truths[i][0]
@@ -2283,17 +2290,28 @@ class PolicyTrainerRayProcess(RayProcess):
                                 )
                             else:
                                 dummy_grad_outputs = []
-                                new_values = self.forward_value(
+                                value_logits = self.forward_value_logits(
                                     data_BT.query_responses[i], data_BT.position_ids[i], resp_mask
                                 )
+                                new_values = value_model_utils.predict_values(value_logits, self.args.value_loss)
                             new_values = self._align_value_predictions(new_values, returns.shape, "value loss forward")
                             assert new_values.shape == returns.shape == old_values.shape, (
                                 f"value loss tensors must align: new={new_values.shape}, "
                                 f"returns={returns.shape}, old={old_values.shape}"
                             )
-                            per_tok, v_clipfrac = value_model_utils.value_clipped_mse_loss(
-                                new_values, returns, old_values, value_mask, self.args.vf_clip_range
-                            )
+                            if value_logits is None:
+                                per_tok, v_clipfrac = value_model_utils.value_clipped_mse_loss(
+                                    new_values, returns, old_values, value_mask, self.args.vf_clip_range
+                                )
+                            else:
+                                per_tok, v_clipfrac = value_model_utils.compute_value_loss(
+                                    value_logits,
+                                    returns,
+                                    old_values,
+                                    value_mask,
+                                    self.args.value_loss,
+                                    self.args.vf_clip_range,
+                                )
                             denom = value_mask.sum().clamp(min=1).float()
                             v_loss = (per_tok.sum() / denom) * self.args.value_loss_coef
                             v_loss = v_loss * (self.args.world_size // self.args.sequence_parallel_size)
@@ -2667,7 +2685,7 @@ def setup_runtime_variables(
         assert streaming_config.mask_tool_use, (
             "Must mask tool use when using vLLM logprobs or truncated importance sampling."
         )
-    if args.skip_tool_outputs:
+    if args.use_value_model and args.skip_tool_outputs and tools_config.enabled:
         assert streaming_config.mask_tool_use, (
             "--skip_tool_outputs requires mask_tool_use=True so tool-output tokens have response_mask==0."
         )

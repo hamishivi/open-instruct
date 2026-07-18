@@ -12,7 +12,7 @@ The value model itself is built, optimized, and DeepSpeed-managed inside
 
 - building value-conditioning strings from ground truths + sibling rollouts;
 - running the value forward with or without between-prompt-and-response conditioning;
-- extracting per-token values for the scalar regression head.
+- extracting scalar per-token values from regression or classification heads.
 """
 
 from __future__ import annotations
@@ -23,8 +23,59 @@ import re
 from collections.abc import Sequence
 
 import torch
+import torch.nn.functional as F
 
 from open_instruct import logger_utils
+
+
+def causal_value_mask(response_mask: torch.Tensor) -> torch.Tensor:
+    """Align action-token membership with causal outputs at positions ``[:-1]``."""
+    return response_mask[:, 1:].bool()
+
+
+def predict_values(logits: torch.Tensor, loss_type: str) -> torch.Tensor:
+    """Convert value-head outputs to scalar predictions."""
+    if loss_type == "mse":
+        return logits.squeeze(-1).float()
+    if loss_type == "classification":
+        if logits.shape[-1] != 2:
+            raise ValueError(f"Classification value head must have 2 outputs, got {logits.shape[-1]}.")
+        return logits.float().softmax(dim=-1)[..., 1]
+    raise ValueError(f"Unknown value loss type: {loss_type}")
+
+
+def classification_value_loss(
+    logits: torch.Tensor, returns: torch.Tensor, mask: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two-bin cross entropy for continuous targets on the support [0, 1]."""
+    tolerance = 1e-5
+    invalid = (returns < -tolerance) | (returns > 1.0 + tolerance)
+    if bool((invalid & mask).any()):
+        invalid_target = returns[invalid & mask][0].item()
+        raise ValueError(f"Classification value target {invalid_target} is outside [0, 1].")
+
+    targets = returns.float().clamp(0.0, 1.0)
+    target_distribution = torch.stack((1.0 - targets, targets), dim=-1)
+    per_token = -(target_distribution * F.log_softmax(logits.float(), dim=-1)).sum(dim=-1)
+    clipfrac = torch.zeros((), dtype=torch.float32, device=logits.device)
+    return per_token * mask.float(), clipfrac
+
+
+def compute_value_loss(
+    logits: torch.Tensor,
+    returns: torch.Tensor,
+    old_values: torch.Tensor | None,
+    mask: torch.Tensor,
+    loss_type: str,
+    clip_range: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute the configured per-token value loss and clipping diagnostic."""
+    if loss_type == "classification":
+        return classification_value_loss(logits, returns, mask)
+    if loss_type == "mse":
+        return value_clipped_mse_loss(predict_values(logits, loss_type), returns, old_values, mask, clip_range)
+    raise ValueError(f"Unknown value loss type: {loss_type}")
+
 
 logger = logger_utils.setup_logger(__name__)
 
