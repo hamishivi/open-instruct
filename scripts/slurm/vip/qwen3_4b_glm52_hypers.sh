@@ -74,7 +74,7 @@ if [[ -n "${APPTAINER_IMAGE:-}" ]]; then
   if [[ "${APPTAINER_LOCAL_VENV:-0}" == "1" ]]; then
     CONTAINER_VENV="${APPTAINER_LOCAL_VENV_DIR:-/scr/${USER}/open-instruct-${SLURM_JOB_ID}/.venv}"
     APPTAINER_LOCAL_BIND="$(dirname "${CONTAINER_VENV}")"
-    APPTAINER_UV_CACHE_DIR="${UV_CACHE_DIR:-/gscratch/h2lab/${USER}/uv-cache}"
+    APPTAINER_UV_CACHE_DIR="${APPTAINER_UV_CACHE_DIR:-/gscratch/h2lab/${USER}/uv-cache}"
     mkdir -p "${APPTAINER_LOCAL_BIND}"
     APPTAINER_SYNC_ARGS=(exec --nv)
     if [[ -n "${APPTAINER_BIND:-}" ]]; then
@@ -109,10 +109,10 @@ if [[ -n "${APPTAINER_IMAGE:-}" ]]; then
   # Keep model, dataset, and Xet downloads off the small home filesystem. The
   # gscratch mount is shared across jobs, so subsequent launches also reuse the
   # downloaded artifacts instead of filling node-local or home storage.
-  APPTAINER_HF_HOME="${HF_HOME:-/gscratch/h2lab/${USER}/huggingface}"
-  APPTAINER_HF_HUB_CACHE="${HF_HUB_CACHE:-${APPTAINER_HF_HOME}/hub}"
-  APPTAINER_HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${APPTAINER_HF_HOME}/datasets}"
-  APPTAINER_HF_XET_CACHE="${HF_XET_CACHE:-${APPTAINER_HF_HOME}/xet}"
+  APPTAINER_HF_HOME="${APPTAINER_HF_HOME:-/gscratch/h2lab/${USER}/huggingface}"
+  APPTAINER_HF_HUB_CACHE="${APPTAINER_HF_HUB_CACHE:-${APPTAINER_HF_HOME}/hub}"
+  APPTAINER_HF_DATASETS_CACHE="${APPTAINER_HF_DATASETS_CACHE:-${APPTAINER_HF_HOME}/datasets}"
+  APPTAINER_HF_XET_CACHE="${APPTAINER_HF_XET_CACHE:-${APPTAINER_HF_HOME}/xet}"
   mkdir -p \
     "${APPTAINER_HF_HUB_CACHE}" \
     "${APPTAINER_HF_DATASETS_CACHE}" \
@@ -122,6 +122,36 @@ if [[ -n "${APPTAINER_IMAGE:-}" ]]; then
     --env "HF_HUB_CACHE=${APPTAINER_HF_HUB_CACHE}"
     --env "HF_DATASETS_CACHE=${APPTAINER_HF_DATASETS_CACHE}"
     --env "HF_XET_CACHE=${APPTAINER_HF_XET_CACHE}"
+  )
+  # Compilation artifacts are large, highly environment-specific, and cheap to
+  # recreate. Keep them on node-local storage instead of the quota-limited home
+  # directory or shared gscratch. When the venv is node-local, reuse its bound
+  # parent so every Ray worker sees the same cache paths inside the container.
+  if [[ -n "${APPTAINER_LOCAL_BIND}" ]]; then
+    APPTAINER_RUNTIME_CACHE_DIR="${APPTAINER_RUNTIME_CACHE_DIR:-${APPTAINER_LOCAL_BIND}/cache}"
+  else
+    APPTAINER_RUNTIME_CACHE_DIR="${APPTAINER_RUNTIME_CACHE_DIR:-/tmp/open-instruct-${USER}-${SLURM_JOB_ID:-local}/cache}"
+  fi
+  APPTAINER_VLLM_CACHE_ROOT="${APPTAINER_VLLM_CACHE_ROOT:-${APPTAINER_RUNTIME_CACHE_DIR}/vllm}"
+  APPTAINER_TORCHINDUCTOR_CACHE_DIR="${APPTAINER_TORCHINDUCTOR_CACHE_DIR:-${APPTAINER_RUNTIME_CACHE_DIR}/torchinductor}"
+  APPTAINER_TRITON_CACHE_DIR="${APPTAINER_TRITON_CACHE_DIR:-${APPTAINER_RUNTIME_CACHE_DIR}/triton}"
+  APPTAINER_CUDA_CACHE_PATH="${APPTAINER_CUDA_CACHE_PATH:-${APPTAINER_RUNTIME_CACHE_DIR}/cuda}"
+  APPTAINER_XDG_CACHE_HOME="${APPTAINER_XDG_CACHE_HOME:-${APPTAINER_RUNTIME_CACHE_DIR}/xdg}"
+  APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-${APPTAINER_RUNTIME_CACHE_DIR}/tmp}"
+  mkdir -p \
+    "${APPTAINER_VLLM_CACHE_ROOT}" \
+    "${APPTAINER_TORCHINDUCTOR_CACHE_DIR}" \
+    "${APPTAINER_TRITON_CACHE_DIR}" \
+    "${APPTAINER_CUDA_CACHE_PATH}" \
+    "${APPTAINER_XDG_CACHE_HOME}" \
+    "${APPTAINER_TMPDIR}"
+  SRUN_PREFIX+=(
+    --env "VLLM_CACHE_ROOT=${APPTAINER_VLLM_CACHE_ROOT}"
+    --env "TORCHINDUCTOR_CACHE_DIR=${APPTAINER_TORCHINDUCTOR_CACHE_DIR}"
+    --env "TRITON_CACHE_DIR=${APPTAINER_TRITON_CACHE_DIR}"
+    --env "CUDA_CACHE_PATH=${APPTAINER_CUDA_CACHE_PATH}"
+    --env "XDG_CACHE_HOME=${APPTAINER_XDG_CACHE_HOME}"
+    --env "TMPDIR=${APPTAINER_TMPDIR}"
   )
   # The locked PyTorch stack ships CUDA 12.8 libraries. Do not let a newer
   # container toolkit (for example CUDA 12.9) override those wheel libraries;
