@@ -106,6 +106,23 @@ if [[ -n "${APPTAINER_IMAGE:-}" ]]; then
   fi
   export PATH="${CONTAINER_VENV}/bin:${PATH}"
   SRUN_PREFIX=(apptainer exec --nv --env "PREPEND_PATH=${CONTAINER_VENV}/bin")
+  # Keep model, dataset, and Xet downloads off the small home filesystem. The
+  # gscratch mount is shared across jobs, so subsequent launches also reuse the
+  # downloaded artifacts instead of filling node-local or home storage.
+  APPTAINER_HF_HOME="${HF_HOME:-/gscratch/h2lab/${USER}/huggingface}"
+  APPTAINER_HF_HUB_CACHE="${HF_HUB_CACHE:-${APPTAINER_HF_HOME}/hub}"
+  APPTAINER_HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${APPTAINER_HF_HOME}/datasets}"
+  APPTAINER_HF_XET_CACHE="${HF_XET_CACHE:-${APPTAINER_HF_HOME}/xet}"
+  mkdir -p \
+    "${APPTAINER_HF_HUB_CACHE}" \
+    "${APPTAINER_HF_DATASETS_CACHE}" \
+    "${APPTAINER_HF_XET_CACHE}"
+  SRUN_PREFIX+=(
+    --env "HF_HOME=${APPTAINER_HF_HOME}"
+    --env "HF_HUB_CACHE=${APPTAINER_HF_HUB_CACHE}"
+    --env "HF_DATASETS_CACHE=${APPTAINER_HF_DATASETS_CACHE}"
+    --env "HF_XET_CACHE=${APPTAINER_HF_XET_CACHE}"
+  )
   # The locked PyTorch stack ships CUDA 12.8 libraries. Do not let a newer
   # container toolkit (for example CUDA 12.9) override those wheel libraries;
   # retain only Apptainer's host-driver bind on the global lookup path.
