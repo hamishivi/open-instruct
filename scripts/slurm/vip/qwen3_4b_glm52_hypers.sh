@@ -19,7 +19,7 @@
 #   EXP_NAME, RUN_NAME, WANDB_PROJECT, NUM_LEARNERS_PER_NODE,
 #   VLLM_NUM_ENGINES, ASYNC_STEPS, POLICY_LEARNING_RATE,
 #   VALUE_LEARNING_RATE, VALUE_NUM_EPOCHS, VALUE_LOSS, SAE_THRESHOLD,
-#   SEGMENT_ADAPTIVE_GAE_ALPHA, NUM_SAMPLES_PER_PROMPT_ROLLOUT,
+#   NUM_SAMPLES_PER_PROMPT_ROLLOUT,
 #   NUM_UNIQUE_PROMPTS_ROLLOUT, NO_RESAMPLING_PASS_RATE,
 #   TOTAL_EPISODES, UV_SYNC, APPTAINER_IMAGE,
 #   APPTAINER_BIND,
@@ -52,7 +52,6 @@ VALUE_LEARNING_RATE="${VALUE_LEARNING_RATE:-5e-6}"
 VALUE_NUM_EPOCHS="${VALUE_NUM_EPOCHS:-2}"
 VALUE_LOSS="${VALUE_LOSS:-mse}"
 SAE_THRESHOLD="${SAE_THRESHOLD:-0.2}"
-SEGMENT_ADAPTIVE_GAE_ALPHA="${SEGMENT_ADAPTIVE_GAE_ALPHA:-0.5}"
 NUM_SAMPLES_PER_PROMPT_ROLLOUT="${NUM_SAMPLES_PER_PROMPT_ROLLOUT:-1}"
 NUM_UNIQUE_PROMPTS_ROLLOUT="${NUM_UNIQUE_PROMPTS_ROLLOUT:-128}"
 NO_RESAMPLING_PASS_RATE="${NO_RESAMPLING_PASS_RATE:-none}"
@@ -193,7 +192,7 @@ echo "Actors: learners=${NUM_LEARNERS_PER_NODE}  vLLM engines=${VLLM_NUM_ENGINES
 echo "Async:  steps=${ASYNC_STEPS}"
 echo "Rollout: samples_per_prompt=${NUM_SAMPLES_PER_PROMPT_ROLLOUT}  unique_prompts=${NUM_UNIQUE_PROMPTS_ROLLOUT}  no_resampling_pass_rate=${NO_RESAMPLING_PASS_RATE}"
 echo "Schedule: total_episodes=${TOTAL_EPISODES}"
-echo "Tuning: policy_lr=${POLICY_LEARNING_RATE}  value_lr=${VALUE_LEARNING_RATE}  value_epochs=${VALUE_NUM_EPOCHS}  value_loss=${VALUE_LOSS}  sae_threshold=${SAE_THRESHOLD}  segment_gae_alpha=${SEGMENT_ADAPTIVE_GAE_ALPHA}"
+echo "Tuning: policy_lr=${POLICY_LEARNING_RATE}  value_lr=${VALUE_LEARNING_RATE}  value_epochs=${VALUE_NUM_EPOCHS}  value_loss=${VALUE_LOSS}  sae_threshold=${SAE_THRESHOLD}"
 if [[ "${VALUE_LOSS}" == "classification" ]]; then
   echo "Value conditioning: disabled (classification value loss is incompatible with ground-truth conditioning)"
 else
@@ -267,8 +266,6 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
       --decoupled_gae \
       --use_sae \
       --sae_threshold "'"${SAE_THRESHOLD}"'" \
-      --segment_adaptive_gae \
-      --segment_adaptive_gae_alpha "'"${SEGMENT_ADAPTIVE_GAE_ALPHA}"'" \
       --skip_tool_outputs \
       --gamma 1.0 \
       --value_loss_coef 0.5 \

@@ -581,9 +581,11 @@ def calculate_advantages_packed_vapo(
 def _sae_lambda_array(
     values: np.ndarray,
     logprobs: np.ndarray,
+    dones: np.ndarray,
     response_masks: np.ndarray,
     sae_threshold: float,
     boundary_lam,  # scalar or ndarray shape values
+    skip_tool_outputs: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Build the per-position lambda array for SAE.
 
@@ -596,16 +598,26 @@ def _sae_lambda_array(
 
     boundary_is_array = isinstance(boundary_lam, np.ndarray)
     lambda_arr = np.ones_like(values, dtype=np.float64)
-    if gen_length > 1:
+    if skip_tool_outputs:
+        next_response = _next_response_token_indices(response_masks, dones)
+        for batch_idx in range(values.shape[0]):
+            response_positions = np.flatnonzero(response_masks[batch_idx] > 0)
+            for position in response_positions:
+                next_position = next_response[batch_idx, position]
+                if next_position >= 0 and is_boundary[batch_idx, next_position]:
+                    lambda_arr[batch_idx, position] = (
+                        boundary_lam[batch_idx, position] if boundary_is_array else boundary_lam
+                    )
+    elif gen_length > 1:
         next_boundary = is_boundary[:, 1:]
         if boundary_is_array:
             lambda_arr[:, :-1] = np.where(next_boundary, boundary_lam[:, :-1], 1.0)
         else:
             lambda_arr[:, :-1] = np.where(next_boundary, boundary_lam, 1.0)
-    if boundary_is_array:
-        lambda_arr[:, -1] = boundary_lam[:, -1]
-    else:
-        lambda_arr[:, -1] = boundary_lam
+        if boundary_is_array:
+            lambda_arr[:, -1] = boundary_lam[:, -1]
+        else:
+            lambda_arr[:, -1] = boundary_lam
 
     resp_tokens = int((response_masks > 0).sum())
     boundary_count = int(is_boundary.sum())
@@ -636,21 +648,6 @@ def _sae_response_segments(
     return subsequences
 
 
-def _segment_adaptive_boundary_lambdas(
-    values: np.ndarray, subsequences: list[tuple[int, int, int, int]], alpha: float
-) -> tuple[np.ndarray, list[float]]:
-    """Set SAE boundary lambda so total trace retention is stable across segment counts."""
-    boundary_lam = np.ones_like(values, dtype=np.float64)
-    lambdas: list[float] = []
-    for batch_idx, start, end, num_segments in subsequences:
-        num_boundaries = num_segments - 1
-        # lambda**num_boundaries = exp(-1 / alpha), independent of boundary count.
-        lam = float(np.clip(np.exp(-1.0 / (alpha * num_boundaries)), 0.0, 0.999)) if num_boundaries > 0 else 1.0
-        boundary_lam[batch_idx, start:end] = lam
-        lambdas.append(lam)
-    return boundary_lam, lambdas
-
-
 def calculate_advantages_packed_sae(
     values: np.ndarray,
     rewards: np.ndarray,
@@ -669,7 +666,7 @@ def calculate_advantages_packed_sae(
     response_masks = response_masks.clip(0, 1)
     dones = dones.clip(0, 1)
     lambda_arr, _, avg_boundary_frac = _sae_lambda_array(
-        values, logprobs, response_masks, sae_threshold, boundary_lam=lam
+        values, logprobs, dones, response_masks, sae_threshold, boundary_lam=lam, skip_tool_outputs=skip_tool_outputs
     )
     advantages = _backward_gae(
         values, rewards, gamma, lambda_arr, dones, response_masks, skip_tool_outputs=skip_tool_outputs
@@ -690,15 +687,12 @@ def calculate_advantages_packed_sae_vapo(
     lam_critic: float = 1.0,
     length_adaptive: bool = False,
     length_adaptive_alpha: float = 0.05,
-    segment_adaptive: bool = False,
-    segment_adaptive_alpha: float = 0.5,
     skip_tool_outputs: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
     """SAE + decoupled GAE.
 
     Critic uses lam_critic=1.0 (standard GAE). Policy uses SAE-style position-dependent lambda at
-    boundaries. Length adaptation scales lambda by response length; segment adaptation instead chooses
-    lambda so its product across all SAE boundaries has constant whole-response retention.
+    boundaries. Length adaptation can optionally scale lambda by response length.
 
     Returns (policy_advantages, critic_returns, SAE metrics).
     """
@@ -715,11 +709,7 @@ def calculate_advantages_packed_sae_vapo(
     subsequences = _sae_response_segments(is_boundary, dones, response_masks)
 
     boundary_lambdas: list[float]
-    if segment_adaptive:
-        boundary_lam, boundary_lambdas = _segment_adaptive_boundary_lambdas(
-            values, subsequences, segment_adaptive_alpha
-        )
-    elif length_adaptive:
+    if length_adaptive:
         batch_size = values.shape[0]
         boundary_lam_arr = np.full_like(values, lam_policy, dtype=np.float64)
         boundary_lambdas = []
@@ -740,7 +730,13 @@ def calculate_advantages_packed_sae_vapo(
         boundary_lambdas = [lam_policy for _ in subsequences]
 
     lambda_arr, _, avg_boundary_frac = _sae_lambda_array(
-        values, logprobs, response_masks, sae_threshold, boundary_lam=boundary_lam
+        values,
+        logprobs,
+        dones,
+        response_masks,
+        sae_threshold,
+        boundary_lam=boundary_lam,
+        skip_tool_outputs=skip_tool_outputs,
     )
     policy_advantages = _backward_gae(
         values, rewards, gamma, lambda_arr, dones, response_masks, skip_tool_outputs=skip_tool_outputs

@@ -1626,8 +1626,6 @@ class PolicyTrainerRayProcess(RayProcess):
                 lam_critic=1.0,
                 length_adaptive=args.length_adaptive_gae,
                 length_adaptive_alpha=args.length_adaptive_gae_alpha,
-                segment_adaptive=args.segment_adaptive_gae,
-                segment_adaptive_alpha=args.segment_adaptive_gae_alpha,
                 skip_tool_outputs=args.skip_tool_outputs,
             )
             metrics.update(sae_metrics)

@@ -98,25 +98,6 @@ class TestGAEVariants(unittest.TestCase):
         self.assertEqual(metrics["value/sae_segments_mean"], 2.0)
         self.assertEqual(metrics["value/sae_boundary_lambda_mean"], 0.5)
 
-    def test_segment_adaptive_sae_preserves_whole_response_retention(self):
-        v, r, d, m, logp = self._inputs()
-        alpha = 1.5
-        _, _, metrics = calculate_advantages_packed_sae_vapo(
-            v,
-            r,
-            gamma=1.0,
-            dones=d,
-            response_masks=m,
-            logprobs=logp,
-            sae_threshold=0.2,
-            segment_adaptive=True,
-            segment_adaptive_alpha=alpha,
-        )
-        num_boundaries = 1
-        expected_lambda = np.exp(-1.0 / (alpha * num_boundaries))
-        self.assertAlmostEqual(metrics["value/sae_boundary_lambda_mean"], expected_lambda)
-        self.assertAlmostEqual(expected_lambda**num_boundaries, np.exp(-1.0 / alpha))
-
     def test_length_adaptive_lambda(self):
         # alpha*length = 1 -> lambda = 0
         self.assertEqual(calculate_length_adaptive_lambda(1, alpha=1.0), 0.0)
@@ -147,6 +128,75 @@ class TestGAEVariants(unittest.TestCase):
         self.assertAlmostEqual(adv_skip[0, 2], (3.0 - 2.0) + adv_skip[0, 5], places=6)
         # Standard GAE would bootstrap onto the tool token value instead.
         self.assertNotAlmostEqual(adv_skip[0, 2], adv_std[0, 2], places=6)
+
+    def test_skip_tool_outputs_matches_sequence_without_observations(self):
+        values = np.array([[0.0, 0.2, 0.4, 9.0, 8.0, 0.6, 0.8]], dtype=np.float64)
+        rewards = np.zeros((1, 7), dtype=np.float64)
+        rewards[0, 6] = 1.0
+        dones = np.zeros((1, 7), dtype=np.float64)
+        dones[0, 6] = 1.0
+        response_masks = np.array([[0, 1, 1, 0, 0, 1, 1]], dtype=np.float64)
+
+        advantages, _ = calculate_advantages_packed(
+            values, rewards, gamma=0.9, lam=0.5, dones=dones, response_masks=response_masks, skip_tool_outputs=True
+        )
+
+        action_indices = [1, 2, 5, 6]
+        compact_values = values[:, action_indices]
+        compact_rewards = rewards[:, action_indices]
+        compact_dones = dones[:, action_indices]
+        compact_mask = np.ones_like(compact_values)
+        compact_advantages, _ = calculate_advantages_packed(
+            compact_values,
+            compact_rewards,
+            gamma=0.9,
+            lam=0.5,
+            dones=compact_dones,
+            response_masks=compact_mask,
+            skip_tool_outputs=True,
+        )
+
+        np.testing.assert_allclose(advantages[:, action_indices], compact_advantages)
+        np.testing.assert_allclose(advantages[:, [0, 3, 4]], 0.0)
+
+    def test_sae_skip_tool_outputs_matches_sequence_without_observations(self):
+        values = np.array([[0.0, 0.2, 0.4, 9.0, 8.0, 0.6, 0.8]], dtype=np.float64)
+        rewards = np.zeros((1, 7), dtype=np.float64)
+        rewards[0, 6] = 1.0
+        dones = np.zeros((1, 7), dtype=np.float64)
+        dones[0, 6] = 1.0
+        response_masks = np.array([[0, 1, 1, 0, 0, 1, 1]], dtype=np.float64)
+        logprobs = np.array([[-0.1, -0.1, -0.1, -0.1, -0.1, -2.5, -0.1]], dtype=np.float64)
+
+        policy_advantages, critic_returns, metrics = calculate_advantages_packed_sae_vapo(
+            values,
+            rewards,
+            gamma=0.9,
+            dones=dones,
+            response_masks=response_masks,
+            logprobs=logprobs,
+            sae_threshold=0.2,
+            lam_policy=0.5,
+            skip_tool_outputs=True,
+        )
+
+        action_indices = [1, 2, 5, 6]
+        compact_policy_advantages, compact_critic_returns, compact_metrics = calculate_advantages_packed_sae_vapo(
+            values[:, action_indices],
+            rewards[:, action_indices],
+            gamma=0.9,
+            dones=dones[:, action_indices],
+            response_masks=np.ones((1, len(action_indices)), dtype=np.float64),
+            logprobs=logprobs[:, action_indices],
+            sae_threshold=0.2,
+            lam_policy=0.5,
+            skip_tool_outputs=True,
+        )
+
+        np.testing.assert_allclose(policy_advantages[:, action_indices], compact_policy_advantages)
+        np.testing.assert_allclose(critic_returns[:, action_indices], compact_critic_returns)
+        np.testing.assert_allclose(policy_advantages[:, [0, 3, 4]], 0.0)
+        self.assertEqual(metrics, compact_metrics)
 
 
 class TestTISMask(unittest.TestCase):
