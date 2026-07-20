@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
+import torch
 from datasets import Dataset
 
 from open_instruct import data_loader as data_loader_lib
@@ -16,7 +17,12 @@ from open_instruct.dataset_transformation import (
     RAW_PROMPT_KEY,
     VERIFIER_SOURCE_KEY,
 )
-from open_instruct.grpo_fast import _is_in_warmup_window, create_generation_configs, maybe_evaluate
+from open_instruct.grpo_fast import (
+    PolicyTrainerRayProcess,
+    _is_in_warmup_window,
+    create_generation_configs,
+    maybe_evaluate,
+)
 
 
 class _QueueWithSize:
@@ -82,6 +88,34 @@ class TestWarmupWindows(unittest.TestCase):
 
         self.assertTrue(_is_in_warmup_window(args, 55))
         self.assertFalse(_is_in_warmup_window(args, 61))
+
+
+class TestConditionedClassificationValueForward(unittest.TestCase):
+    def test_preserves_two_logits_and_converts_to_scalar_values(self):
+        trainer = object.__new__(PolicyTrainerRayProcess)
+        trainer.args = SimpleNamespace(value_loss="classification", sequence_parallel_size=1)
+        trainer._sp_world_size = 1
+
+        query_responses = torch.tensor([[10, 11, 12, 13]])
+        position_ids = torch.arange(4).unsqueeze(0)
+        response_mask = torch.tensor([[False, True, True, False]])
+        subseq = {"offset_in_pack": 0, "response_is_resp": response_mask[0]}
+        trainer._unpack_subseqs = Mock(return_value=[subseq])
+        trainer._build_conditioned_value_entries = Mock(
+            return_value=[{"input_ids": query_responses[0], "orig_mask": response_mask[0], "subseq": subseq}]
+        )
+        model_logits = torch.tensor([[[0.0, 1.0], [1.0, 3.0], [4.0, 1.0], [2.0, 2.0]]], requires_grad=True)
+        trainer.value_model = Mock(return_value=SimpleNamespace(logits=model_logits))
+
+        logits = trainer._forward_value_with_conditioning(
+            query_responses, position_ids, response_mask, ["42"], None, return_logits=True
+        )
+        values = trainer._forward_value_with_conditioning(query_responses, position_ids, response_mask, ["42"], None)
+
+        self.assertEqual(logits.shape, (1, 3, 2))
+        torch.testing.assert_close(logits[0, :2], model_logits[0, :2])
+        torch.testing.assert_close(values[0, :2], model_logits[0, :2].softmax(dim=-1)[:, 1])
+        self.assertTrue(logits.requires_grad)
 
 
 class TestMaybeEvaluate(unittest.TestCase):

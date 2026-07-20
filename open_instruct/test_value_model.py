@@ -371,6 +371,16 @@ class TestValueLoss(unittest.TestCase):
         self.assertEqual(config.value_loss_coef, 1.0)
         self.assertTrue(config.skip_tool_outputs)
 
+    def test_classification_supports_ground_truth_conditioning(self):
+        config = grpo_utils.GRPOExperimentConfig(
+            use_value_model=True,
+            value_loss="classification",
+            value_model_ground_truth_conditioning=True,
+            gt_conditioning_template="answer_prefix",
+        )
+        self.assertEqual(config.value_loss, "classification")
+        self.assertTrue(config.value_model_ground_truth_conditioning)
+
     def test_causal_value_mask_uses_shifted_action_coordinates(self):
         response_mask = torch.tensor([[False, False, True, False, True]])
         expected = torch.tensor([[False, True, False, True]])

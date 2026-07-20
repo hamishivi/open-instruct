@@ -19,6 +19,7 @@
 #   EXP_NAME, RUN_NAME, WANDB_PROJECT, NUM_LEARNERS_PER_NODE,
 #   VLLM_NUM_ENGINES, ASYNC_STEPS, POLICY_LEARNING_RATE,
 #   VALUE_LEARNING_RATE, VALUE_NUM_EPOCHS, VALUE_LOSS, SAE_THRESHOLD,
+#   VALUE_MODEL_GROUND_TRUTH_CONDITIONING, GT_CONDITIONING_TEMPLATE,
 #   NUM_SAMPLES_PER_PROMPT_ROLLOUT,
 #   NUM_UNIQUE_PROMPTS_ROLLOUT, NO_RESAMPLING_PASS_RATE,
 #   TOTAL_EPISODES, UV_SYNC, APPTAINER_IMAGE,
@@ -52,6 +53,8 @@ VALUE_LEARNING_RATE="${VALUE_LEARNING_RATE:-5e-6}"
 VALUE_NUM_EPOCHS="${VALUE_NUM_EPOCHS:-2}"
 VALUE_LOSS="${VALUE_LOSS:-mse}"
 SAE_THRESHOLD="${SAE_THRESHOLD:-0.2}"
+VALUE_MODEL_GROUND_TRUTH_CONDITIONING="${VALUE_MODEL_GROUND_TRUTH_CONDITIONING:-true}"
+GT_CONDITIONING_TEMPLATE="${GT_CONDITIONING_TEMPLATE:-answer_prefix}"
 NUM_SAMPLES_PER_PROMPT_ROLLOUT="${NUM_SAMPLES_PER_PROMPT_ROLLOUT:-1}"
 NUM_UNIQUE_PROMPTS_ROLLOUT="${NUM_UNIQUE_PROMPTS_ROLLOUT:-128}"
 NO_RESAMPLING_PASS_RATE="${NO_RESAMPLING_PASS_RATE:-none}"
@@ -64,6 +67,13 @@ case "${VALUE_LOSS}" in
   *)
     echo "ERROR: VALUE_LOSS must be mse or classification, got: ${VALUE_LOSS}" >&2
     exit 1
+    ;;
+esac
+case "${VALUE_MODEL_GROUND_TRUTH_CONDITIONING}" in
+  true|false) ;;
+  *)
+    echo "ERROR: VALUE_MODEL_GROUND_TRUTH_CONDITIONING must be true or false, got: ${VALUE_MODEL_GROUND_TRUTH_CONDITIONING}" >&2
+    exit 2
     ;;
 esac
 
@@ -193,10 +203,10 @@ echo "Async:  steps=${ASYNC_STEPS}"
 echo "Rollout: samples_per_prompt=${NUM_SAMPLES_PER_PROMPT_ROLLOUT}  unique_prompts=${NUM_UNIQUE_PROMPTS_ROLLOUT}  no_resampling_pass_rate=${NO_RESAMPLING_PASS_RATE}"
 echo "Schedule: total_episodes=${TOTAL_EPISODES}"
 echo "Tuning: policy_lr=${POLICY_LEARNING_RATE}  value_lr=${VALUE_LEARNING_RATE}  value_epochs=${VALUE_NUM_EPOCHS}  value_loss=${VALUE_LOSS}  sae_threshold=${SAE_THRESHOLD}"
-if [[ "${VALUE_LOSS}" == "classification" ]]; then
-  echo "Value conditioning: disabled (classification value loss is incompatible with ground-truth conditioning)"
+if [[ "${VALUE_MODEL_GROUND_TRUTH_CONDITIONING}" == "true" ]]; then
+  echo "Value conditioning: ${GT_CONDITIONING_TEMPLATE}"
 else
-  echo "Value conditioning: answer_prefix"
+  echo "Value conditioning: disabled"
 fi
 echo "===================================="
 
@@ -208,9 +218,9 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
     if [[ "'"${NO_RESAMPLING_PASS_RATE}"'" != "none" ]]; then
       no_resampling_args=(--no_resampling_pass_rate "'"${NO_RESAMPLING_PASS_RATE}"'")
     fi
-    value_conditioning_args=(--value_model_ground_truth_conditioning --gt_conditioning_template answer_prefix)
-    if [[ "'"${VALUE_LOSS}"'" == "classification" ]]; then
-      value_conditioning_args=()
+    value_conditioning_args=()
+    if [[ "'"${VALUE_MODEL_GROUND_TRUTH_CONDITIONING}"'" == "true" ]]; then
+      value_conditioning_args=(--value_model_ground_truth_conditioning --gt_conditioning_template "'"${GT_CONDITIONING_TEMPLATE}"'")
     fi
     python open_instruct/grpo_fast.py \
       --exp_name "'"${EXP_NAME}"'" \

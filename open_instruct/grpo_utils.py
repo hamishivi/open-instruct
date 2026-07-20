@@ -412,8 +412,6 @@ class GRPOExperimentConfig(
             )
         if self.value_model_ground_truth_conditioning and not self.use_value_model:
             raise ValueError("--value_model_ground_truth_conditioning requires --use_value_model.")
-        if self.value_loss == "classification" and self.value_model_ground_truth_conditioning:
-            raise ValueError("--value_loss classification does not support value-model ground-truth conditioning.")
         if self.rollout_context_num_siblings < -1:
             raise ValueError(f"--rollout_context_num_siblings must be >=-1, got {self.rollout_context_num_siblings}.")
 

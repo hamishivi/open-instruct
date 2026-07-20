@@ -1272,7 +1272,10 @@ class PolicyTrainerRayProcess(RayProcess):
         assert self.splitter is not None, "SP conditioned value forward requires an SP splitter"
         original_padded_len = max(original_batch_seq_lens) if original_batch_seq_lens else original_seq_len
         original_start, original_end, _ = self._sp_slice_bounds(original_padded_len)
-        local_out = torch.zeros(1, original_end - original_start - 1, dtype=torch.float32, device=device)
+        value_head_size = 2 if self.args.value_loss == "classification" else 1
+        local_out = torch.zeros(
+            1, original_end - original_start - 1, value_head_size, dtype=torch.float32, device=device
+        )
 
         target_len = getattr(self.args, "value_model_repack_max_length", None)
         if target_len is None or target_len <= 0:
@@ -1346,12 +1349,16 @@ class PolicyTrainerRayProcess(RayProcess):
             logits = getattr(output, "logits", output)
             if dummy_grad_outputs is not None:
                 dummy_grad_outputs.append(logits.reshape(-1).sum())
-            local_values = logits[:, :-1].squeeze(-1).float()
+            local_logits = logits[:, :-1].float()
 
             local_seq_len = local_ids.shape[-1]
-            local_values = self._align_value_predictions(
-                local_values, torch.Size((1, local_seq_len - 1)), "conditioned value local forward"
-            )
+            if local_logits.shape[1] != local_seq_len - 1:
+                local_logits = local_logits[:, : local_seq_len - 1]
+                if local_logits.shape[1] < local_seq_len - 1:
+                    pad = local_logits.new_zeros(
+                        local_logits.shape[0], local_seq_len - 1 - local_logits.shape[1], local_logits.shape[2]
+                    )
+                    local_logits = torch.cat((local_logits, pad), dim=1)
             cond_start = local_seq_len * self._sp_rank
             cond_end = local_seq_len * (self._sp_rank + 1)
             cond_padded_len = local_seq_len * self._sp_world_size
@@ -1361,7 +1368,7 @@ class PolicyTrainerRayProcess(RayProcess):
             valid = (local_map >= original_start) & (local_map < original_end - 1)
             if bool(valid.any().item()):
                 local_orig_idx = local_map[valid] - original_start
-                local_out[0, local_orig_idx] = local_values[0, valid]
+                local_out[0, local_orig_idx] = local_logits[0, valid]
 
         return local_out
 
@@ -1374,7 +1381,8 @@ class PolicyTrainerRayProcess(RayProcess):
         device: torch.device,
         dummy_grad_outputs: list | None = None,
     ) -> torch.Tensor:
-        out_values = torch.zeros(1, full_len - 1, dtype=torch.float32, device=device)
+        value_head_size = 2 if self.args.value_loss == "classification" else 1
+        out_logits = torch.zeros(1, full_len - 1, value_head_size, dtype=torch.float32, device=device)
         target_len = getattr(self.args, "value_model_repack_max_length", None)
         if target_len is None or target_len <= 0:
             target_len = getattr(self.streaming_config, "pack_length", full_len)
@@ -1400,7 +1408,7 @@ class PolicyTrainerRayProcess(RayProcess):
 
             output = self.value_model(input_ids=packed_ids, attention_mask=None, position_ids=packed_pos)
             logits = getattr(output, "logits", output)
-            pack_values = logits[0, :-1].squeeze(-1).float()
+            pack_logits = logits[0, :-1].float()
 
             row_offset = 0
             for entry in pack_entries:
@@ -1409,17 +1417,17 @@ class PolicyTrainerRayProcess(RayProcess):
                     row_offset += entry_len
                     continue
 
-                sub_values = pack_values[row_offset : row_offset + entry_len - 1]
-                new_resp_values = sub_values[entry["orig_mask"][1:]]
+                sub_logits = pack_logits[row_offset : row_offset + entry_len - 1]
+                new_resp_logits = sub_logits[entry["orig_mask"][1:]]
                 sub = entry["subseq"]
                 base = sub["offset_in_pack"]
                 resp_mask = sub["response_is_resp"]
                 resp_positions = resp_mask[1:].nonzero(as_tuple=True)[0] + base
-                n = min(resp_positions.numel(), new_resp_values.numel())
-                out_values[0, resp_positions[:n]] = new_resp_values[:n]
+                n = min(resp_positions.numel(), new_resp_logits.shape[0])
+                out_logits[0, resp_positions[:n]] = new_resp_logits[:n]
                 row_offset += entry_len
 
-        return out_values
+        return out_logits
 
     def _forward_value_with_conditioning(
         self,
@@ -1432,6 +1440,7 @@ class PolicyTrainerRayProcess(RayProcess):
         sequential: bool = False,
         dummy_grad_outputs: list | None = None,
         original_batch_seq_lens: list[int] | None = None,
+        return_logits: bool = False,
     ) -> torch.Tensor:
         """Per-sub-sequence forward with conditioning text spliced via `value_model_utils`.
 
@@ -1441,16 +1450,19 @@ class PolicyTrainerRayProcess(RayProcess):
         When ``sequential=False``, all sub-sequences are padded and forwarded in a single
         batched call. Only safe without SP and with small n_subs.
 
-        Returns a values tensor of shape (batch=1, seq_len-1) matching `query_responses[:, 1:]`.
+        Returns scalar values of shape ``(1, seq_len - 1)`` by default. With
+        ``return_logits=True``, returns the value-head logits of shape
+        ``(1, seq_len - 1, num_value_labels)`` for loss computation.
         """
         args = self.args
         subseqs = self._unpack_subseqs(query_responses, position_ids, response_mask)
         full_len = query_responses.shape[1]
         device = query_responses.device
-        out_values = torch.zeros(1, full_len - 1, dtype=torch.float32, device=device)
+        value_head_size = 2 if args.value_loss == "classification" else 1
+        out_logits = torch.zeros(1, full_len - 1, value_head_size, dtype=torch.float32, device=device)
 
         if not subseqs:
-            return out_values
+            return out_logits if return_logits else value_model_utils.predict_values(out_logits, args.value_loss)
 
         value_entries = self._build_conditioned_value_entries(
             query_responses,
@@ -1464,7 +1476,7 @@ class PolicyTrainerRayProcess(RayProcess):
         orig_masks_list = [entry["orig_mask"] for entry in value_entries]
 
         if self._sp_world_size > 1:
-            return self._forward_sp_conditioned_value_entries(
+            conditioned_logits = self._forward_sp_conditioned_value_entries(
                 value_entries,
                 full_len,
                 original_batch_seq_lens or [full_len],
@@ -1473,16 +1485,26 @@ class PolicyTrainerRayProcess(RayProcess):
                 device,
                 dummy_grad_outputs=dummy_grad_outputs,
             )
+            return (
+                conditioned_logits
+                if return_logits
+                else value_model_utils.predict_values(conditioned_logits, args.value_loss)
+            )
 
         if sequential:
             if getattr(args, "value_model_repack_conditioned_inputs", True) and args.sequence_parallel_size == 1:
-                return self._forward_repacked_conditioned_value_entries(
+                conditioned_logits = self._forward_repacked_conditioned_value_entries(
                     value_entries,
                     full_len,
                     position_ids.dtype,
                     query_responses.dtype,
                     device,
                     dummy_grad_outputs=dummy_grad_outputs,
+                )
+                return (
+                    conditioned_logits
+                    if return_logits
+                    else value_model_utils.predict_values(conditioned_logits, args.value_loss)
                 )
 
             # ZeRO-3 requires all DP ranks to call the value model the same number of times
@@ -1501,22 +1523,22 @@ class PolicyTrainerRayProcess(RayProcess):
                     pos = torch.arange(L, dtype=position_ids.dtype, device=device).unsqueeze(0)
                     output = self.value_model(input_ids=ids.unsqueeze(0), attention_mask=attn, position_ids=pos)
                     logits = getattr(output, "logits", output)
-                    sub_values = logits[0, :-1].squeeze(-1).float()  # (L-1,)
+                    sub_logits = logits[0, :-1].float()
                     orig_mask_shifted = orig_mask[1:]
-                    new_resp_values = sub_values[orig_mask_shifted]
+                    new_resp_logits = sub_logits[orig_mask_shifted]
                     sub = subseqs[i]
                     base = sub["offset_in_pack"]
                     resp_mask = sub["response_is_resp"]
                     resp_positions = resp_mask[1:].nonzero(as_tuple=True)[0] + base
-                    n = min(resp_positions.numel(), new_resp_values.numel())
-                    out_values[0, resp_positions[:n]] = new_resp_values[:n]
+                    n = min(resp_positions.numel(), new_resp_logits.shape[0])
+                    out_logits[0, resp_positions[:n]] = new_resp_logits[:n]
                 else:
                     # Dummy forward to keep ZeRO-3 ALLGATHER in sync across ranks.
                     # During the loss pass, the caller collects dummy_grad_outputs and folds
                     # them into v_loss with a 0 weight so that backward also traverses the
                     # same number of layers on all ranks (ZeRO-3 backward allgather parity).
                     self._dummy_value_forward(query_responses.dtype, device, dummy_grad_outputs=dummy_grad_outputs)
-            return out_values
+            return out_logits if return_logits else value_model_utils.predict_values(out_logits, args.value_loss)
 
         # Pad all expanded sequences to the same length for a single batched forward.
         n_subs = len(expanded_ids_list)
@@ -1533,20 +1555,20 @@ class PolicyTrainerRayProcess(RayProcess):
         # Single model call — one ZeRO-3 allgather cycle regardless of sub-sequence count.
         output = self.value_model(input_ids=padded_ids, attention_mask=padded_attn, position_ids=padded_pos)
         logits = getattr(output, "logits", output)
-        all_values = logits[:, :-1].squeeze(-1).float()  # (n_subs, max_len - 1)
+        all_logits = logits[:, :-1].float()
 
         # Scatter values back into out_values at original response positions.
         for i, sub in enumerate(subseqs):
             L = expanded_ids_list[i].shape[0]
             orig_mask_shifted = orig_masks_list[i][1:]  # length L-1; aligns with shifted logits
-            new_resp_values = all_values[i, : L - 1][orig_mask_shifted]
+            new_resp_logits = all_logits[i, : L - 1][orig_mask_shifted]
             base = sub["offset_in_pack"]
             mask = sub["response_is_resp"]
             resp_positions = mask[1:].nonzero(as_tuple=True)[0] + base
-            n = min(resp_positions.numel(), new_resp_values.numel())
-            out_values[0, resp_positions[:n]] = new_resp_values[:n]
+            n = min(resp_positions.numel(), new_resp_logits.shape[0])
+            out_logits[0, resp_positions[:n]] = new_resp_logits[:n]
 
-        return out_values
+        return out_logits if return_logits else value_model_utils.predict_values(out_logits, args.value_loss)
 
     def _align_value_predictions(self, values: torch.Tensor, target_shape: torch.Size, context: str) -> torch.Tensor:
         """Align value predictions to the local shifted token shape.
@@ -2261,7 +2283,6 @@ class PolicyTrainerRayProcess(RayProcess):
                             old_values = ctx["old_values"]
                             # Re-forward with grad on the value model (with conditioning if enabled).
                             if self.args.value_model_ground_truth_conditioning:
-                                value_logits = None
                                 value_source_BT = sp_value_data_BT if sp_value_data_BT is not None else data_BT
                                 gts_pack = (
                                     value_source_BT.ground_truths[i][0]
@@ -2275,7 +2296,7 @@ class PolicyTrainerRayProcess(RayProcess):
                                 )
                                 hints_pack = value_source_BT.hints[i][0] if value_source_BT.hints is not None else None
                                 dummy_grad_outputs: list = []
-                                new_values = self._forward_value_with_conditioning(
+                                conditioned_output = self._forward_value_with_conditioning(
                                     value_source_BT.query_responses[i],
                                     value_source_BT.position_ids[i],
                                     value_source_BT.response_masks[i].bool(),
@@ -2285,7 +2306,14 @@ class PolicyTrainerRayProcess(RayProcess):
                                     sequential=True,
                                     dummy_grad_outputs=dummy_grad_outputs,
                                     original_batch_seq_lens=[t.shape[-1] for t in value_source_BT.query_responses],
+                                    return_logits=self.args.value_loss == "classification",
                                 )
+                                if self.args.value_loss == "classification":
+                                    value_logits = conditioned_output
+                                    new_values = value_model_utils.predict_values(value_logits, self.args.value_loss)
+                                else:
+                                    value_logits = None
+                                    new_values = conditioned_output
                             else:
                                 dummy_grad_outputs = []
                                 value_logits = self.forward_value_logits(
