@@ -20,6 +20,7 @@
 #   VLLM_NUM_ENGINES, ASYNC_STEPS, POLICY_LEARNING_RATE,
 #   VALUE_LEARNING_RATE, VALUE_NUM_EPOCHS, VALUE_LOSS, SAE_THRESHOLD,
 #   VALUE_MODEL_GROUND_TRUTH_CONDITIONING, GT_CONDITIONING_TEMPLATE,
+#   ACTIVE_SAMPLING, FILTER_ZERO_STD_SAMPLES,
 #   NUM_SAMPLES_PER_PROMPT_ROLLOUT,
 #   NUM_UNIQUE_PROMPTS_ROLLOUT, NO_RESAMPLING_PASS_RATE,
 #   TOTAL_EPISODES, UV_SYNC, APPTAINER_IMAGE,
@@ -55,6 +56,8 @@ VALUE_LOSS="${VALUE_LOSS:-mse}"
 SAE_THRESHOLD="${SAE_THRESHOLD:-0.2}"
 VALUE_MODEL_GROUND_TRUTH_CONDITIONING="${VALUE_MODEL_GROUND_TRUTH_CONDITIONING:-true}"
 GT_CONDITIONING_TEMPLATE="${GT_CONDITIONING_TEMPLATE:-answer_prefix}"
+ACTIVE_SAMPLING="${ACTIVE_SAMPLING:-false}"
+FILTER_ZERO_STD_SAMPLES="${FILTER_ZERO_STD_SAMPLES:-false}"
 NUM_SAMPLES_PER_PROMPT_ROLLOUT="${NUM_SAMPLES_PER_PROMPT_ROLLOUT:-1}"
 NUM_UNIQUE_PROMPTS_ROLLOUT="${NUM_UNIQUE_PROMPTS_ROLLOUT:-128}"
 NO_RESAMPLING_PASS_RATE="${NO_RESAMPLING_PASS_RATE:-none}"
@@ -76,6 +79,19 @@ case "${VALUE_MODEL_GROUND_TRUTH_CONDITIONING}" in
     exit 2
     ;;
 esac
+for bool_var in ACTIVE_SAMPLING FILTER_ZERO_STD_SAMPLES; do
+  case "${!bool_var}" in
+    true|false) ;;
+    *)
+      echo "ERROR: ${bool_var} must be true or false, got: ${!bool_var}" >&2
+      exit 2
+      ;;
+  esac
+done
+if [[ "${ACTIVE_SAMPLING}" == "true" && "${FILTER_ZERO_STD_SAMPLES}" != "true" ]]; then
+  echo "ERROR: ACTIVE_SAMPLING=true requires FILTER_ZERO_STD_SAMPLES=true" >&2
+  exit 2
+fi
 
 # Ensure Ray and the training dependencies are available inside the allocation.
 # Set UV_SYNC=0 when reusing an already-synced environment. On clusters whose
@@ -200,7 +216,7 @@ echo "Run:    ${RUN_NAME}"
 echo "Nodes:  ${SLURM_JOB_NUM_NODES}  GPUs/node: ${SLURM_GPUS_ON_NODE:-${SLURM_GPUS_PER_NODE:-8}}"
 echo "Actors: learners=${NUM_LEARNERS_PER_NODE}  vLLM engines=${VLLM_NUM_ENGINES}"
 echo "Async:  steps=${ASYNC_STEPS}"
-echo "Rollout: samples_per_prompt=${NUM_SAMPLES_PER_PROMPT_ROLLOUT}  unique_prompts=${NUM_UNIQUE_PROMPTS_ROLLOUT}  no_resampling_pass_rate=${NO_RESAMPLING_PASS_RATE}"
+echo "Rollout: samples_per_prompt=${NUM_SAMPLES_PER_PROMPT_ROLLOUT}  unique_prompts=${NUM_UNIQUE_PROMPTS_ROLLOUT}  active_sampling=${ACTIVE_SAMPLING}  filter_zero_std=${FILTER_ZERO_STD_SAMPLES}  no_resampling_pass_rate=${NO_RESAMPLING_PASS_RATE}"
 echo "Schedule: total_episodes=${TOTAL_EPISODES}"
 echo "Tuning: policy_lr=${POLICY_LEARNING_RATE}  value_lr=${VALUE_LEARNING_RATE}  value_epochs=${VALUE_NUM_EPOCHS}  value_loss=${VALUE_LOSS}  sae_threshold=${SAE_THRESHOLD}"
 if [[ "${VALUE_MODEL_GROUND_TRUTH_CONDITIONING}" == "true" ]]; then
@@ -233,9 +249,10 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
       --tis_mask_lower 0.8 \
       --tis_mask_upper 3.0 \
       --advantage_normalization_type centered \
+      --active_sampling "'"${ACTIVE_SAMPLING}"'" \
       --num_samples_per_prompt_rollout "'"${NUM_SAMPLES_PER_PROMPT_ROLLOUT}"'" \
       "${no_resampling_args[@]}" \
-      --filter_zero_std_samples False \
+      --filter_zero_std_samples "'"${FILTER_ZERO_STD_SAMPLES}"'" \
       --num_unique_prompts_rollout "'"${NUM_UNIQUE_PROMPTS_ROLLOUT}"'" \
       --num_mini_batches 1 \
       --learning_rate "'"${POLICY_LEARNING_RATE}"'" \
