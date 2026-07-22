@@ -23,6 +23,8 @@
 #   ACTIVE_SAMPLING, FILTER_ZERO_STD_SAMPLES,
 #   NUM_SAMPLES_PER_PROMPT_ROLLOUT,
 #   NUM_UNIQUE_PROMPTS_ROLLOUT, NO_RESAMPLING_PASS_RATE,
+#   USE_VLLM_LOGPROBS, TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP,
+#   TIS_MASK_LOWER, TIS_MASK_UPPER,
 #   TOTAL_EPISODES, UV_SYNC, APPTAINER_IMAGE,
 #   APPTAINER_BIND,
 #   APPTAINER_LOCAL_VENV, VLLM_ALLOW_INSECURE_SERIALIZATION, etc.
@@ -61,6 +63,10 @@ FILTER_ZERO_STD_SAMPLES="${FILTER_ZERO_STD_SAMPLES:-false}"
 NUM_SAMPLES_PER_PROMPT_ROLLOUT="${NUM_SAMPLES_PER_PROMPT_ROLLOUT:-1}"
 NUM_UNIQUE_PROMPTS_ROLLOUT="${NUM_UNIQUE_PROMPTS_ROLLOUT:-128}"
 NO_RESAMPLING_PASS_RATE="${NO_RESAMPLING_PASS_RATE:-none}"
+USE_VLLM_LOGPROBS="${USE_VLLM_LOGPROBS:-true}"
+TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP="${TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP:-0}"
+TIS_MASK_LOWER="${TIS_MASK_LOWER:-0.8}"
+TIS_MASK_UPPER="${TIS_MASK_UPPER:-3.0}"
 TOTAL_EPISODES="${TOTAL_EPISODES:-281600}"
 WANDB_ENTITY_NAME="${WANDB_ENTITY:-hamishivi}"
 WANDB_PROJECT_NAME="${WANDB_PROJECT:-VIP}"
@@ -79,7 +85,7 @@ case "${VALUE_MODEL_GROUND_TRUTH_CONDITIONING}" in
     exit 2
     ;;
 esac
-for bool_var in ACTIVE_SAMPLING FILTER_ZERO_STD_SAMPLES; do
+for bool_var in ACTIVE_SAMPLING FILTER_ZERO_STD_SAMPLES USE_VLLM_LOGPROBS; do
   case "${!bool_var}" in
     true|false) ;;
     *)
@@ -217,6 +223,7 @@ echo "Nodes:  ${SLURM_JOB_NUM_NODES}  GPUs/node: ${SLURM_GPUS_ON_NODE:-${SLURM_G
 echo "Actors: learners=${NUM_LEARNERS_PER_NODE}  vLLM engines=${VLLM_NUM_ENGINES}"
 echo "Async:  steps=${ASYNC_STEPS}"
 echo "Rollout: samples_per_prompt=${NUM_SAMPLES_PER_PROMPT_ROLLOUT}  unique_prompts=${NUM_UNIQUE_PROMPTS_ROLLOUT}  active_sampling=${ACTIVE_SAMPLING}  filter_zero_std=${FILTER_ZERO_STD_SAMPLES}  no_resampling_pass_rate=${NO_RESAMPLING_PASS_RATE}"
+echo "Off-policy correction: use_vllm_logprobs=${USE_VLLM_LOGPROBS}  tis_cap=${TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP}  hard_ratio_mask=[${TIS_MASK_LOWER},${TIS_MASK_UPPER}]"
 echo "Schedule: total_episodes=${TOTAL_EPISODES}"
 echo "Tuning: policy_lr=${POLICY_LEARNING_RATE}  value_lr=${VALUE_LEARNING_RATE}  value_epochs=${VALUE_NUM_EPOCHS}  value_loss=${VALUE_LOSS}  sae_threshold=${SAE_THRESHOLD}"
 if [[ "${VALUE_MODEL_GROUND_TRUTH_CONDITIONING}" == "true" ]]; then
@@ -244,10 +251,10 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
       --beta 0.0 \
       --async_steps "'"${ASYNC_STEPS}"'" \
       --inflight_updates \
-      --use_vllm_logprobs True \
-      --truncated_importance_sampling_ratio_cap 0 \
-      --tis_mask_lower 0.8 \
-      --tis_mask_upper 3.0 \
+      --use_vllm_logprobs "'"${USE_VLLM_LOGPROBS}"'" \
+      --truncated_importance_sampling_ratio_cap "'"${TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP}"'" \
+      --tis_mask_lower "'"${TIS_MASK_LOWER}"'" \
+      --tis_mask_upper "'"${TIS_MASK_UPPER}"'" \
       --advantage_normalization_type centered \
       --active_sampling "'"${ACTIVE_SAMPLING}"'" \
       --num_samples_per_prompt_rollout "'"${NUM_SAMPLES_PER_PROMPT_ROLLOUT}"'" \
