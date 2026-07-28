@@ -24,6 +24,7 @@
 #   USE_VLLM_LOGPROBS, TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP,
 #   TIS_MASK_LOWER, TIS_MASK_UPPER,
 #   TOTAL_EPISODES, UV_SYNC, APPTAINER_IMAGE,
+#   CHECKPOINT_STATE_FREQ, CHECKPOINT_STATE_DIR,
 #   APPTAINER_BIND,
 #   APPTAINER_LOCAL_VENV, VLLM_ALLOW_INSECURE_SERIALIZATION, etc.
 
@@ -62,6 +63,8 @@ TIS_MASK_UPPER="${TIS_MASK_UPPER:-3.0}"
 TOTAL_EPISODES="${TOTAL_EPISODES:-281600}"
 WANDB_ENTITY_NAME="${WANDB_ENTITY:-hamishivi}"
 WANDB_PROJECT_NAME="${WANDB_PROJECT:-VIP}"
+CHECKPOINT_STATE_FREQ="${CHECKPOINT_STATE_FREQ:-50}"
+CHECKPOINT_STATE_DIR="${CHECKPOINT_STATE_DIR:-/gscratch/h2lab/${USER}/tmp/checkpoint_states/${RUN_NAME}}"
 
 for bool_var in ACTIVE_SAMPLING FILTER_ZERO_STD_SAMPLES USE_VLLM_LOGPROBS; do
   case "${!bool_var}" in
@@ -76,6 +79,11 @@ if [[ "${ACTIVE_SAMPLING}" == "true" && "${FILTER_ZERO_STD_SAMPLES}" != "true" ]
   echo "ERROR: ACTIVE_SAMPLING=true requires FILTER_ZERO_STD_SAMPLES=true" >&2
   exit 2
 fi
+if ! [[ "${CHECKPOINT_STATE_FREQ}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: CHECKPOINT_STATE_FREQ must be a positive integer, got: ${CHECKPOINT_STATE_FREQ}" >&2
+  exit 2
+fi
+mkdir -p "$(dirname "${CHECKPOINT_STATE_DIR}")"
 
 # Ensure Ray and the training dependencies are available inside the allocation.
 # Set UV_SYNC=0 when reusing an already-synced environment. On clusters whose
@@ -205,6 +213,7 @@ echo "Off-policy correction: use_vllm_logprobs=${USE_VLLM_LOGPROBS}  tis_cap=${T
 echo "Schedule: total_episodes=${TOTAL_EPISODES}"
 echo "Algorithm: pure centered GRPO (no critic/value model, GAE, SAE, or value warmup)"
 echo "Tuning: policy_lr=${POLICY_LEARNING_RATE}"
+echo "Resume state: every ${CHECKPOINT_STATE_FREQ} steps -> ${CHECKPOINT_STATE_DIR}"
 echo "===================================="
 
 # Start Ray on every allocated node (head on rank 0, workers block).
@@ -214,7 +223,8 @@ export \
   ACTIVE_SAMPLING NUM_SAMPLES_PER_PROMPT_ROLLOUT NO_RESAMPLING_PASS_RATE \
   FILTER_ZERO_STD_SAMPLES NUM_UNIQUE_PROMPTS_ROLLOUT POLICY_LEARNING_RATE \
   TOTAL_EPISODES NUM_LEARNERS_PER_NODE VLLM_NUM_ENGINES \
-  WANDB_ENTITY_NAME WANDB_PROJECT_NAME
+  WANDB_ENTITY_NAME WANDB_PROJECT_NAME \
+  CHECKPOINT_STATE_FREQ CHECKPOINT_STATE_DIR
 srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
   source scripts/slurm/vip/ray_node_setup.sh
   if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
@@ -246,6 +256,8 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
       --non_stop_penalty False \
       --temperature 1.0 \
       --total_episodes "${TOTAL_EPISODES}"
+      --checkpoint_state_freq "${CHECKPOINT_STATE_FREQ}"
+      --checkpoint_state_dir "${CHECKPOINT_STATE_DIR}"
       --deepspeed_stage 3 \
       --num_learners_per_node "${NUM_LEARNERS_PER_NODE}"
       --num_nodes 1 \
