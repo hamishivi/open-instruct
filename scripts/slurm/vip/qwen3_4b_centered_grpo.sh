@@ -23,6 +23,8 @@
 #   NUM_UNIQUE_PROMPTS_ROLLOUT, NO_RESAMPLING_PASS_RATE,
 #   USE_VLLM_LOGPROBS, TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP,
 #   TIS_MASK_LOWER, TIS_MASK_UPPER,
+#   DATASET_NAME, DATASET_WEIGHT, SFT_MESSAGES_KEY, GROUND_TRUTHS_KEY,
+#   VERIFIER_SOURCE_KEY, HINTS_KEY, CHAT_TEMPLATE_NAME,
 #   TOTAL_EPISODES, UV_SYNC, APPTAINER_IMAGE,
 #   CHECKPOINT_STATE_FREQ, CHECKPOINT_STATE_DIR,
 #   APPTAINER_BIND,
@@ -60,6 +62,13 @@ USE_VLLM_LOGPROBS="${USE_VLLM_LOGPROBS:-true}"
 TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP="${TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP:-0}"
 TIS_MASK_LOWER="${TIS_MASK_LOWER:-0.8}"
 TIS_MASK_UPPER="${TIS_MASK_UPPER:-3.0}"
+DATASET_NAME="${DATASET_NAME:-hamishivi/DAPO-Math-17k-Processed_filtered}"
+DATASET_WEIGHT="${DATASET_WEIGHT:-1.0}"
+SFT_MESSAGES_KEY="${SFT_MESSAGES_KEY:-messages}"
+GROUND_TRUTHS_KEY="${GROUND_TRUTHS_KEY:-ground_truth}"
+VERIFIER_SOURCE_KEY="${VERIFIER_SOURCE_KEY:-dataset}"
+HINTS_KEY="${HINTS_KEY:-hint}"
+CHAT_TEMPLATE_NAME="${CHAT_TEMPLATE_NAME-qwen_instruct_user_boxed_math}"
 TOTAL_EPISODES="${TOTAL_EPISODES:-281600}"
 WANDB_ENTITY_NAME="${WANDB_ENTITY:-hamishivi}"
 WANDB_PROJECT_NAME="${WANDB_PROJECT:-VIP}"
@@ -211,6 +220,8 @@ echo "Async:  steps=${ASYNC_STEPS}"
 echo "Rollout: samples_per_prompt=${NUM_SAMPLES_PER_PROMPT_ROLLOUT}  unique_prompts=${NUM_UNIQUE_PROMPTS_ROLLOUT}  active_sampling=${ACTIVE_SAMPLING}  filter_zero_std=${FILTER_ZERO_STD_SAMPLES}  no_resampling_pass_rate=${NO_RESAMPLING_PASS_RATE}"
 echo "Off-policy correction: use_vllm_logprobs=${USE_VLLM_LOGPROBS}  tis_cap=${TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP}  hard_ratio_mask=[${TIS_MASK_LOWER},${TIS_MASK_UPPER}]"
 echo "Schedule: total_episodes=${TOTAL_EPISODES}"
+echo "Dataset: ${DATASET_NAME} weight=${DATASET_WEIGHT} messages=${SFT_MESSAGES_KEY} ground_truth=${GROUND_TRUTHS_KEY} verifier=${VERIFIER_SOURCE_KEY} hints=${HINTS_KEY}"
+echo "Chat template: ${CHAT_TEMPLATE_NAME:-model default}"
 echo "Algorithm: pure centered GRPO (no critic/value model, GAE, SAE, or value warmup)"
 echo "Tuning: policy_lr=${POLICY_LEARNING_RATE}"
 echo "Resume state: every ${CHECKPOINT_STATE_FREQ} steps -> ${CHECKPOINT_STATE_DIR}"
@@ -222,6 +233,8 @@ export \
   TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP TIS_MASK_LOWER TIS_MASK_UPPER \
   ACTIVE_SAMPLING NUM_SAMPLES_PER_PROMPT_ROLLOUT NO_RESAMPLING_PASS_RATE \
   FILTER_ZERO_STD_SAMPLES NUM_UNIQUE_PROMPTS_ROLLOUT POLICY_LEARNING_RATE \
+  DATASET_NAME DATASET_WEIGHT SFT_MESSAGES_KEY GROUND_TRUTHS_KEY \
+  VERIFIER_SOURCE_KEY HINTS_KEY CHAT_TEMPLATE_NAME \
   TOTAL_EPISODES NUM_LEARNERS_PER_NODE VLLM_NUM_ENGINES \
   WANDB_ENTITY_NAME WANDB_PROJECT_NAME \
   CHECKPOINT_STATE_FREQ CHECKPOINT_STATE_DIR
@@ -238,6 +251,8 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
       --truncated_importance_sampling_ratio_cap "${TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP}"
       --tis_mask_lower "${TIS_MASK_LOWER}"
       --tis_mask_upper "${TIS_MASK_UPPER}"
+      --clip_lower 0.2
+      --clip_higher 0.272
       --advantage_normalization_type centered \
       --active_sampling "${ACTIVE_SAMPLING}"
       --num_samples_per_prompt_rollout "${NUM_SAMPLES_PER_PROMPT_ROLLOUT}"
@@ -246,13 +261,16 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
       --num_mini_batches 1 \
       --learning_rate "${POLICY_LEARNING_RATE}"
       --per_device_train_batch_size 1 \
-      --dataset_mixer_list hamishivi/DAPO-Math-17k-Processed_filtered 1.0 \
+      --dataset_mixer_list "${DATASET_NAME}" "${DATASET_WEIGHT}"
       --dataset_mixer_list_splits train \
+      --sft_messages_key "${SFT_MESSAGES_KEY}"
+      --ground_truths_key "${GROUND_TRUTHS_KEY}"
+      --verifier_source_key "${VERIFIER_SOURCE_KEY}"
+      --hints_key "${HINTS_KEY}"
       --max_prompt_token_length 2048 \
       --response_length 8192 \
       --pack_length 10240 \
       --model_name_or_path Qwen/Qwen3-4B-Base \
-      --chat_template_name qwen_instruct_user_boxed_math \
       --non_stop_penalty False \
       --temperature 1.0 \
       --total_episodes "${TOTAL_EPISODES}"
@@ -279,6 +297,9 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
     )
     if [[ "${NO_RESAMPLING_PASS_RATE}" != "none" ]]; then
       train_args+=(--no_resampling_pass_rate "${NO_RESAMPLING_PASS_RATE}")
+    fi
+    if [[ -n "${CHAT_TEMPLATE_NAME}" ]]; then
+      train_args+=(--chat_template_name "${CHAT_TEMPLATE_NAME}")
     fi
     python open_instruct/grpo_fast.py "${train_args[@]}"
   fi

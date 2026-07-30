@@ -25,7 +25,10 @@
 #   NUM_UNIQUE_PROMPTS_ROLLOUT, NO_RESAMPLING_PASS_RATE,
 #   USE_VLLM_LOGPROBS, TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP,
 #   TIS_MASK_LOWER, TIS_MASK_UPPER,
+#   DATASET_NAME, DATASET_WEIGHT, SFT_MESSAGES_KEY, GROUND_TRUTHS_KEY,
+#   VERIFIER_SOURCE_KEY, HINTS_KEY, CHAT_TEMPLATE_NAME,
 #   TOTAL_EPISODES, UV_SYNC, APPTAINER_IMAGE,
+#   CHECKPOINT_STATE_FREQ, CHECKPOINT_STATE_DIR,
 #   APPTAINER_BIND,
 #   APPTAINER_LOCAL_VENV, VLLM_ALLOW_INSECURE_SERIALIZATION, etc.
 
@@ -67,9 +70,18 @@ USE_VLLM_LOGPROBS="${USE_VLLM_LOGPROBS:-true}"
 TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP="${TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP:-0}"
 TIS_MASK_LOWER="${TIS_MASK_LOWER:-0.8}"
 TIS_MASK_UPPER="${TIS_MASK_UPPER:-3.0}"
+DATASET_NAME="${DATASET_NAME:-hamishivi/DAPO-Math-17k-Processed_filtered}"
+DATASET_WEIGHT="${DATASET_WEIGHT:-1.0}"
+SFT_MESSAGES_KEY="${SFT_MESSAGES_KEY:-messages}"
+GROUND_TRUTHS_KEY="${GROUND_TRUTHS_KEY:-ground_truth}"
+VERIFIER_SOURCE_KEY="${VERIFIER_SOURCE_KEY:-dataset}"
+HINTS_KEY="${HINTS_KEY:-hint}"
+CHAT_TEMPLATE_NAME="${CHAT_TEMPLATE_NAME-qwen_instruct_user_boxed_math}"
 TOTAL_EPISODES="${TOTAL_EPISODES:-281600}"
 WANDB_ENTITY_NAME="${WANDB_ENTITY:-hamishivi}"
 WANDB_PROJECT_NAME="${WANDB_PROJECT:-VIP}"
+CHECKPOINT_STATE_FREQ="${CHECKPOINT_STATE_FREQ:-50}"
+CHECKPOINT_STATE_DIR="${CHECKPOINT_STATE_DIR:-/gscratch/h2lab/${USER}/tmp/checkpoint_states/${RUN_NAME}}"
 
 case "${VALUE_LOSS}" in
   mse|classification) ;;
@@ -98,6 +110,11 @@ if [[ "${ACTIVE_SAMPLING}" == "true" && "${FILTER_ZERO_STD_SAMPLES}" != "true" ]
   echo "ERROR: ACTIVE_SAMPLING=true requires FILTER_ZERO_STD_SAMPLES=true" >&2
   exit 2
 fi
+if ! [[ "${CHECKPOINT_STATE_FREQ}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: CHECKPOINT_STATE_FREQ must be a positive integer, got: ${CHECKPOINT_STATE_FREQ}" >&2
+  exit 2
+fi
+mkdir -p "$(dirname "${CHECKPOINT_STATE_DIR}")"
 
 # Ensure Ray and the training dependencies are available inside the allocation.
 # Set UV_SYNC=0 when reusing an already-synced environment. On clusters whose
@@ -225,7 +242,10 @@ echo "Async:  steps=${ASYNC_STEPS}"
 echo "Rollout: samples_per_prompt=${NUM_SAMPLES_PER_PROMPT_ROLLOUT}  unique_prompts=${NUM_UNIQUE_PROMPTS_ROLLOUT}  active_sampling=${ACTIVE_SAMPLING}  filter_zero_std=${FILTER_ZERO_STD_SAMPLES}  no_resampling_pass_rate=${NO_RESAMPLING_PASS_RATE}"
 echo "Off-policy correction: use_vllm_logprobs=${USE_VLLM_LOGPROBS}  tis_cap=${TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP}  hard_ratio_mask=[${TIS_MASK_LOWER},${TIS_MASK_UPPER}]"
 echo "Schedule: total_episodes=${TOTAL_EPISODES}"
+echo "Dataset: ${DATASET_NAME} weight=${DATASET_WEIGHT} messages=${SFT_MESSAGES_KEY} ground_truth=${GROUND_TRUTHS_KEY} verifier=${VERIFIER_SOURCE_KEY} hints=${HINTS_KEY}"
+echo "Chat template: ${CHAT_TEMPLATE_NAME:-model default}"
 echo "Tuning: policy_lr=${POLICY_LEARNING_RATE}  value_lr=${VALUE_LEARNING_RATE}  value_epochs=${VALUE_NUM_EPOCHS}  value_loss=${VALUE_LOSS}  sae_threshold=${SAE_THRESHOLD}"
+echo "Resume state: every ${CHECKPOINT_STATE_FREQ} steps -> ${CHECKPOINT_STATE_DIR}"
 if [[ "${VALUE_MODEL_GROUND_TRUTH_CONDITIONING}" == "true" ]]; then
   echo "Value conditioning: ${GT_CONDITIONING_TEMPLATE}"
 else
@@ -245,6 +265,10 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
     if [[ "'"${VALUE_MODEL_GROUND_TRUTH_CONDITIONING}"'" == "true" ]]; then
       value_conditioning_args=(--value_model_ground_truth_conditioning --gt_conditioning_template "'"${GT_CONDITIONING_TEMPLATE}"'")
     fi
+    chat_template_args=()
+    if [[ -n "'"${CHAT_TEMPLATE_NAME}"'" ]]; then
+      chat_template_args=(--chat_template_name "'"${CHAT_TEMPLATE_NAME}"'")
+    fi
     python open_instruct/grpo_fast.py \
       --exp_name "'"${EXP_NAME}"'" \
       --run_name "'"${RUN_NAME}"'" \
@@ -255,6 +279,8 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
       --truncated_importance_sampling_ratio_cap "'"${TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP}"'" \
       --tis_mask_lower "'"${TIS_MASK_LOWER}"'" \
       --tis_mask_upper "'"${TIS_MASK_UPPER}"'" \
+      --clip_lower 0.2 \
+      --clip_higher 0.272 \
       --advantage_normalization_type centered \
       --active_sampling "'"${ACTIVE_SAMPLING}"'" \
       --num_samples_per_prompt_rollout "'"${NUM_SAMPLES_PER_PROMPT_ROLLOUT}"'" \
@@ -264,16 +290,22 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
       --num_mini_batches 1 \
       --learning_rate "'"${POLICY_LEARNING_RATE}"'" \
       --per_device_train_batch_size 1 \
-      --dataset_mixer_list hamishivi/DAPO-Math-17k-Processed_filtered 1.0 \
+      --dataset_mixer_list "'"${DATASET_NAME}"'" "'"${DATASET_WEIGHT}"'" \
       --dataset_mixer_list_splits train \
+      --sft_messages_key "'"${SFT_MESSAGES_KEY}"'" \
+      --ground_truths_key "'"${GROUND_TRUTHS_KEY}"'" \
+      --verifier_source_key "'"${VERIFIER_SOURCE_KEY}"'" \
+      --hints_key "'"${HINTS_KEY}"'" \
       --max_prompt_token_length 2048 \
       --response_length 8192 \
       --pack_length 10240 \
       --model_name_or_path Qwen/Qwen3-4B-Base \
-      --chat_template_name qwen_instruct_user_boxed_math \
+      "${chat_template_args[@]}" \
       --non_stop_penalty False \
       --temperature 1.0 \
       --total_episodes "'"${TOTAL_EPISODES}"'" \
+      --checkpoint_state_freq "'"${CHECKPOINT_STATE_FREQ}"'" \
+      --checkpoint_state_dir "'"${CHECKPOINT_STATE_DIR}"'" \
       --deepspeed_stage 3 \
       --num_learners_per_node "'"${NUM_LEARNERS_PER_NODE}"'" \
       --num_nodes 1 \

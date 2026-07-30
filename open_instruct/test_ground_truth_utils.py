@@ -13,11 +13,21 @@ from parameterized import parameterized
 from open_instruct.ground_truth_utils import (
     F1Verifier,
     GSM8KVerifier,
+    IFEvalVerifier,
     LMJudgeVerifier,
     LMJudgeVerifierConfig,
     PuzzleMatcherVerifier,
     cleanup_all_llm_judge_clients,
 )
+
+
+class TestIFEvalVerifier(unittest.TestCase):
+    def test_dataset_ground_truth_format_routes_to_ifeval_verifier(self):
+        verifier = IFEvalVerifier()
+        label = "[{'instruction_id': ['last_word:last_word_answer'], 'kwargs': [{'last_word': 'brief'}]}]"
+
+        self.assertEqual(verifier([], "A concise answer ending in brief", label).score, 1.0)
+        self.assertEqual(verifier([], "A concise answer ending incorrectly", label).score, 0.0)
 
 
 class TestPuzzleMatcherVerifier(unittest.TestCase):

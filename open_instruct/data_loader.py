@@ -436,6 +436,8 @@ class StreamingDataLoaderConfig:
     dataset_config_eval_hash: str | None = None
     dataset_skip_cache: bool = False
     system_prompt_override_file: str | None = None
+    hints_key: str = HINTS_KEY
+    """Source dataset column used for value-model hints. Defaults to ``hint``."""
 
     # Generation
     temperature: float = 0.7
@@ -769,6 +771,7 @@ def accumulate_inference_batches(
     max_possible_score: float = 1.0,
     requeue_on_timeout: bool = True,
     ground_truth_overrides: dict[int, Any] | None = None,
+    hints_key: str = HINTS_KEY,
 ) -> (
     tuple[data_types.GenerationResult, Batch, dict, BatchStatistics]
     | tuple[data_types.ShutdownSentinel | None, None, None, None]
@@ -841,7 +844,7 @@ def accumulate_inference_batches(
         example = dataset[result.index]
         query = example[INPUT_IDS_PROMPT_KEY]
         ground_truth = example[GROUND_TRUTHS_KEY]
-        hint = example.get(HINTS_KEY)
+        hint = example.get(hints_key)
         dataset_name = example[VERIFIER_SOURCE_KEY]
         raw_query = example[RAW_PROMPT_KEY]
         sample_active_tools = example.get(TOOLS_COLUMN_KEY)
@@ -1443,6 +1446,7 @@ class DataPreparationActor:
                 max_possible_score=self.config.max_possible_score,
                 base_env_config=self.base_env_config,
                 ground_truth_overrides=self.ground_truth_overrides,
+                hints_key=self.config.hints_key,
             )
             logger.info(
                 f"[DataPreparationActor] Step {step}: accumulate_inference_batches returned, result type: {type(result).__name__}"

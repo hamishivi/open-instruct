@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=vip-if-sae-ap
+#SBATCH --account=gpu-h200-h2lab
+#SBATCH --partition=gpu-h200
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=4
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=1100G
+#SBATCH --time=72:00:00
+#SBATCH --output=logs/%j.%x.out
+#SBATCH --error=logs/%j.%x.err
+
+set -euo pipefail
+
+DDMM=$(date +"%d%m")
+export EXP_NAME="${EXP_NAME:-vip_if_sae_ap_g8_p32_as_zvf_tis2_${DDMM}_q3_4b}"
+export NUM_LEARNERS_PER_NODE="${NUM_LEARNERS_PER_NODE:-2}"
+export VLLM_NUM_ENGINES="${VLLM_NUM_ENGINES:-2}"
+export ASYNC_STEPS="${ASYNC_STEPS:-8}"
+export ACTIVE_SAMPLING="${ACTIVE_SAMPLING:-true}"
+export FILTER_ZERO_STD_SAMPLES="${FILTER_ZERO_STD_SAMPLES:-true}"
+export NUM_SAMPLES_PER_PROMPT_ROLLOUT="${NUM_SAMPLES_PER_PROMPT_ROLLOUT:-8}"
+export NUM_UNIQUE_PROMPTS_ROLLOUT="${NUM_UNIQUE_PROMPTS_ROLLOUT:-32}"
+export NO_RESAMPLING_PASS_RATE="${NO_RESAMPLING_PASS_RATE:-0.875}"
+export USE_VLLM_LOGPROBS="${USE_VLLM_LOGPROBS:-false}"
+export TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP="${TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP:-2}"
+export TIS_MASK_LOWER="${TIS_MASK_LOWER:-0}"
+export TIS_MASK_UPPER="${TIS_MASK_UPPER:-0}"
+export TOTAL_EPISODES="${TOTAL_EPISODES:-281600}"
+export POLICY_LEARNING_RATE="${POLICY_LEARNING_RATE:-1e-6}"
+export VALUE_LEARNING_RATE="${VALUE_LEARNING_RATE:-5e-6}"
+export VALUE_NUM_EPOCHS="${VALUE_NUM_EPOCHS:-2}"
+export VALUE_LOSS="${VALUE_LOSS:-mse}"
+export SAE_THRESHOLD="${SAE_THRESHOLD:-0.2}"
+export VALUE_MODEL_GROUND_TRUTH_CONDITIONING="${VALUE_MODEL_GROUND_TRUTH_CONDITIONING:-true}"
+export GT_CONDITIONING_TEMPLATE="${GT_CONDITIONING_TEMPLATE:-answer_prefix}"
+export DATASET_NAME="${DATASET_NAME:-allenai/IF_multi_constraints_upto5}"
+export DATASET_WEIGHT="${DATASET_WEIGHT:-1.0}"
+export SFT_MESSAGES_KEY="${SFT_MESSAGES_KEY:-messages}"
+export GROUND_TRUTHS_KEY="${GROUND_TRUTHS_KEY:-ground_truth}"
+export VERIFIER_SOURCE_KEY="${VERIFIER_SOURCE_KEY:-dataset}"
+export HINTS_KEY="${HINTS_KEY:-constraint}"
+export CHAT_TEMPLATE_NAME="${CHAT_TEMPLATE_NAME:-}"
+export CHECKPOINT_STATE_FREQ="${CHECKPOINT_STATE_FREQ:-50}"
+export APPTAINER_IMAGE="${APPTAINER_IMAGE:-/gscratch/h2lab/hamishiv/containers/vllm-openai-v0.19.1.sif}"
+export APPTAINER_BIND="${APPTAINER_BIND:-/mmfs1/gscratch:/gscratch}"
+export APPTAINER_LOCAL_VENV="${APPTAINER_LOCAL_VENV:-1}"
+
+exec bash scripts/slurm/vip/qwen3_4b_glm52_hypers.sh
