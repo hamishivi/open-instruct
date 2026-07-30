@@ -294,7 +294,6 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
       --dataset_mixer_list_splits train \
       --sft_messages_key "'"${SFT_MESSAGES_KEY}"'" \
       --ground_truths_key "'"${GROUND_TRUTHS_KEY}"'" \
-      --dataset_source_key "'"${VERIFIER_SOURCE_KEY}"'" \
       --hints_key "'"${HINTS_KEY}"'" \
       --max_prompt_token_length 2048 \
       --response_length 8192 \
