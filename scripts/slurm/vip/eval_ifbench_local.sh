@@ -17,7 +17,8 @@ set -euo pipefail
 : "${MODEL_REVISION:?Set MODEL_REVISION to the Hugging Face revision}"
 
 OPEN_INSTRUCT_DIR="${OPEN_INSTRUCT_DIR:-/mmfs1/gscratch/h2lab/hamishiv/open-instruct-vip-if-runs}"
-OE_EVAL_INTERNAL_DIR="${OE_EVAL_INTERNAL_DIR:-/mmfs1/gscratch/h2lab/hamishiv/oe-eval-internal-vip-ifbench}"
+OE_EVAL_ARCHIVE="${OE_EVAL_ARCHIVE:-/mmfs1/gscratch/h2lab/hamishiv/oe-eval-internal-vip-ifbench.tar.gz}"
+OE_EVAL_INTERNAL_DIR="${OE_EVAL_INTERNAL_DIR:-/scr/hamishiv/oe-eval-internal-${SLURM_JOB_ID}}"
 CONTAINER="${CONTAINER:-/gscratch/h2lab/hamishiv/containers/vllm-openai-v0.19.1.sif}"
 ENV_DIR="${ENV_DIR:-/gscratch/h2lab/hamishiv/uv-envs/oe-eval-ifbench}"
 RESULTS_ROOT="${RESULTS_ROOT:-/mmfs1/gscratch/h2lab/hamishiv/oe-eval-results/vip_ifbench_local}"
@@ -32,6 +33,8 @@ export UV_PROJECT_ENVIRONMENT="${ENV_DIR}"
 export TMPDIR="${TMPDIR:-/tmp/oi-ifbench-${SLURM_JOB_ID}}"
 
 mkdir -p "${OUTPUT_DIR}" "${TMPDIR}" "${UV_CACHE_DIR}" "${HF_HUB_CACHE}" "${HF_DATASETS_CACHE}"
+mkdir -p "${OE_EVAL_INTERNAL_DIR}"
+tar -xzf "${OE_EVAL_ARCHIVE}" -C "${OE_EVAL_INTERNAL_DIR}"
 
 echo "Syncing oe-eval environment: ${ENV_DIR}"
 uv sync --project "${OE_EVAL_INTERNAL_DIR}" --frozen --no-dev
