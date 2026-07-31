@@ -29,6 +29,20 @@ class TestIFEvalVerifier(unittest.TestCase):
         self.assertEqual(verifier([], "A concise answer ending in brief", label).score, 1.0)
         self.assertEqual(verifier([], "A concise answer ending incorrectly", label).score, 0.0)
 
+    def test_scores_only_answer_payload_after_thinking_trace(self):
+        verifier = IFEvalVerifier()
+        label = "[{'instruction_id': ['last_word:last_word_answer'], 'kwargs': [{'last_word': 'brief'}]}]"
+        prediction = "<think>I should end the response with brief.</think><answer>A concise answer ending in brief</answer>"
+
+        self.assertEqual(verifier([], prediction, label).score, 1.0)
+
+    def test_uses_final_complete_answer_payload(self):
+        verifier = IFEvalVerifier()
+        label = "[{'instruction_id': ['last_word:last_word_answer'], 'kwargs': [{'last_word': 'correct'}]}]"
+        prediction = "<answer>An abandoned answer ending wrong</answer><answer>The final answer is correct</answer>"
+
+        self.assertEqual(verifier([], prediction, label).score, 1.0)
+
 
 class TestPuzzleMatcherVerifier(unittest.TestCase):
     """Test suite for PuzzleMatcherVerifier"""

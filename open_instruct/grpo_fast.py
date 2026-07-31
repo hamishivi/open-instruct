@@ -2829,6 +2829,8 @@ def setup_datasets(
 
     transform_fn_args = [
         {
+            "sft_messages_key": tc.sft_messages_key,
+            "ground_truths_key": tc.ground_truths_key,
             "system_prompt_override": system_prompt_override,
             "tool_definitions": tool_definitions,
             "pass_tools_to_chat_template": pass_tools_to_chat_template,

@@ -191,8 +191,14 @@ def remove_thinking_section(prediction: str) -> str:
     prediction = prediction.replace("<|assistant|>", "").strip()
     # remove thinking section from the prediction
     prediction = prediction.split("</think>")[-1]
-    # remove answer tags from the prediction
-    prediction = prediction.replace("<answer>", "").replace("</answer>", "")
+    # Score only the final complete answer payload when the model follows the
+    # answer-tag format. Keep accepting untagged and truncated-tag generations
+    # for compatibility with existing checkpoints and length-limited rollouts.
+    answer_sections = re.findall(r"<answer>(.*?)</answer>", prediction, flags=re.DOTALL)
+    if answer_sections:
+        prediction = answer_sections[-1]
+    else:
+        prediction = prediction.replace("<answer>", "").replace("</answer>", "")
     return prediction.strip()
 
 

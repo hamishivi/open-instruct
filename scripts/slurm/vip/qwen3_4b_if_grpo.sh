@@ -14,7 +14,7 @@
 set -euo pipefail
 
 DDMM=$(date +"%d%m")
-export EXP_NAME="${EXP_NAME:-vip_dolci_if_grpo_centered_g8_p32_as_zvf_tis2_${DDMM}_q3_4b}"
+export EXP_NAME="${EXP_NAME:-vip_dolci_if_grpo_answer_centered_g8_p32_as_zvf_tis2_${DDMM}_q3_4b}"
 export NUM_LEARNERS_PER_NODE="${NUM_LEARNERS_PER_NODE:-2}"
 export VLLM_NUM_ENGINES="${VLLM_NUM_ENGINES:-2}"
 export ASYNC_STEPS="${ASYNC_STEPS:-8}"
@@ -35,7 +35,7 @@ export SFT_MESSAGES_KEY="${SFT_MESSAGES_KEY:-prompt}"
 export GROUND_TRUTHS_KEY="${GROUND_TRUTHS_KEY:-ground_truth}"
 export VERIFIER_SOURCE_KEY="${VERIFIER_SOURCE_KEY:-dataset}"
 export HINTS_KEY="${HINTS_KEY:-constraint}"
-export CHAT_TEMPLATE_NAME="${CHAT_TEMPLATE_NAME:-}"
+export CHAT_TEMPLATE_NAME="${CHAT_TEMPLATE_NAME:-qwen_instruct_user_answer}"
 export CHECKPOINT_STATE_FREQ="${CHECKPOINT_STATE_FREQ:-50}"
 export APPTAINER_IMAGE="${APPTAINER_IMAGE:-/gscratch/h2lab/hamishiv/containers/vllm-openai-v0.19.1.sif}"
 export APPTAINER_BIND="${APPTAINER_BIND:-/mmfs1/gscratch:/gscratch}"
