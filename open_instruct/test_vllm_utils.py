@@ -96,6 +96,28 @@ class TestProcessFromQueue(unittest.TestCase):
             self.assertTrue(processed.wait(timeout=1))
 
 
+class TestFinalizeCompletedRequest(unittest.IsolatedAsyncioTestCase):
+    async def test_reward_failure_returns_zero_scores_and_enqueues_result(self):
+        actor = MagicMock()
+        actor.request_outputs = {"train_0_0": {"outputs": [object()], "use_tools": False}}
+        actor.request_metadata = {"train_0_0": {}}
+        actor.results_queue = MagicMock()
+        actor.eval_results_queue = MagicMock()
+        result = MagicMock()
+        result.responses = [[1], [2]]
+
+        with (
+            mock.patch.object(vllm_utils, "process_completed_request", return_value=(result, False, {})),
+            mock.patch.object(vllm_utils, "compute_rewards", side_effect=RuntimeError("verifier failed")),
+            mock.patch.object(vllm_utils, "split_request_id", return_value={"request_index": 0}),
+        ):
+            await vllm_utils.finalize_completed_request(actor, "train_0_0")
+
+        self.assertEqual(result.reward_scores, [0.0, 0.0])
+        self.assertEqual(result.reward_metrics, {"objective/reward_finalization_error": 1.0})
+        actor.results_queue.put.assert_called_once_with(result)
+
+
 class TestVllmUtils3(unittest.TestCase):
     def setUp(self):
         logging.disable(logging.CRITICAL)
