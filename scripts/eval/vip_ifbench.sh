@@ -11,6 +11,8 @@
 #
 # Optional:
 #   OE_EVAL_INTERNAL_DIR=/path/to/oe-eval-internal
+#   RUN_LOCAL=0
+#   OUTPUT_DIR=/path/to/local/results
 #   CLUSTER=ai2/jupiter
 #   WORKSPACE=ai2/tulu-3-results
 #   GPUS=1
@@ -41,15 +43,20 @@ EXPERIMENT_GROUP="${EXPERIMENT_GROUP:-vip-ifbench}"
 MODEL_SLUG="${MODEL_ID##*/}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-${MODEL_SLUG}-${MODEL_REVISION}-ifbench}"
 DRY_RUN="${DRY_RUN:-1}"
+RUN_LOCAL="${RUN_LOCAL:-0}"
+OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/outputs/${EXPERIMENT_NAME}}"
 
-if [[ ! -d "${OE_EVAL_INTERNAL_DIR}/.git" ]]; then
+if [[ ! -f "${OE_EVAL_INTERNAL_DIR}/pyproject.toml" ]]; then
   echo "ERROR: oe-eval-internal checkout not found: ${OE_EVAL_INTERNAL_DIR}" >&2
   exit 2
 fi
-if [[ "${DRY_RUN}" != "0" && "${DRY_RUN}" != "1" ]]; then
-  echo "ERROR: DRY_RUN must be 0 or 1, got: ${DRY_RUN}" >&2
-  exit 2
-fi
+for boolean_var in DRY_RUN RUN_LOCAL; do
+  value="${!boolean_var}"
+  if [[ "${value}" != "0" && "${value}" != "1" ]]; then
+    echo "ERROR: ${boolean_var} must be 0 or 1, got: ${value}" >&2
+    exit 2
+  fi
+done
 
 args=(
   run
@@ -63,13 +70,25 @@ args=(
   --task "ifbench::tulu"
   --batch-size auto
   --gpus "${GPUS}"
-  --cluster "${CLUSTER}"
-  --beaker-workspace "${WORKSPACE}"
-  --beaker-timeout "${TIMEOUT}"
-  --beaker-priority "${PRIORITY}"
-  --push-datalake
-  --datalake-tags "experiment_group=${EXPERIMENT_GROUP},revision=${MODEL_REVISION}"
 )
+if [[ "${RUN_LOCAL}" == "1" ]]; then
+  mkdir -p "${OUTPUT_DIR}"
+  args+=(
+    --run-local
+    --output-dir "${OUTPUT_DIR}"
+    --no-datalake
+    --skip-pin-beaker-image
+  )
+else
+  args+=(
+    --cluster "${CLUSTER}"
+    --beaker-workspace "${WORKSPACE}"
+    --beaker-timeout "${TIMEOUT}"
+    --beaker-priority "${PRIORITY}"
+    --push-datalake
+    --datalake-tags "experiment_group=${EXPERIMENT_GROUP},revision=${MODEL_REVISION}"
+  )
+fi
 if [[ "${DRY_RUN}" == "1" ]]; then
   args+=(--dry-run)
 fi
@@ -77,6 +96,9 @@ fi
 echo "Model:    ${MODEL_ID}@${MODEL_REVISION}"
 echo "Suite:    ifbench::tulu"
 echo "Eval repo: ${OE_EVAL_INTERNAL_DIR}"
-echo "Mode:     $([[ "${DRY_RUN}" == "1" ]] && echo dry-run || echo submit)"
+if [[ "${RUN_LOCAL}" == "1" ]]; then
+  echo "Output:   ${OUTPUT_DIR}"
+fi
+echo "Mode:     $([[ "${DRY_RUN}" == "1" ]] && echo dry-run || ([[ "${RUN_LOCAL}" == "1" ]] && echo local || echo submit))"
 
 uv "${args[@]}"
