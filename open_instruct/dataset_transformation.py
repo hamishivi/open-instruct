@@ -1461,6 +1461,9 @@ def rlvr_tokenize_v3(
     pass_tools_to_chat_template: bool = True,
 ):
     prompt = row.pop(sft_messages_key)
+    if isinstance(prompt, str):
+        prompt_content = prompt.removeprefix("user:").lstrip()
+        prompt = [{"role": "user", "content": prompt_content}]
     assert len(prompt) > 0, "Empty prompt in dataset"
     # if the prompt has multiple messages, make sure we don't end in an assistant message.
     if len(prompt) > 1 and prompt[-1]["role"] == "assistant":
@@ -1483,11 +1486,12 @@ def rlvr_tokenize_v3(
         row[INPUT_IDS_PROMPT_KEY] = [x for x in row[INPUT_IDS_PROMPT_KEY] if x != tokenizer.pad_token_id]
     # Get the raw values from the source keys
     ground_truths_val = row[ground_truths_key]
-    verifier_source_val = row[verifier_source_key]
-
-    # Get the raw values from the source keys
-    ground_truths_val = row[ground_truths_key]
-    verifier_source_val = row[verifier_source_key]
+    if verifier_source_key in row:
+        verifier_source_val = row[verifier_source_key]
+    elif "constraint" in row:
+        verifier_source_val = ["ifeval"] * len(ground_truths_val) if isinstance(ground_truths_val, list) else "ifeval"
+    else:
+        raise KeyError(f"Dataset row is missing verifier source column {verifier_source_key!r}")
 
     # if the verifier source is a string, we wrap it in a list (compatibility with multi-verifier datasets)
     # we also then wrap ground truths in a list to match.

@@ -14,7 +14,7 @@
 set -euo pipefail
 
 DDMM=$(date +"%d%m")
-export EXP_NAME="${EXP_NAME:-vip_if_grpo_centered_g8_p32_as_zvf_tis2_${DDMM}_q3_4b}"
+export EXP_NAME="${EXP_NAME:-vip_dolci_if_grpo_centered_g8_p32_as_zvf_tis2_${DDMM}_q3_4b}"
 export NUM_LEARNERS_PER_NODE="${NUM_LEARNERS_PER_NODE:-2}"
 export VLLM_NUM_ENGINES="${VLLM_NUM_ENGINES:-2}"
 export ASYNC_STEPS="${ASYNC_STEPS:-8}"
@@ -29,9 +29,9 @@ export TIS_MASK_LOWER="${TIS_MASK_LOWER:-0}"
 export TIS_MASK_UPPER="${TIS_MASK_UPPER:-0}"
 export TOTAL_EPISODES="${TOTAL_EPISODES:-281600}"
 export POLICY_LEARNING_RATE="${POLICY_LEARNING_RATE:-1e-6}"
-export DATASET_NAME="${DATASET_NAME:-allenai/IF_multi_constraints_upto5}"
+export DATASET_NAME="${DATASET_NAME:-allenai/Dolci-RL-Zero-IF-7B}"
 export DATASET_WEIGHT="${DATASET_WEIGHT:-1.0}"
-export SFT_MESSAGES_KEY="${SFT_MESSAGES_KEY:-messages}"
+export SFT_MESSAGES_KEY="${SFT_MESSAGES_KEY:-prompt}"
 export GROUND_TRUTHS_KEY="${GROUND_TRUTHS_KEY:-ground_truth}"
 export VERIFIER_SOURCE_KEY="${VERIFIER_SOURCE_KEY:-dataset}"
 export HINTS_KEY="${HINTS_KEY:-constraint}"

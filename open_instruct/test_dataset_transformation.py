@@ -5,6 +5,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 import torch
 from parameterized import parameterized
@@ -52,6 +53,35 @@ class TestEnvConfigNormalization(unittest.TestCase):
         open_instruct.dataset_transformation._normalize_env_config_column(row)
         self.assertEqual(
             row["env_config"], {"max_steps": 10, "env_configs": [{"env_name": "guess_number", "number": "5"}]}
+        )
+
+
+class TestRLVRTokenize(unittest.TestCase):
+    def test_dolci_if_prompt_and_verifier_schema(self):
+        tokenizer = mock.MagicMock()
+        tokenizer.pad_token_id = -1
+        tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        ground_truth = "[{'instruction_id': ['detectable_format:title'], 'kwargs': [None]}]"
+        row = {
+            "prompt": "user: Explain the result. Include a title.",
+            "ground_truth": [ground_truth],
+            "constraint": "Include a title.",
+        }
+
+        result = open_instruct.dataset_transformation.rlvr_tokenize_v3(
+            row,
+            tokenizer,
+            sft_messages_key="prompt",
+        )
+
+        self.assertEqual(result[open_instruct.dataset_transformation.GROUND_TRUTHS_KEY], [ground_truth])
+        self.assertEqual(result[open_instruct.dataset_transformation.VERIFIER_SOURCE_KEY], ["ifeval"])
+        self.assertEqual(result[open_instruct.dataset_transformation.RAW_PROMPT_KEY], "user: Explain the result. Include a title.")
+        tokenizer.apply_chat_template.assert_called_once_with(
+            [{"role": "user", "content": "Explain the result. Include a title."}],
+            add_generation_prompt=True,
+            return_dict=False,
+            tools=None,
         )
 
 
