@@ -344,13 +344,12 @@ class IFEvalVerifier(VerifierFunction):
             if args is None:
                 args = {}
             args = {k: v for k, v in args.items() if v is not None}
-            try:
-                instruction_cls = instruction_dict[instruction_key]
-                instruction_instance = instruction_cls(instruction_key)
-                instruction_instance.build_description(**args)
-                rewards.append(float(bool(prediction.strip()) and instruction_instance.check_following(answer)))
-            except Exception:
-                logger.exception("IFEval constraint %s failed for prediction; assigning zero reward.", instruction_key)
+            instruction_cls = instruction_dict[instruction_key]
+            instruction_instance = instruction_cls(instruction_key)
+            instruction_instance.build_description(**args)
+            if prediction.strip() and instruction_instance.check_following(answer):
+                rewards.append(1.0)
+            else:
                 rewards.append(0.0)
         return VerificationResult(score=sum(rewards) / len(rewards))
 

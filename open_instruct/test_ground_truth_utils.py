@@ -29,23 +29,6 @@ class TestIFEvalVerifier(unittest.TestCase):
         self.assertEqual(verifier([], "A concise answer ending in brief", label).score, 1.0)
         self.assertEqual(verifier([], "A concise answer ending incorrectly", label).score, 0.0)
 
-    def test_failing_constraint_receives_zero_without_aborting_other_constraints(self):
-        verifier = IFEvalVerifier()
-        label = (
-            "[{'instruction_id': ['test:raises', 'last_word:last_word_answer'], "
-            "'kwargs': [None, {'last_word': 'brief'}]}]"
-        )
-        failing_instruction = unittest.mock.MagicMock()
-        failing_instruction.return_value.check_following.side_effect = RuntimeError("checker failed")
-
-        with patch.dict(
-            "open_instruct.ground_truth_utils.instructions_registry.INSTRUCTION_DICT",
-            {"test:raises": failing_instruction},
-        ):
-            result = verifier([], "A concise answer ending in brief", label)
-
-        self.assertEqual(result.score, 0.5)
-
 
 class TestPuzzleMatcherVerifier(unittest.TestCase):
     """Test suite for PuzzleMatcherVerifier"""

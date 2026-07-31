@@ -542,15 +542,7 @@ async def finalize_completed_request(actor: "LLMRayActor", base_request_id: str)
     actor.request_outputs.pop(base_request_id)
     actor.request_metadata.pop(base_request_id, None)
 
-    try:
-        result.reward_scores, result.reward_metrics = await compute_rewards(actor, result, example)
-    except Exception:
-        logger.exception(
-            "Reward finalization failed for request %s; assigning zero rewards so generation can continue.",
-            base_request_id,
-        )
-        result.reward_scores = [0.0] * len(result.responses)
-        result.reward_metrics = {"objective/reward_finalization_error": 1.0}
+    result.reward_scores, result.reward_metrics = await compute_rewards(actor, result, example)
     results_queue = actor.eval_results_queue if is_eval else actor.results_queue
     results_queue.put(result)
 
