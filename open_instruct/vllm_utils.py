@@ -93,6 +93,7 @@ MambaSpec.__annotations__["dtypes"] = tuple[torch.dtype, ...]
 NUM_PREFETCH_WORKERS = 2
 DRAIN_ACTIVE_TASKS_SLEEP_S = 1
 SHOULD_STOP_TIMEOUT_S = 0.1
+COMPLETION_QUEUE_POLL_TIMEOUT_S = 0.1
 INFERENCE_INIT_TIMEOUT_S = 1200
 VLLM_HEALTH_CHECK_TIMEOUT_S = 600.0
 
@@ -786,12 +787,19 @@ class LLMRayActor:
     def process_from_queue(self) -> None:
         finalize_futures: list[futures.Future] = []
         while True:
-            completion_future = accumulate_completions(self, self.completion_queue.get())
-            if completion_future is not None:
-                finalize_futures.append(completion_future)
+            try:
+                sub_request = self.completion_queue.get(timeout=COMPLETION_QUEUE_POLL_TIMEOUT_S)
+            except queue.Empty:
+                sub_request = None
+
+            if sub_request is not None:
+                completion_future = accumulate_completions(self, sub_request)
+                if completion_future is not None:
+                    finalize_futures.append(completion_future)
 
             done, not_done = futures.wait(finalize_futures, timeout=0)
-            [future.result() for future in done]
+            for future in done:
+                future.result()
             finalize_futures = list(not_done)
 
     def init_weight_transfer_engine(self, request: WeightTransferInitRequest) -> None:

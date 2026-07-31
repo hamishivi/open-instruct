@@ -1,5 +1,9 @@
 import logging
+import queue
+import threading
+import time
 import unittest
+from concurrent import futures
 from unittest import mock
 from unittest.mock import MagicMock
 
@@ -64,6 +68,32 @@ class TestBoundCompletionRequestToContext(unittest.TestCase):
         self.assertEqual(request_max_tokens, 1)
         self.assertTrue(prompt_truncated)
         self.assertLessEqual(len(prompt_ids) + request_max_tokens, 10)
+
+
+class TestProcessFromQueue(unittest.TestCase):
+    def test_reaps_finalize_future_without_another_completion(self):
+        actor = MagicMock()
+        actor.completion_queue = queue.Queue()
+        finalize_future = futures.Future()
+        processed = threading.Event()
+
+        def get_result():
+            processed.set()
+            return None
+
+        finalize_future.result = get_result
+        actor.completion_queue.put(object())
+
+        with mock.patch.object(vllm_utils, "accumulate_completions", return_value=finalize_future):
+            worker = threading.Thread(target=vllm_utils.LLMRayActor.process_from_queue, args=(actor,), daemon=True)
+            worker.start()
+
+            deadline = time.monotonic() + 1
+            while vllm_utils.accumulate_completions.call_count == 0 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            finalize_future.set_result(None)
+
+            self.assertTrue(processed.wait(timeout=1))
 
 
 class TestVllmUtils3(unittest.TestCase):
