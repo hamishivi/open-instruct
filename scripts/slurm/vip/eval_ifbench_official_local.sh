@@ -60,7 +60,7 @@ SERVER_PID=$!
 trap 'kill "${SERVER_PID}" 2>/dev/null || true' EXIT
 
 for _ in $(seq 1 180); do
-  if curl --fail --silent "http://127.0.0.1:${PORT}/health" >/dev/null; then
+  if curl --fail --silent "http://localhost:${PORT}/health" >/dev/null; then
     break
   fi
   if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
@@ -69,12 +69,12 @@ for _ in $(seq 1 180); do
   fi
   sleep 5
 done
-curl --fail --silent "http://127.0.0.1:${PORT}/health" >/dev/null
+curl --fail --silent "http://localhost:${PORT}/health" >/dev/null
 
 echo "Evaluating ${MODEL_ID}@${MODEL_REVISION} with official IFBench"
 echo "temperature=${TEMPERATURE} top_p=${TOP_P} max_tokens=${MAX_TOKENS} max_model_len=${MAX_MODEL_LEN}"
 uv run --project "${IFBENCH_DIR}" python "${OPEN_INSTRUCT_DIR}/scripts/eval/vip_ifbench_official.py" \
-  --api-base "http://127.0.0.1:${PORT}/v1" \
+  --api-base "http://localhost:${PORT}/v1" \
   --model "${SERVED_MODEL_NAME}" \
   --input-file "${IFBENCH_DIR}/data/IFBench_test.jsonl" \
   --output-file "${OUTPUT_DIR}/responses.jsonl" \
