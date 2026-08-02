@@ -14,7 +14,7 @@
 set -euo pipefail
 
 DDMM=$(date +"%d%m")
-export EXP_NAME="${EXP_NAME:-vip_dolci_if_sae_answer_centered_g8_p32_as_zvf_tis2_${DDMM}_q3_4b}"
+export EXP_NAME="${EXP_NAME:-vip_dolci_if_sae_whiten_answer_centered_g8_p32_as_zvf_tis2_${DDMM}_q3_4b}"
 export NUM_LEARNERS_PER_NODE="${NUM_LEARNERS_PER_NODE:-2}"
 export VLLM_NUM_ENGINES="${VLLM_NUM_ENGINES:-2}"
 export ASYNC_STEPS="${ASYNC_STEPS:-8}"
@@ -34,6 +34,7 @@ export VALUE_NUM_EPOCHS="${VALUE_NUM_EPOCHS:-2}"
 export VALUE_LOSS="${VALUE_LOSS:-mse}"
 export SAE_THRESHOLD="${SAE_THRESHOLD:-0.2}"
 export VALUE_MODEL_GROUND_TRUTH_CONDITIONING=false
+export WHITEN_ADVANTAGES=true
 export DATASET_NAME="${DATASET_NAME:-allenai/Dolci-RL-Zero-IF-7B}"
 export DATASET_WEIGHT="${DATASET_WEIGHT:-1.0}"
 export SFT_MESSAGES_KEY="${SFT_MESSAGES_KEY:-prompt}"
