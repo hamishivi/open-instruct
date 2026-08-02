@@ -750,6 +750,17 @@ def add_prompt_to_generator(
     )
 
 
+def result_is_stale(model_step: int | None, training_step: int | None, max_result_age_steps: int | None) -> bool:
+    """Whether an async rollout result is too far behind the current training step.
+
+    Returns False when staleness checking is disabled or the required step metadata
+    is unavailable. A result is stale only when its age strictly exceeds the limit.
+    """
+    if max_result_age_steps is None or training_step is None or model_step is None:
+        return False
+    return training_step - model_step > max_result_age_steps
+
+
 def accumulate_inference_batches(
     inference_results_Q: ray_queue.Queue,
     generation_config: vllm.SamplingParams,
@@ -772,6 +783,7 @@ def accumulate_inference_batches(
     requeue_on_timeout: bool = True,
     ground_truth_overrides: dict[int, Any] | None = None,
     hints_key: str = HINTS_KEY,
+    max_result_age_steps: int | None = None,
 ) -> (
     tuple[data_types.GenerationResult, Batch, dict, BatchStatistics]
     | tuple[data_types.ShutdownSentinel | None, None, None, None]
@@ -783,6 +795,9 @@ def accumulate_inference_batches(
         assert param_prompt_Q is not None and iter_dataloader is not None and dataset is not None, (
             "replenish_prompts requires param_prompt_Q and iter_dataloader and dataset"
         )
+
+    if max_result_age_steps is not None and not replenish_prompts:
+        raise ValueError("max_result_age_steps requires replenish_prompts=True to avoid draining the prompt pipeline.")
 
     results = []
     all_queries = []
@@ -802,6 +817,7 @@ def accumulate_inference_batches(
     filtered_prompt_solved = 0
     filtered_prompt_nonzero = 0
     total_no_resampled = 0
+    stale_results_dropped = 0
     progress_bar = tqdm(
         total=num_prompts,
         desc=f"Accumulating Responses and Rewarding {num_prompts} prompts",
@@ -827,13 +843,38 @@ def accumulate_inference_batches(
                 for r in collected_results:
                     inference_results_Q.put(r)
             raise
-        collected_results.append(result)
         logger.info(
             f"[accumulate_inference_batches] Got result {num_prompts_sampled + 1}/{num_prompts}, type: {type(result).__name__}"
         )
 
         if isinstance(result, data_types.ShutdownSentinel):
             return result, None, None, None
+
+        if result_is_stale(result.model_step, training_step, max_result_age_steps):
+            stale_results_dropped += 1
+            logger.warning(
+                "[accumulate_inference_batches] Dropping stale result for index=%s at training_step=%s: "
+                "model_step=%s lag=%s max_result_age_steps=%s",
+                result.index,
+                training_step,
+                result.model_step,
+                training_step - result.model_step,
+                max_result_age_steps,
+            )
+            assert iter_dataloader is not None and param_prompt_Q is not None
+            example = next(iter_dataloader)
+            add_prompt_to_generator(
+                example,
+                iter_dataloader._epoch,
+                param_prompt_Q,
+                generation_config,
+                is_eval=False,
+                base_env_config=base_env_config,
+                ground_truth_overrides=ground_truth_overrides,
+            )
+            continue
+
+        collected_results.append(result)
 
         assert len(result.responses) == generation_config.n, (
             f"Mismatch: individual prompt result has {len(result.responses)} responses "
@@ -1028,6 +1069,7 @@ def accumulate_inference_batches(
     combined_reward_metrics["model_step_max"] = float(model_steps_array.max())
     combined_reward_metrics["model_step_mean"] = float(model_steps_array.mean())
     combined_reward_metrics["num_steps_off_policy"] = float(training_step - model_steps_array.mean())
+    combined_reward_metrics["stale_results_dropped"] = float(stale_results_dropped)
     percent_solved_mean = np.mean(all_percent_solved) if all_percent_solved else 0.0
 
     batch_stats = BatchStatistics(
@@ -1447,6 +1489,7 @@ class DataPreparationActor:
                 base_env_config=self.base_env_config,
                 ground_truth_overrides=self.ground_truth_overrides,
                 hints_key=self.config.hints_key,
+                max_result_age_steps=self.config.async_steps,
             )
             logger.info(
                 f"[DataPreparationActor] Step {step}: accumulate_inference_batches returned, result type: {type(result).__name__}"
