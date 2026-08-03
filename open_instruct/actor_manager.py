@@ -42,6 +42,7 @@ class ActorManager:
         vllm_config: data_loader.VLLMConfig,
     ):
         self._should_stop = False
+        self._current_model_step = 0
         self._last_updated = datetime.now()
         self._dashboard_port: int | None = None
         self._queues = queues or {}
@@ -138,6 +139,14 @@ class ActorManager:
     def should_stop(self) -> bool:
         """Check if actors should stop processing."""
         return self._should_stop
+
+    def set_current_model_step(self, model_step: int) -> None:
+        """Record the latest policy step successfully synchronized to every vLLM engine."""
+        self._current_model_step = model_step
+
+    def get_current_model_step(self) -> int:
+        """Return the policy step currently served by the vLLM engines."""
+        return self._current_model_step
 
     def report_token_stats(self, prompt_tokens: int, generation_tokens: int):
         """Report token statistics from main thread."""

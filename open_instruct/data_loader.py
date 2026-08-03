@@ -750,15 +750,15 @@ def add_prompt_to_generator(
     )
 
 
-def result_is_stale(model_step: int | None, training_step: int | None, max_result_age_steps: int | None) -> bool:
-    """Whether an async rollout result is too far behind the current training step.
+def result_is_stale(model_step: int | None, current_model_step: int | None, max_result_age_steps: int | None) -> bool:
+    """Whether an async rollout result is too far behind the policy served by vLLM.
 
     Returns False when staleness checking is disabled or the required step metadata
     is unavailable. A result is stale only when its age strictly exceeds the limit.
     """
-    if max_result_age_steps is None or training_step is None or model_step is None:
+    if max_result_age_steps is None or current_model_step is None or model_step is None:
         return False
-    return training_step - model_step > max_result_age_steps
+    return current_model_step - model_step > max_result_age_steps
 
 
 def accumulate_inference_batches(
@@ -784,6 +784,7 @@ def accumulate_inference_batches(
     ground_truth_overrides: dict[int, Any] | None = None,
     hints_key: str = HINTS_KEY,
     max_result_age_steps: int | None = None,
+    current_model_step: int | None = None,
 ) -> (
     tuple[data_types.GenerationResult, Batch, dict, BatchStatistics]
     | tuple[data_types.ShutdownSentinel | None, None, None, None]
@@ -850,15 +851,17 @@ def accumulate_inference_batches(
         if isinstance(result, data_types.ShutdownSentinel):
             return result, None, None, None
 
-        if result_is_stale(result.model_step, training_step, max_result_age_steps):
+        if result_is_stale(result.model_step, current_model_step, max_result_age_steps):
             stale_results_dropped += 1
             logger.warning(
-                "[accumulate_inference_batches] Dropping stale result for index=%s at training_step=%s: "
+                "[accumulate_inference_batches] Dropping stale result for index=%s at training_step=%s, "
+                "current_model_step=%s: "
                 "model_step=%s lag=%s max_result_age_steps=%s",
                 result.index,
                 training_step,
+                current_model_step,
                 result.model_step,
-                training_step - result.model_step,
+                current_model_step - result.model_step,
                 max_result_age_steps,
             )
             assert iter_dataloader is not None and param_prompt_Q is not None
@@ -1469,6 +1472,7 @@ class DataPreparationActor:
             logger.info(
                 f"[DataPreparationActor] Step {step}: calling accumulate_inference_batches for {self.global_batch_size} prompts"
             )
+            current_model_step = ray.get(self.actor_manager.get_current_model_step.remote())
             result, batch, reward_metrics, batch_stats = accumulate_inference_batches(
                 self.inference_results_Q,
                 self.generation_config,
@@ -1490,6 +1494,7 @@ class DataPreparationActor:
                 ground_truth_overrides=self.ground_truth_overrides,
                 hints_key=self.config.hints_key,
                 max_result_age_steps=self.config.async_steps,
+                current_model_step=current_model_step,
             )
             logger.info(
                 f"[DataPreparationActor] Step {step}: accumulate_inference_batches returned, result type: {type(result).__name__}"

@@ -3243,6 +3243,7 @@ def weight_sync_thread(
                     desc="[Weight Sync Thread] Waking up vLLM engines",
                     enable=False,
                 )
+                ray.get(actor_manager.set_current_model_step.remote(target_model_step))
         except Exception as e:
             logger.exception("[Weight Sync Thread] Weight Sync failed")
             raise RuntimeError from e

@@ -81,20 +81,23 @@ class TestWorldAwarePacking(unittest.TestCase):
 
 class TestResultIsStale(unittest.TestCase):
     def test_disabled_when_max_age_none(self):
-        self.assertFalse(data_loader.result_is_stale(model_step=0, training_step=100, max_result_age_steps=None))
+        self.assertFalse(data_loader.result_is_stale(model_step=0, current_model_step=100, max_result_age_steps=None))
 
     def test_disabled_when_inputs_missing(self):
-        self.assertFalse(data_loader.result_is_stale(model_step=None, training_step=100, max_result_age_steps=4))
-        self.assertFalse(data_loader.result_is_stale(model_step=0, training_step=None, max_result_age_steps=4))
+        self.assertFalse(data_loader.result_is_stale(model_step=None, current_model_step=100, max_result_age_steps=4))
+        self.assertFalse(data_loader.result_is_stale(model_step=0, current_model_step=None, max_result_age_steps=4))
 
     def test_stale_when_lag_exceeds_threshold(self):
-        self.assertTrue(data_loader.result_is_stale(model_step=95, training_step=100, max_result_age_steps=4))
+        self.assertTrue(data_loader.result_is_stale(model_step=95, current_model_step=100, max_result_age_steps=4))
 
     def test_not_stale_at_threshold(self):
-        self.assertFalse(data_loader.result_is_stale(model_step=96, training_step=100, max_result_age_steps=4))
+        self.assertFalse(data_loader.result_is_stale(model_step=96, current_model_step=100, max_result_age_steps=4))
 
     def test_not_stale_when_fresh(self):
-        self.assertFalse(data_loader.result_is_stale(model_step=100, training_step=100, max_result_age_steps=4))
+        self.assertFalse(data_loader.result_is_stale(model_step=100, current_model_step=100, max_result_age_steps=4))
+
+    def test_value_warmup_training_steps_do_not_age_an_unchanged_policy(self):
+        self.assertFalse(data_loader.result_is_stale(model_step=0, current_model_step=0, max_result_age_steps=8))
 
     def test_max_result_age_requires_replenish_prompts(self):
         with self.assertRaisesRegex(ValueError, "replenish_prompts"):
