@@ -14,7 +14,7 @@
 set -euo pipefail
 
 DDMM=$(date +"%d%m")
-export EXP_NAME="${EXP_NAME:-vip_dolci_if_sae_whiten_answer_centered_g8_p32_as_zvf_tis2_${DDMM}_q3_4b}"
+export EXP_NAME="${EXP_NAME:-vip_dolci_if_sae_whiten_ctr_g8_p32_zvf_tis2_${DDMM}_q3_4b}"
 export NUM_LEARNERS_PER_NODE="${NUM_LEARNERS_PER_NODE:-2}"
 export VLLM_NUM_ENGINES="${VLLM_NUM_ENGINES:-2}"
 export ASYNC_STEPS="${ASYNC_STEPS:-8}"
