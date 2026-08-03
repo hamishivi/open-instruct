@@ -179,7 +179,7 @@ class GRPOExperimentConfig(
     value_num_epochs: int = 1
     """Number of training passes over the value model per RL step (independent of policy `num_epochs`)."""
     whiten_advantages: bool = False
-    """If True, whiten GAE advantages across the batch before applying them."""
+    """If True, whiten policy advantages globally across response tokens and data-parallel ranks."""
     skip_tool_outputs: bool = True
     """If True, GAE skips tool/observation tokens and bootstraps from the last action token to the
     first token of the next action (skip-observation GAE). When using tools, `mask_tool_use=True`
@@ -658,6 +658,47 @@ def calculate_token_counts(
         accumulation_counts[key] = accumulation_counts.get(key, 0.0) + count.item()
 
     return accumulation_counts
+
+
+def whiten_advantages(
+    advantages: list[torch.Tensor], response_masks: list[torch.Tensor], process_group: dist.ProcessGroup | None = None
+) -> list[torch.Tensor]:
+    """Whiten valid policy advantages across samples and data-parallel ranks.
+
+    This operates on the advantages consumed by the policy loss, regardless of
+    whether they came from group-relative rewards or a value model with GAE.
+    Prompt and masked response positions are left unchanged or zeroed,
+    respectively.
+    """
+    if len(advantages) != len(response_masks):
+        raise ValueError(
+            f"Expected one response mask per advantage tensor, got {len(response_masks)} masks "
+            f"for {len(advantages)} advantage tensors."
+        )
+    if not advantages:
+        return []
+
+    valid_advantages = [
+        advantage[:, 1:].float()[response_mask[:, 1:].bool()]
+        for advantage, response_mask in zip(advantages, response_masks)
+    ]
+    flattened = torch.cat(valid_advantages)
+    stats = torch.stack(
+        [torch.tensor(float(flattened.numel()), device=flattened.device), flattened.sum(), flattened.square().sum()]
+    )
+    dist.all_reduce(stats, op=dist.ReduceOp.SUM, group=process_group)
+    count, total, squared_total = stats
+    mean = total / count.clamp(min=1)
+    std = ((squared_total / count.clamp(min=1) - mean.square()).clamp(min=0) + 1e-8).sqrt()
+
+    whitened = []
+    for advantage, response_mask in zip(advantages, response_masks):
+        valid_mask = response_mask[:, 1:].bool()
+        normalized = torch.where(valid_mask, (advantage[:, 1:].float() - mean) / std, 0.0)
+        whitened_advantage = advantage.clone()
+        whitened_advantage[:, 1:] = normalized.to(whitened_advantage.dtype)
+        whitened.append(whitened_advantage)
+    return whitened
 
 
 _SCALAR_LOSS_STAT_KEYS = [

@@ -2083,26 +2083,6 @@ class PolicyTrainerRayProcess(RayProcess):
                         "[GenValue] failed to enqueue %d training pairs; REINFORCE step will be skipped",
                         len(_gen_value_training_pairs),
                     )
-            # Global advantage whitening across all samples and ranks (replaces per-sample whitening).
-            if self.args.whiten_advantages:
-                adv_parts = [data_BT.advantages[i][:, 1:].float() for i in range(num_samples)]
-                mask_parts = [data_BT.response_masks[i][:, 1:].bool() for i in range(num_samples)]
-                adv_flat = torch.cat([a[m] for a, m in zip(adv_parts, mask_parts)])
-                count = torch.tensor(float(adv_flat.numel()), device=device)
-                s1 = adv_flat.sum()
-                s2 = (adv_flat**2).sum()
-                dist.all_reduce(count, op=dist.ReduceOp.SUM)
-                dist.all_reduce(s1, op=dist.ReduceOp.SUM)
-                dist.all_reduce(s2, op=dist.ReduceOp.SUM)
-                mean = s1 / count.clamp(min=1)
-                std = ((s2 / count.clamp(min=1) - mean**2).clamp(min=0) + 1e-8).sqrt()
-                for i in range(num_samples):
-                    mask_i = data_BT.response_masks[i][:, 1:].bool()
-                    adv_i = data_BT.advantages[i][:, 1:]
-                    adv_normed = torch.where(mask_i, (adv_i - mean) / std, torch.zeros_like(adv_i))
-                    new_adv = data_BT.advantages[i].clone()
-                    new_adv[:, 1:] = adv_normed
-                    data_BT.advantages[i] = new_adv
             # Compute and stash value diagnostics metrics.
             with torch.no_grad():
                 for bin_idx in range(_NUM_PCT_BINS):
@@ -2121,6 +2101,14 @@ class PolicyTrainerRayProcess(RayProcess):
                     sae_step_metrics["value/predictions_mean"] = float(np.mean(preds))
                     sae_step_metrics["value/predictions_std"] = float(np.std(preds))
                     sae_step_metrics["value/explained_variance"] = 1.0 - float(np.var(residuals)) / (ret_var + 1e-8)
+
+        # Whiten the advantages that will feed the policy loss. With a value model these are
+        # GAE/SAE advantages; without one they remain the group-relative advantages prepared
+        # by the data loader. Keeping this outside the value-model branch makes the flag useful
+        # for critic-free whitening ablations as well.
+        if self.args.whiten_advantages:
+            data_BT.advantages = grpo_utils.whiten_advantages(data_BT.advantages, data_BT.response_masks)
+
         # Do multiple epochs of training on on-policy data (PPO-style), with a fresh random shuffle in each epoch
         with Timer("[Training Processes] Loss calculation", noop=self.rank != 0):
             loss_stats_B = grpo_utils.create_loss_stats(num_samples, device, record_entropy=self.args.record_entropy)
