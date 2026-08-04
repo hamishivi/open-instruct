@@ -25,6 +25,7 @@
 #   TIS_MASK_LOWER, TIS_MASK_UPPER,
 #   DATASET_NAME, DATASET_WEIGHT, SFT_MESSAGES_KEY, GROUND_TRUTHS_KEY,
 #   VERIFIER_SOURCE_KEY, HINTS_KEY, CHAT_TEMPLATE_NAME,
+#   WHITEN_ADVANTAGES,
 #   TOTAL_EPISODES, UV_SYNC, APPTAINER_IMAGE,
 #   CHECKPOINT_STATE_FREQ, CHECKPOINT_STATE_DIR,
 #   APPTAINER_BIND,
@@ -59,6 +60,7 @@ NUM_SAMPLES_PER_PROMPT_ROLLOUT="${NUM_SAMPLES_PER_PROMPT_ROLLOUT:-1}"
 NUM_UNIQUE_PROMPTS_ROLLOUT="${NUM_UNIQUE_PROMPTS_ROLLOUT:-128}"
 NO_RESAMPLING_PASS_RATE="${NO_RESAMPLING_PASS_RATE:-none}"
 USE_VLLM_LOGPROBS="${USE_VLLM_LOGPROBS:-true}"
+WHITEN_ADVANTAGES="${WHITEN_ADVANTAGES:-false}"
 TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP="${TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP:-0}"
 TIS_MASK_LOWER="${TIS_MASK_LOWER:-0.8}"
 TIS_MASK_UPPER="${TIS_MASK_UPPER:-3.0}"
@@ -75,7 +77,7 @@ WANDB_PROJECT_NAME="${WANDB_PROJECT:-VIP}"
 CHECKPOINT_STATE_FREQ="${CHECKPOINT_STATE_FREQ:-50}"
 CHECKPOINT_STATE_DIR="${CHECKPOINT_STATE_DIR:-/gscratch/h2lab/${USER}/tmp/checkpoint_states/${RUN_NAME}}"
 
-for bool_var in ACTIVE_SAMPLING FILTER_ZERO_STD_SAMPLES USE_VLLM_LOGPROBS; do
+for bool_var in ACTIVE_SAMPLING FILTER_ZERO_STD_SAMPLES USE_VLLM_LOGPROBS WHITEN_ADVANTAGES; do
   case "${!bool_var}" in
     true|false) ;;
     *)
@@ -223,6 +225,7 @@ echo "Schedule: total_episodes=${TOTAL_EPISODES}"
 echo "Dataset: ${DATASET_NAME} weight=${DATASET_WEIGHT} messages=${SFT_MESSAGES_KEY} ground_truth=${GROUND_TRUTHS_KEY} verifier=${VERIFIER_SOURCE_KEY} hints=${HINTS_KEY}"
 echo "Chat template: ${CHAT_TEMPLATE_NAME:-model default}"
 echo "Algorithm: pure centered GRPO (no critic/value model, GAE, SAE, or value warmup)"
+echo "Global advantage whitening: ${WHITEN_ADVANTAGES}"
 echo "Tuning: policy_lr=${POLICY_LEARNING_RATE}"
 echo "Resume state: every ${CHECKPOINT_STATE_FREQ} steps -> ${CHECKPOINT_STATE_DIR}"
 echo "===================================="
@@ -230,6 +233,7 @@ echo "===================================="
 # Start Ray on every allocated node (head on rank 0, workers block).
 export \
   EXP_NAME RUN_NAME ASYNC_STEPS USE_VLLM_LOGPROBS \
+  WHITEN_ADVANTAGES \
   TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP TIS_MASK_LOWER TIS_MASK_UPPER \
   ACTIVE_SAMPLING NUM_SAMPLES_PER_PROMPT_ROLLOUT NO_RESAMPLING_PASS_RATE \
   FILTER_ZERO_STD_SAMPLES NUM_UNIQUE_PROMPTS_ROLLOUT POLICY_LEARNING_RATE \
@@ -296,6 +300,9 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
     )
     if [[ "${NO_RESAMPLING_PASS_RATE}" != "none" ]]; then
       train_args+=(--no_resampling_pass_rate "${NO_RESAMPLING_PASS_RATE}")
+    fi
+    if [[ "${WHITEN_ADVANTAGES}" == "true" ]]; then
+      train_args+=(--whiten_advantages)
     fi
     if [[ -n "${CHAT_TEMPLATE_NAME}" ]]; then
       train_args+=(--chat_template_name "${CHAT_TEMPLATE_NAME}")
