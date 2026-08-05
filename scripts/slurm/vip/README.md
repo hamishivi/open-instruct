@@ -9,6 +9,8 @@ with `srun` (one task per node), then run `open_instruct/grpo_fast.py` on rank 0
 |------|--------------------|
 | `qwen3_4b_glm52_hypers.sh` | `scripts/train/vip/math_train_rl/qwen3_4b_glm52_hypers.sh` |
 | `dr_tulu_8b_glm52_hypers.sh` | `scripts/train/vip/dr_tulu/dr_tulu_8b_glm52_hypers.sh` |
+| `dr_tulu_qwen35_s2_grpo.sh` | Qwen3.5-4B S2-only centered GRPO |
+| `dr_tulu_qwen35_s2_sae_critic_whiten.sh` | Matched S2-only SAE + critic + whitening |
 | `ray_node_setup.sh` | Slurm analogue of `configs/beaker_configs/ray_node_setup.sh` |
 | `setup_apptainer_env.sh` | Frozen `uv.lock` environment setup inside Apptainer |
 
@@ -23,6 +25,11 @@ sbatch scripts/slurm/vip/qwen3_4b_glm52_hypers.sh
 # Dr. Tulu (2 nodes × 8 GPUs) — export API keys first
 export SERPER_API_KEY=... S2_API_KEY=... JINA_API_KEY=... OPENAI_API_KEY=...
 sbatch scripts/slurm/vip/dr_tulu_8b_glm52_hypers.sh
+
+# Qwen3.5-4B DR-Tulu S2-only ablation (2 nodes x 4 H200s)
+export S2_API_KEY=... OPENAI_API_KEY=...
+sbatch scripts/slurm/vip/dr_tulu_qwen35_s2_grpo.sh
+sbatch scripts/slurm/vip/dr_tulu_qwen35_s2_sae_critic_whiten.sh
 ```
 
 Override partition / account at submit time:
