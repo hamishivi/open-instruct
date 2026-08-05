@@ -213,6 +213,7 @@ srun --cpu-bind=none ${SRUN_PREFIX[@]+"${SRUN_PREFIX[@]}"} bash -c '
       --wandb_entity "${WANDB_ENTITY_NAME}" \
       --wandb_project "${WANDB_PROJECT_NAME}" \
       --vllm_enable_prefix_caching \
+      --vllm_enforce_eager \
       --vllm_gdn_prefill_backend triton \
       --keep_last_n_checkpoints -1 \
       --kl_estimator 3 \
