@@ -13,4 +13,5 @@
 
 set -euo pipefail
 export VARIANT=grpo
-exec bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dr_tulu_qwen35_s2_only_common.sh"
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$(pwd)}"
+exec bash "${REPO_ROOT}/scripts/slurm/vip/dr_tulu_qwen35_s2_only_common.sh"
