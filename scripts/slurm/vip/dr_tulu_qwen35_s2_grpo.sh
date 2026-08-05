@@ -2,7 +2,7 @@
 #SBATCH --job-name=drt-q35-s2-grpo
 #SBATCH --account=gpu-h200-h2lab
 #SBATCH --partition=gpu-h200
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=64

@@ -26,7 +26,7 @@ sbatch scripts/slurm/vip/qwen3_4b_glm52_hypers.sh
 export SERPER_API_KEY=... S2_API_KEY=... JINA_API_KEY=... OPENAI_API_KEY=...
 sbatch scripts/slurm/vip/dr_tulu_8b_glm52_hypers.sh
 
-# Qwen3.5-4B DR-Tulu S2-only ablation (2 nodes x 4 H200s)
+# Qwen3.5-4B DR-Tulu S2-only ablation (1 node x 4 H200s)
 export S2_API_KEY=... OPENAI_API_KEY=...
 sbatch scripts/slurm/vip/dr_tulu_qwen35_s2_grpo.sh
 sbatch scripts/slurm/vip/dr_tulu_qwen35_s2_sae_critic_whiten.sh
