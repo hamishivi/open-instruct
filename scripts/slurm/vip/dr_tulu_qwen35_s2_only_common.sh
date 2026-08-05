@@ -70,6 +70,34 @@ if [[ -n "${APPTAINER_IMAGE:-}" ]]; then
     exit 2
   fi
   CONTAINER_VENV="${CONTAINER_VENV:-${REPO_ROOT}/.venv-container}"
+  APPTAINER_LOCAL_BIND=""
+  if [[ "${APPTAINER_LOCAL_VENV:-0}" == 1 ]]; then
+    CONTAINER_VENV="${APPTAINER_LOCAL_VENV_DIR:-/scr/${USER}/open-instruct-${SLURM_JOB_ID}/.venv}"
+    APPTAINER_LOCAL_BIND="$(dirname "${CONTAINER_VENV}")"
+    APPTAINER_UV_CACHE_DIR="${APPTAINER_UV_CACHE_DIR:-/gscratch/h2lab/${USER}/uv-cache}"
+    mkdir -p "${APPTAINER_LOCAL_BIND}" "${APPTAINER_UV_CACHE_DIR}"
+    APPTAINER_SYNC_ARGS=(exec --nv)
+    if [[ -n "${APPTAINER_BIND:-}" ]]; then
+      APPTAINER_SYNC_ARGS+=(--bind "${APPTAINER_BIND}")
+    fi
+    APPTAINER_SYNC_ARGS+=(
+      --bind /usr/bin/git:/usr/bin/git
+      --bind /usr/libexec/git-core:/usr/libexec/git-core
+      --bind /lib64/libcrypto.so.1.1:/lib64/libcrypto.so.1.1
+      --bind "${APPTAINER_LOCAL_BIND}:${APPTAINER_LOCAL_BIND}"
+      --env LD_LIBRARY_PATH=/lib64:/.singularity.d/libs:/usr/local/nvidia/lib64:/usr/local/cuda/lib64
+      --env GIT_EXEC_PATH=/usr/libexec/git-core
+      --env "UV_CACHE_DIR=${APPTAINER_UV_CACHE_DIR}"
+      --env UV_LINK_MODE=copy
+    )
+    echo "Syncing the locked environment to node-local storage: ${CONTAINER_VENV}"
+    apptainer "${APPTAINER_SYNC_ARGS[@]}" "${APPTAINER_IMAGE}" bash -c '
+      set -euo pipefail
+      cd "$1"
+      export UV_PROJECT_ENVIRONMENT="$2"
+      uv sync --frozen --no-dev
+    ' _ "${REPO_ROOT}" "${CONTAINER_VENV}"
+  fi
   if [[ ! -x "${CONTAINER_VENV}/bin/python" ]]; then
     echo "ERROR: prepare ${CONTAINER_VENV} with scripts/slurm/vip/setup_apptainer_env.sh first" >&2
     exit 2
@@ -78,6 +106,9 @@ if [[ -n "${APPTAINER_IMAGE:-}" ]]; then
   SRUN_PREFIX=(apptainer exec --nv --env "PREPEND_PATH=${CONTAINER_VENV}/bin")
   if [[ -n "${APPTAINER_BIND:-}" ]]; then
     SRUN_PREFIX+=(--bind "${APPTAINER_BIND}")
+  fi
+  if [[ -n "${APPTAINER_LOCAL_BIND}" ]]; then
+    SRUN_PREFIX+=(--bind "${APPTAINER_LOCAL_BIND}:${APPTAINER_LOCAL_BIND}")
   fi
   SRUN_PREFIX+=("${APPTAINER_IMAGE}")
 elif [[ "${UV_SYNC:-1}" == 1 ]]; then
