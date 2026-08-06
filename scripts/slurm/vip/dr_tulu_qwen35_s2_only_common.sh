@@ -42,6 +42,7 @@ esac
 
 RUN_NAME="${RUN_NAME:-${EXP_NAME}_$(date +%Y%m%d_%H%M%S)}"
 CHECKPOINT_STATE_DIR="${CHECKPOINT_STATE_DIR:-/gscratch/h2lab/${USER}/tmp/checkpoint_states/${RUN_NAME}}"
+ROLLOUTS_SAVE_PATH="${ROLLOUTS_SAVE_PATH:-/gscratch/h2lab/${USER}/rollouts/${RUN_NAME}}"
 export WANDB_RUN_ID="${WANDB_RUN_ID:-${RUN_NAME}}"
 export RUBRIC_JUDGE_MODEL="${RUBRIC_JUDGE_MODEL:-gpt-4.1}"
 export RUBRIC_GENERATION_MODEL="${RUBRIC_GENERATION_MODEL:-gpt-4.1}"
@@ -61,7 +62,7 @@ if [[ "${NUM_UNIQUE_PROMPTS_ROLLOUT}" != 8 || "${NUM_SAMPLES_PER_PROMPT_ROLLOUT}
   exit 2
 fi
 
-mkdir -p "$(dirname "${CHECKPOINT_STATE_DIR}")"
+mkdir -p "$(dirname "${CHECKPOINT_STATE_DIR}")" "${ROLLOUTS_SAVE_PATH}"
 
 SRUN_PREFIX=()
 if [[ -n "${APPTAINER_IMAGE:-}" ]]; then
@@ -125,7 +126,7 @@ export VARIANT EXP_NAME RUN_NAME MODEL_NAME_OR_PATH DATASET_NAME DATASET_WEIGHT
 export TOTAL_EPISODES NUM_NODES NUM_LEARNERS_PER_NODE VLLM_NUM_ENGINES
 export NUM_UNIQUE_PROMPTS_ROLLOUT NUM_SAMPLES_PER_PROMPT_ROLLOUT
 export VALUE_WARMUP_STEPS CHECKPOINT_STATE_FREQ CHECKPOINT_STATE_DIR
-export WANDB_ENTITY_NAME WANDB_PROJECT_NAME TOOL_CONFIG
+export ROLLOUTS_SAVE_PATH WANDB_ENTITY_NAME WANDB_PROJECT_NAME TOOL_CONFIG
 
 echo "=== Qwen3-4B-Instruct-2507 DR-Tulu S2-only ${VARIANT} ==="
 echo "Job:      ${SLURM_JOB_ID:-local}"
@@ -135,6 +136,7 @@ echo "Actors:   ${NUM_LEARNERS_PER_NODE} learners/node; ${VLLM_NUM_ENGINES} vLLM
 echo "Rollout:  ${NUM_UNIQUE_PROMPTS_ROLLOUT} prompts x ${NUM_SAMPLES_PER_PROMPT_ROLLOUT} samples = ${ROLLOUT_BATCH_SIZE}"
 echo "Episodes: ${TOTAL_EPISODES}"
 echo "State:    ${CHECKPOINT_STATE_DIR} every ${CHECKPOINT_STATE_FREQ} steps"
+echo "Traces:   ${ROLLOUTS_SAVE_PATH}"
 echo "Tools:    snippet_search (Semantic Scholar) only"
 echo "================================================="
 
@@ -210,6 +212,7 @@ srun --cpu-bind=none ${SRUN_PREFIX[@]+"${SRUN_PREFIX[@]}"} bash -c '
       --max_steps 10 \
       --backend_timeout 1800 \
       --save_traces \
+      --rollouts_save_path "${ROLLOUTS_SAVE_PATH}" \
       --seed 1 \
       --local_eval_every 100 \
       --save_freq 100 \
