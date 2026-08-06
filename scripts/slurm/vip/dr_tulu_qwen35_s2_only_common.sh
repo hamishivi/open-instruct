@@ -61,6 +61,10 @@ if [[ "${NUM_UNIQUE_PROMPTS_ROLLOUT}" != 8 || "${NUM_SAMPLES_PER_PROMPT_ROLLOUT}
   echo "ERROR: this matched ablation requires 8 prompts and group size 32" >&2
   exit 2
 fi
+if ! [[ "${CHECKPOINT_STATE_FREQ}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: CHECKPOINT_STATE_FREQ must be a positive integer, got: ${CHECKPOINT_STATE_FREQ}" >&2
+  exit 2
+fi
 
 mkdir -p "$(dirname "${CHECKPOINT_STATE_DIR}")" "${ROLLOUTS_SAVE_PATH}"
 
@@ -105,6 +109,46 @@ if [[ -n "${APPTAINER_IMAGE:-}" ]]; then
   fi
   export PATH="${CONTAINER_VENV}/bin:${PATH}"
   SRUN_PREFIX=(apptainer exec --nv --env "PREPEND_PATH=${CONTAINER_VENV}/bin")
+  APPTAINER_HF_HOME="${APPTAINER_HF_HOME:-${HF_HOME:-/gscratch/h2lab/${USER}/huggingface}}"
+  APPTAINER_HF_HUB_CACHE="${APPTAINER_HF_HUB_CACHE:-${APPTAINER_HF_HOME}/hub}"
+  APPTAINER_HF_DATASETS_CACHE="${APPTAINER_HF_DATASETS_CACHE:-${APPTAINER_HF_HOME}/datasets}"
+  APPTAINER_HF_XET_CACHE="${APPTAINER_HF_XET_CACHE:-${APPTAINER_HF_HOME}/xet}"
+  mkdir -p \
+    "${APPTAINER_HF_HUB_CACHE}" \
+    "${APPTAINER_HF_DATASETS_CACHE}" \
+    "${APPTAINER_HF_XET_CACHE}"
+  SRUN_PREFIX+=(
+    --env "HF_HOME=${APPTAINER_HF_HOME}"
+    --env "HF_HUB_CACHE=${APPTAINER_HF_HUB_CACHE}"
+    --env "HF_DATASETS_CACHE=${APPTAINER_HF_DATASETS_CACHE}"
+    --env "HF_XET_CACHE=${APPTAINER_HF_XET_CACHE}"
+  )
+  if [[ -n "${APPTAINER_LOCAL_BIND}" ]]; then
+    APPTAINER_RUNTIME_CACHE_DIR="${APPTAINER_RUNTIME_CACHE_DIR:-${APPTAINER_LOCAL_BIND}/cache}"
+  else
+    APPTAINER_RUNTIME_CACHE_DIR="${APPTAINER_RUNTIME_CACHE_DIR:-/tmp/open-instruct-${USER}-${SLURM_JOB_ID:-local}/cache}"
+  fi
+  APPTAINER_VLLM_CACHE_ROOT="${APPTAINER_VLLM_CACHE_ROOT:-${APPTAINER_RUNTIME_CACHE_DIR}/vllm}"
+  APPTAINER_TORCHINDUCTOR_CACHE_DIR="${APPTAINER_TORCHINDUCTOR_CACHE_DIR:-${APPTAINER_RUNTIME_CACHE_DIR}/torchinductor}"
+  APPTAINER_TRITON_CACHE_DIR="${APPTAINER_TRITON_CACHE_DIR:-${APPTAINER_RUNTIME_CACHE_DIR}/triton}"
+  APPTAINER_CUDA_CACHE_PATH="${APPTAINER_CUDA_CACHE_PATH:-${APPTAINER_RUNTIME_CACHE_DIR}/cuda}"
+  APPTAINER_XDG_CACHE_HOME="${APPTAINER_XDG_CACHE_HOME:-${APPTAINER_RUNTIME_CACHE_DIR}/xdg}"
+  APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-/tmp/oi-${SLURM_JOB_ID:-local}}"
+  mkdir -p \
+    "${APPTAINER_VLLM_CACHE_ROOT}" \
+    "${APPTAINER_TORCHINDUCTOR_CACHE_DIR}" \
+    "${APPTAINER_TRITON_CACHE_DIR}" \
+    "${APPTAINER_CUDA_CACHE_PATH}" \
+    "${APPTAINER_XDG_CACHE_HOME}" \
+    "${APPTAINER_TMPDIR}"
+  SRUN_PREFIX+=(
+    --env "VLLM_CACHE_ROOT=${APPTAINER_VLLM_CACHE_ROOT}"
+    --env "TORCHINDUCTOR_CACHE_DIR=${APPTAINER_TORCHINDUCTOR_CACHE_DIR}"
+    --env "TRITON_CACHE_DIR=${APPTAINER_TRITON_CACHE_DIR}"
+    --env "CUDA_CACHE_PATH=${APPTAINER_CUDA_CACHE_PATH}"
+    --env "XDG_CACHE_HOME=${APPTAINER_XDG_CACHE_HOME}"
+    --env "TMPDIR=${APPTAINER_TMPDIR}"
+  )
   # The locked PyTorch stack ships CUDA 12.8 libraries. Do not let the
   # container's CUDA 12.9 toolkit override those wheel libraries; retain only
   # Apptainer's host-driver bind on the global lookup path.
@@ -140,7 +184,7 @@ echo "Traces:   ${ROLLOUTS_SAVE_PATH}"
 echo "Tools:    snippet_search (Semantic Scholar) only"
 echo "================================================="
 
-srun --cpu-bind=none ${SRUN_PREFIX[@]+"${SRUN_PREFIX[@]}"} bash -c '
+srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
   source scripts/slurm/vip/ray_node_setup.sh
   if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
     value_args=()
@@ -203,7 +247,7 @@ srun --cpu-bind=none ${SRUN_PREFIX[@]+"${SRUN_PREFIX[@]}"} bash -c '
       --apply_evolving_rubric_reward true \
       --max_active_rubrics 5 \
       --remap_verifier general_rubric=rubric \
-      --tool_parser_type vllm_qwen3_xml \
+      --tool_parser_type vllm_hermes \
       --tools s2_search \
       --tool_call_names snippet_search \
       --tool_configs "${TOOL_CONFIG}" \

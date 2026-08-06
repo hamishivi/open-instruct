@@ -17,11 +17,15 @@
   Question: What recent evidence links retrieval augmentation to lower factual error rates in language models?
 
   <think>I should retrieve recent scientific evidence about retrieval augmentation and factuality.</think>
-  [call snippet_search with query "retrieval augmented generation factual errors language models"]
+  <tool_call>
+  {"name":"snippet_search","arguments":{"query":"retrieval augmented generation factual errors language models"}}
+  </tool_call>
   [results returned as snippets with IDs]
 
   <think>I have relevant evidence, but I should refine the search for controlled evaluations.</think>
-  [call snippet_search with query "controlled evaluation retrieval augmented generation factual accuracy"]
+  <tool_call>
+  {"name":"snippet_search","arguments":{"query":"controlled evaluation retrieval augmented generation factual accuracy"}}
+  </tool_call>
   [results returned as snippets with IDs]
 
   <answer><cite id="S_example1,S_example2">Controlled evaluations report that retrieval augmentation can improve factual accuracy when relevant evidence is retrieved.</cite></answer>
