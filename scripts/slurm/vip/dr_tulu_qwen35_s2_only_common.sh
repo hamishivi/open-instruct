@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared Slurm body for the S2-only Qwen3.5-4B DR-Tulu ablation.
+# Shared Slurm body for the S2-only Qwen3-4B-Instruct DR-Tulu ablation.
 
 set -euo pipefail
 
@@ -9,7 +9,7 @@ REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." &&
 cd "${REPO_ROOT}"
 mkdir -p logs
 
-MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-Qwen/Qwen3.5-4B}"
+MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-Qwen/Qwen3-4B-Instruct-2507}"
 DATASET_NAME="${DATASET_NAME:-rl-research/dr-tulu-rl-data}"
 DATASET_WEIGHT="${DATASET_WEIGHT:-1.0}"
 RL_STEPS="${RL_STEPS:-4000}"
@@ -27,11 +27,11 @@ TOOL_CONFIG='{"num_results": 10}'
 
 case "${VARIANT}" in
   grpo)
-    EXP_NAME="${EXP_NAME:-dr_tulu_q35_4b_s2_grpo}"
+    EXP_NAME="${EXP_NAME:-dr_tulu_q3_4b_inst_s2_grpo}"
     TOTAL_EPISODES=$((RL_STEPS * ROLLOUT_BATCH_SIZE))
     ;;
   sae_critic_whiten)
-    EXP_NAME="${EXP_NAME:-dr_tulu_q35_4b_s2_sae_whiten}"
+    EXP_NAME="${EXP_NAME:-dr_tulu_q3_4b_inst_s2_sae_whiten}"
     TOTAL_EPISODES=$(((RL_STEPS + VALUE_WARMUP_STEPS) * ROLLOUT_BATCH_SIZE))
     ;;
   *)
@@ -122,7 +122,7 @@ export NUM_UNIQUE_PROMPTS_ROLLOUT NUM_SAMPLES_PER_PROMPT_ROLLOUT
 export VALUE_WARMUP_STEPS CHECKPOINT_STATE_FREQ CHECKPOINT_STATE_DIR
 export WANDB_ENTITY_NAME WANDB_PROJECT_NAME TOOL_CONFIG
 
-echo "=== Qwen3.5-4B DR-Tulu S2-only ${VARIANT} ==="
+echo "=== Qwen3-4B-Instruct-2507 DR-Tulu S2-only ${VARIANT} ==="
 echo "Job:      ${SLURM_JOB_ID:-local}"
 echo "Run:      ${RUN_NAME}"
 echo "Nodes:    ${NUM_NODES}; GPUs/node: ${SLURM_GPUS_ON_NODE:-${SLURM_GPUS_PER_NODE:-4}}"
@@ -213,8 +213,6 @@ srun --cpu-bind=none ${SRUN_PREFIX[@]+"${SRUN_PREFIX[@]}"} bash -c '
       --wandb_entity "${WANDB_ENTITY_NAME}" \
       --wandb_project "${WANDB_PROJECT_NAME}" \
       --vllm_enable_prefix_caching \
-      --vllm_enforce_eager \
-      --vllm_gdn_prefill_backend triton \
       --keep_last_n_checkpoints -1 \
       --kl_estimator 3 \
       --push_to_hub False \

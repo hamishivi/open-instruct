@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=drt-q35-s2-sae-w
+#SBATCH --job-name=drt-q3-4b-s2-sae-w
 #SBATCH --account=gpu-h200-h2lab
 #SBATCH --partition=gpu-h200
 #SBATCH --nodes=1
