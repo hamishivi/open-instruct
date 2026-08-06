@@ -174,9 +174,24 @@ class VllmToolParser(ToolParser):
         tool_calls = []
         for call in result.tool_calls:
             try:
-                tool_calls.append(
-                    EnvCall(id=call.id or "", name=call.function.name, args=json.loads(call.function.arguments))
-                )
+                args = json.loads(call.function.arguments)
+                if isinstance(args, str):
+                    matching_definitions = [
+                        definition
+                        for definition in self._tool_definitions or []
+                        if definition.get("function", {}).get("name") == call.function.name
+                    ]
+                    if len(matching_definitions) == 1:
+                        parameters = matching_definitions[0]["function"].get("parameters", {})
+                        required = parameters.get("required", [])
+                        properties = parameters.get("properties", {})
+                        if (
+                            len(required) == 1
+                            and required[0] in properties
+                            and properties[required[0]].get("type") == "string"
+                        ):
+                            args = {required[0]: args}
+                tool_calls.append(EnvCall(id=call.id or "", name=call.function.name, args=args))
             except json.JSONDecodeError as e:
                 # the model may have mungled the tool call somehow, catch the error here.
                 logger.warning(

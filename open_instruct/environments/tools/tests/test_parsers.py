@@ -421,6 +421,25 @@ class TestVllmToolParser(unittest.TestCase):
         result = parser.format_tool_outputs(["hello"], role="user")
         self.assertEqual(result, "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n")
 
+    def test_single_string_argument_is_mapped_to_required_string_parameter(self):
+        mock_native = MagicMock()
+        parsed_call = MagicMock()
+        parsed_call.id = "call-1"
+        parsed_call.function.name = "snippet_search"
+        parsed_call.function.arguments = '"retrieval augmented generation factuality"'
+        mock_native.extract_tool_calls.return_value = MagicMock(tools_called=True, tool_calls=[parsed_call])
+        parser = VllmToolParser(
+            tool_parser=mock_native,
+            role_templates=self.ROLE_TEMPLATES,
+            tool_definitions=[make_tool_definition("snippet_search", param_name="query")],
+        )
+
+        result = parser.get_tool_calls("<tool_call>...</tool_call>")
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].name, "snippet_search")
+        self.assertEqual(result[0].args, {"query": "retrieval augmented generation factuality"})
+
     def test_stop_sequences_empty_by_default(self):
         mock_native = MagicMock()
         parser = VllmToolParser(tool_parser=mock_native, role_templates=self.ROLE_TEMPLATES, stop_sequences=[])
