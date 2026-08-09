@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-: "${VARIANT:?Set VARIANT to grpo or sae_critic_whiten}"
+: "${VARIANT:?Set VARIANT to grpo, sae_critic_whiten, or sae_critic_whiten_rubrics}"
 
 REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 cd "${REPO_ROOT}"
@@ -34,8 +34,12 @@ case "${VARIANT}" in
     EXP_NAME="${EXP_NAME:-dr_tulu_q3_4b_inst_s2_sae_whiten}"
     TOTAL_EPISODES=$(((RL_STEPS + VALUE_WARMUP_STEPS) * ROLLOUT_BATCH_SIZE))
     ;;
+  sae_critic_whiten_rubrics)
+    EXP_NAME="${EXP_NAME:-dr_tulu_q3_4b_inst_s2_sae_whiten_rubrics}"
+    TOTAL_EPISODES=$(((RL_STEPS + VALUE_WARMUP_STEPS) * ROLLOUT_BATCH_SIZE))
+    ;;
   *)
-    echo "ERROR: unknown VARIANT=${VARIANT}; expected grpo or sae_critic_whiten" >&2
+    echo "ERROR: unknown VARIANT=${VARIANT}; expected grpo, sae_critic_whiten, or sae_critic_whiten_rubrics" >&2
     exit 2
     ;;
 esac
@@ -188,7 +192,7 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
   source scripts/slurm/vip/ray_node_setup.sh
   if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
     value_args=()
-    if [[ "${VARIANT}" == sae_critic_whiten ]]; then
+    if [[ "${VARIANT}" == sae_critic_whiten || "${VARIANT}" == sae_critic_whiten_rubrics ]]; then
       value_args=(
         --use_value_model
         --value_learning_rate 5e-7
@@ -206,6 +210,12 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
         --value_warmup_steps "${VALUE_WARMUP_STEPS}"
         --reset_optimizer_after_value_warmup
       )
+      if [[ "${VARIANT}" == sae_critic_whiten_rubrics ]]; then
+        value_args+=(
+          --value_model_ground_truth_conditioning
+          --gt_conditioning_template rubrics
+        )
+      fi
     fi
 
     python open_instruct/grpo_fast.py \
