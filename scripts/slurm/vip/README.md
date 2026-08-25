@@ -70,13 +70,14 @@ container toolkit, while retaining Apptainer's host NVIDIA driver bind.
 
 ## ASTA Bench ScholarQA evaluation
 
-`eval_asta_sqa_local.sh` evaluates the two S2-only Qwen3-4B DR-Tulu runs from
-W&B as a two-task Slurm array:
+`eval_asta_sqa_local.sh` evaluates the shared starting model and the two S2-only
+Qwen3-4B DR-Tulu runs from W&B as a three-task Slurm array:
 
 | Array task | Model | Checkpoint |
 |---|---|---|
-| `0` | `dr_tulu_q3_4b_inst_s2_grpo_20260805_215652` | step 1000 |
-| `1` | `dr_tulu_q3_4b_inst_s2_sae_whiten_rubrics_20260809_085022` | final step 1100 |
+| `0` | `Qwen/Qwen3-4B-Instruct-2507` | shared step 0 |
+| `1` | `dr_tulu_q3_4b_inst_s2_grpo_20260805_215652` | step 1000 |
+| `2` | `dr_tulu_q3_4b_inst_s2_sae_whiten_rubrics_20260809_085022` | final step 1100 |
 
 The generation phase uses the same S2-only system prompt and native Hermes tool
 format as training. It produces resumable raw JSONL plus ASTA cached-solver
@@ -92,7 +93,7 @@ export HF_TOKEN=...
 bash scripts/slurm/vip/setup_asta_sqa_env.sh
 ```
 
-Submit both model evaluations after exporting the runtime credentials:
+Submit all three model evaluations after exporting the runtime credentials:
 
 ```bash
 mkdir -p logs
@@ -110,5 +111,5 @@ MAX_SAMPLES=2 RUN_SCORING=0 \
 
 Results default to `/mmfs1/gscratch/h2lab/$USER/asta-sqa-results/<model>/`.
 Override `MODEL_RUN=custom`, `MODEL_PATH`, and `MODEL_LABEL` to evaluate another
-gathered Hugging Face checkpoint. The launcher refuses incomplete checkpoints
-that lack `.checkpoint_complete`.
+gathered Hugging Face checkpoint. Local trained checkpoints must include
+`.checkpoint_complete`; the shared step-0 model is loaded from Hugging Face.

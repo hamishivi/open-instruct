@@ -2,7 +2,7 @@
 #SBATCH --account=gpu-h200-h2lab
 #SBATCH --partition=gpu-h200
 #SBATCH --job-name=drt-asta-sqa
-#SBATCH --array=0-1
+#SBATCH --array=0-2
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=1
@@ -19,10 +19,16 @@ set -euo pipefail
 
 REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 TRAINING_ROOT="${TRAINING_ROOT:-/mmfs1/gscratch/h2lab/hamishiv/open-instruct-dr-tulu-s2}"
-MODEL_RUNS=(grpo sae)
+MODEL_RUNS=(base grpo sae)
 MODEL_RUN="${MODEL_RUN:-${MODEL_RUNS[${SLURM_ARRAY_TASK_ID:-0}]}}"
+REQUIRE_CHECKPOINT_MARKER=1
 
 case "${MODEL_RUN}" in
+  base)
+    MODEL_LABEL="${MODEL_LABEL:-qwen3_4b_instruct_2507_step_0}"
+    MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-4B-Instruct-2507}"
+    REQUIRE_CHECKPOINT_MARKER=0
+    ;;
   grpo)
     MODEL_LABEL="${MODEL_LABEL:-dr_tulu_q3_4b_inst_s2_grpo_step_1000}"
     MODEL_PATH="${MODEL_PATH:-${TRAINING_ROOT}/output/dr_tulu_q3_4b_inst_s2_grpo__1__1786035513_checkpoints/step_1000}"
@@ -36,7 +42,7 @@ case "${MODEL_RUN}" in
     : "${MODEL_PATH:?Set MODEL_PATH when MODEL_RUN=custom}"
     ;;
   *)
-    echo "ERROR: MODEL_RUN must be grpo, sae, or custom; got ${MODEL_RUN}" >&2
+    echo "ERROR: MODEL_RUN must be base, grpo, sae, or custom; got ${MODEL_RUN}" >&2
     exit 2
     ;;
 esac
@@ -57,8 +63,6 @@ MAX_CONNECTIONS="${MAX_CONNECTIONS:-16}"
 RUN_SCORING="${RUN_SCORING:-1}"
 
 for required_file in \
-  "${MODEL_PATH}/config.json" \
-  "${MODEL_PATH}/.checkpoint_complete" \
   "${ASTA_DATA_FILE}" \
   "${CONTAINER}" \
   "${SCORER_ENV}/bin/python"; do
@@ -67,6 +71,14 @@ for required_file in \
     exit 2
   fi
 done
+if [[ "${REQUIRE_CHECKPOINT_MARKER}" == 1 ]]; then
+  for required_file in "${MODEL_PATH}/config.json" "${MODEL_PATH}/.checkpoint_complete"; do
+    if [[ ! -e "${required_file}" ]]; then
+      echo "ERROR: required checkpoint file is missing: ${required_file}" >&2
+      exit 2
+    fi
+  done
+fi
 if [[ -z "${GOOGLE_API_KEY:-}" && "${RUN_SCORING}" == 1 ]]; then
   echo "ERROR: GOOGLE_API_KEY is required when RUN_SCORING=1" >&2
   exit 2
