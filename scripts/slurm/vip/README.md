@@ -109,6 +109,12 @@ MAX_SAMPLES=2 RUN_SCORING=1 \
   sbatch --array=0 --export=ALL scripts/slurm/vip/eval_asta_sqa_local.sh
 ```
 
+Generation defaults to 16 concurrent samples and ASTA scoring to 24 concurrent
+Gemini requests. Override these with `WORKERS` and `MAX_CONNECTIONS` when API
+quotas require lower concurrency. Re-running the same model is resumable: the
+launcher retains completed rows in `responses.jsonl` and generates only missing
+samples before scoring.
+
 Results default to `/mmfs1/gscratch/h2lab/$USER/asta-sqa-results/<model>/`.
 Override `MODEL_RUN=custom`, `MODEL_PATH`, and `MODEL_LABEL` to evaluate another
 gathered Hugging Face checkpoint. Local trained checkpoints must include

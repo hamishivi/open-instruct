@@ -98,3 +98,58 @@ def test_generate_case_runs_native_tool_loop(monkeypatch) -> None:
             "citations": [{"id": "[call-1-0]", "title": "Paper", "snippets": ["Evidence"]}],
         }
     ]
+
+
+def test_generate_case_returns_search_errors_to_model(monkeypatch) -> None:
+    responses = iter(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "function": {"name": "snippet_search", "arguments": '{"query":"A* search"}'},
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+            {"choices": [{"message": {"content": "<answer>Recovered answer.</answer>"}}]},
+        ]
+    )
+    requests = []
+
+    def request_json(*args, **kwargs):
+        requests.append(kwargs["payload"])
+        return next(responses)
+
+    def search_fails(*args, **kwargs):
+        raise RuntimeError("HTTP 400: unsupported wildcard")
+
+    monkeypatch.setattr(asta_sqa_generate, "request_json", request_json)
+    monkeypatch.setattr(asta_sqa_generate, "semantic_scholar_search", search_fails)
+
+    result = asta_sqa_generate.generate_case(
+        {"case_id": "case", "question": "Question?"},
+        api_base="http://localhost/v1",
+        model="model",
+        system_prompt="prompt",
+        max_tool_calls=2,
+        num_docs=10,
+        temperature=0.6,
+        top_p=0.95,
+        max_tokens=100,
+        request_timeout=1,
+        s2_timeout=1,
+    )
+
+    tool_message = requests[1]["messages"][-1]
+    assert tool_message["role"] == "tool"
+    assert "unsupported wildcard" in tool_message["content"]
+    assert "rephrase" in tool_message["content"]
+    assert result["tool_calls"] == 1
+    assert result["final_response"] == "Recovered answer."

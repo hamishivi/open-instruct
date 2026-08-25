@@ -284,11 +284,18 @@ def generate_case(
                 if not query:
                     tool_output = "Empty query. Please provide a search query."
                 else:
-                    search_response = semantic_scholar_search(query, num_docs=num_docs, timeout=s2_timeout)
-                    tool_output, citations = format_search_results(
-                        search_response, str(tool_call.get("id") or case_id)
-                    )
-                    citation_catalogue.update(citations)
+                    try:
+                        search_response = semantic_scholar_search(query, num_docs=num_docs, timeout=s2_timeout)
+                    except RuntimeError as error:
+                        tool_output = (
+                            f"Semantic Scholar search failed: {error}. "
+                            "Please rephrase the query and try again. Avoid wildcard characters such as *."
+                        )
+                    else:
+                        tool_output, citations = format_search_results(
+                            search_response, str(tool_call.get("id") or case_id)
+                        )
+                        citation_catalogue.update(citations)
             messages.append(
                 {
                     "role": "tool",
