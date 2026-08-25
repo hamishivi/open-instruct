@@ -101,11 +101,11 @@ export S2_API_KEY=... GOOGLE_API_KEY=... HF_TOKEN=...
 sbatch --export=ALL scripts/slurm/vip/eval_asta_sqa_local.sh
 ```
 
-Each array task requests one H200, 32 CPUs, 256 GB RAM, and 24 hours. A cheap
-generation-only smoke test can be run before the full scorer:
+Each array task requests one H200, 32 CPUs, 256 GB RAM, and 24 hours. A
+two-question end-to-end smoke test can be run before the full evaluation:
 
 ```bash
-MAX_SAMPLES=2 RUN_SCORING=0 \
+MAX_SAMPLES=2 RUN_SCORING=1 \
   sbatch --array=0 --export=ALL scripts/slurm/vip/eval_asta_sqa_local.sh
 ```
 

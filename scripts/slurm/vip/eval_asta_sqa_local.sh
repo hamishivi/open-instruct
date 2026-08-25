@@ -93,6 +93,7 @@ PROJECT_ENV="${PROJECT_ENV:-${JOB_SCRATCH}/open-instruct-venv}"
 export HF_HOME="${HF_HOME:-/gscratch/h2lab/${USER}/huggingface}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+export NLTK_DATA="${NLTK_DATA:-${ASTA_ROOT}/nltk_data}"
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/gscratch/h2lab/${USER}/uv-cache}"
 export TMPDIR="${TMPDIR:-${JOB_SCRATCH}/tmp}"
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${JOB_SCRATCH}/vllm}"
@@ -128,6 +129,7 @@ APPTAINER_ARGS=(
   --env "HF_HOME=${HF_HOME}"
   --env "HF_HUB_CACHE=${HF_HUB_CACHE}"
   --env "HF_DATASETS_CACHE=${HF_DATASETS_CACHE}"
+  --env "NLTK_DATA=${NLTK_DATA}"
   --env "UV_CACHE_DIR=${UV_CACHE_DIR}"
   --env "TMPDIR=${TMPDIR}"
   --env "VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT}"
@@ -153,6 +155,7 @@ apptainer "${APPTAINER_ARGS[@]}" \
   "${PROJECT_ENV}/bin/vllm" serve "${MODEL_PATH}" \
     --served-model-name "${SERVED_MODEL_NAME}" \
     --dtype bfloat16 \
+    --generation-config vllm \
     --max-model-len "${MAX_MODEL_LEN}" \
     --gpu-memory-utilization 0.90 \
     --enable-auto-tool-choice \
@@ -211,7 +214,7 @@ if [[ "${RUN_SCORING}" == 1 ]]; then
     --log-dir "${OUTPUT_DIR}/inspect"
   )
   if [[ "${MAX_SAMPLES}" != -1 ]]; then
-    INSPECT_ARGS+=(--max-samples "${MAX_SAMPLES}")
+    INSPECT_ARGS+=(--limit "${MAX_SAMPLES}")
   fi
   export INSPECT_EVAL_LOG_FILE_PATTERN="${MODEL_LABEL}"
   apptainer "${APPTAINER_ARGS[@]}" "${SCORER_ENV}/bin/python" "${INSPECT_ARGS[@]}"

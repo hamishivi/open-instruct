@@ -11,6 +11,7 @@ ASTA_ROOT="${ASTA_ROOT:-/gscratch/h2lab/${USER}/asta-sqa}"
 SCORER_ENV="${SCORER_ENV:-${ASTA_ROOT}/scorer-venv}"
 ASTA_DATA_DIR="${ASTA_DATA_DIR:-${ASTA_ROOT}/data}"
 ASTA_DATA_FILE="${ASTA_DATA_FILE:-${ASTA_DATA_DIR}/tasks/sqa/rubrics_v2_recomputed.json}"
+NLTK_DATA_DIR="${NLTK_DATA_DIR:-${ASTA_ROOT}/nltk_data}"
 UV_CACHE_DIR="${UV_CACHE_DIR:-/gscratch/h2lab/${USER}/uv-cache}"
 
 if ! command -v uv >/dev/null 2>&1; then
@@ -18,8 +19,8 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 2
 fi
 
-mkdir -p "${ASTA_ROOT}" "${ASTA_DATA_DIR}" "${UV_CACHE_DIR}"
-export UV_CACHE_DIR ASTA_DATA_DIR
+mkdir -p "${ASTA_ROOT}" "${ASTA_DATA_DIR}" "${NLTK_DATA_DIR}" "${UV_CACHE_DIR}"
+export UV_CACHE_DIR ASTA_DATA_DIR NLTK_DATA_DIR
 
 if [[ ! -x "${SCORER_ENV}/bin/python" ]]; then
   uv venv --python 3.11 "${SCORER_ENV}"
@@ -43,6 +44,18 @@ path = hf_hub_download(
 print(path)
 '
 
+NLTK_ALLOW_PROXIED_URLOPEN=1 NLTK_DATA="${NLTK_DATA_DIR}" \
+  "${SCORER_ENV}/bin/python" -c '
+import os
+
+import nltk
+
+for package in ("punkt", "punkt_tab"):
+    if not nltk.download(package, download_dir=os.environ["NLTK_DATA_DIR"], quiet=True):
+        raise RuntimeError(f"Failed to download NLTK package: {package}")
+'
+
 test -f "${ASTA_DATA_FILE}"
 echo "ASTA scorer environment: ${SCORER_ENV}"
 echo "ScholarQA test data:     ${ASTA_DATA_FILE}"
+echo "NLTK data:               ${NLTK_DATA_DIR}"
