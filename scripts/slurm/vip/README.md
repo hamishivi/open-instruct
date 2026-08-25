@@ -113,7 +113,9 @@ Generation defaults to 16 concurrent samples and ASTA scoring to 24 concurrent
 Gemini requests. Override these with `WORKERS` and `MAX_CONNECTIONS` when API
 quotas require lower concurrency. Re-running the same model is resumable: the
 launcher retains completed rows in `responses.jsonl` and generates only missing
-samples before scoring.
+samples before scoring. Each Slurm task derives a job-specific vLLM port so
+concurrent evaluations can safely share a node; set `PORT` only when a fixed port
+is required.
 
 Results default to `/mmfs1/gscratch/h2lab/$USER/asta-sqa-results/<model>/`.
 Override `MODEL_RUN=custom`, `MODEL_PATH`, and `MODEL_LABEL` to evaluate another

@@ -54,7 +54,9 @@ CONTAINER="${CONTAINER:-/gscratch/h2lab/${USER}/containers/vllm-openai-v0.19.1.s
 RESULTS_ROOT="${RESULTS_ROOT:-/mmfs1/gscratch/h2lab/${USER}/asta-sqa-results}"
 OUTPUT_DIR="${OUTPUT_DIR:-${RESULTS_ROOT}/${MODEL_LABEL}}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-${MODEL_LABEL}}"
-PORT="${PORT:-30001}"
+if [[ -z "${PORT:-}" ]]; then
+  PORT=$((20000 + ((${SLURM_JOB_ID:-$$} + ${SLURM_ARRAY_TASK_ID:-0}) % 20000)))
+fi
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-40960}"
 MAX_TOKENS="${MAX_TOKENS:-16384}"
 MAX_SAMPLES="${MAX_SAMPLES:--1}"
@@ -178,6 +180,11 @@ for _ in $(seq 1 180); do
   sleep 5
 done
 curl --fail --silent "http://127.0.0.1:${PORT}/health" >/dev/null
+MODEL_LIST="$(curl --fail --silent "http://127.0.0.1:${PORT}/v1/models")"
+if [[ "${MODEL_LIST}" != *"\"${SERVED_MODEL_NAME}\""* ]]; then
+  echo "ERROR: vLLM on port ${PORT} does not serve ${SERVED_MODEL_NAME}: ${MODEL_LIST}" >&2
+  exit 1
+fi
 
 RAW_OUTPUT="${OUTPUT_DIR}/responses.jsonl"
 ASTA_OUTPUT="${OUTPUT_DIR}/responses_asta_format.json"
