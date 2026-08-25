@@ -67,3 +67,48 @@ locked environment under the compute node's `/scr` SSD. This avoids slow Python
 imports from the many small environment files on Klone's shared filesystem. The
 math launcher also keeps the locked environment's CUDA libraries ahead of the
 container toolkit, while retaining Apptainer's host NVIDIA driver bind.
+
+## ASTA Bench ScholarQA evaluation
+
+`eval_asta_sqa_local.sh` evaluates the two S2-only Qwen3-4B DR-Tulu runs from
+W&B as a two-task Slurm array:
+
+| Array task | Model | Checkpoint |
+|---|---|---|
+| `0` | `dr_tulu_q3_4b_inst_s2_grpo_20260805_215652` | step 1000 |
+| `1` | `dr_tulu_q3_4b_inst_s2_sae_whiten_rubrics_20260809_085022` | final step 1100 |
+
+The generation phase uses the same S2-only system prompt and native Hermes tool
+format as training. It produces resumable raw JSONL plus ASTA cached-solver
+responses. The scoring phase follows DR-Tulu's self-contained SQA-CS-V2 recipe:
+`astabench==0.3.1`, joint simplified assessment, all-at-once scoring, and
+`google/gemini-2.5-flash`.
+
+One-time setup on a Hyak login node requires a Hugging Face token with access to
+the gated `allenai/asta-bench` dataset:
+
+```bash
+export HF_TOKEN=...
+bash scripts/slurm/vip/setup_asta_sqa_env.sh
+```
+
+Submit both model evaluations after exporting the runtime credentials:
+
+```bash
+mkdir -p logs
+export S2_API_KEY=... GOOGLE_API_KEY=... HF_TOKEN=...
+sbatch --export=ALL scripts/slurm/vip/eval_asta_sqa_local.sh
+```
+
+Each array task requests one H200, 32 CPUs, 256 GB RAM, and 24 hours. A cheap
+generation-only smoke test can be run before the full scorer:
+
+```bash
+MAX_SAMPLES=2 RUN_SCORING=0 \
+  sbatch --array=0 --export=ALL scripts/slurm/vip/eval_asta_sqa_local.sh
+```
+
+Results default to `/mmfs1/gscratch/h2lab/$USER/asta-sqa-results/<model>/`.
+Override `MODEL_RUN=custom`, `MODEL_PATH`, and `MODEL_LABEL` to evaluate another
+gathered Hugging Face checkpoint. The launcher refuses incomplete checkpoints
+that lack `.checkpoint_complete`.
