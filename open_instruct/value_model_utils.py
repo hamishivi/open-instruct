@@ -21,6 +21,7 @@ import json
 import math
 import re
 from collections.abc import Sequence
+from typing import overload
 
 import torch
 import torch.nn.functional as F
@@ -33,28 +34,98 @@ def causal_value_mask(response_mask: torch.Tensor) -> torch.Tensor:
     return response_mask[:, 1:].bool()
 
 
-def predict_values(logits: torch.Tensor, loss_type: str) -> torch.Tensor:
-    """Convert value-head outputs to scalar predictions."""
+def validate_value_bounds(value_min: float, value_max: float) -> None:
+    if value_max <= value_min:
+        raise ValueError(f"value_max must be greater than value_min, got [{value_min}, {value_max}].")
+
+
+def validate_terminal_rewards(rewards: torch.Tensor, dones: torch.Tensor, value_min: float, value_max: float) -> None:
+    """Fail before critic training when observed outcomes exceed its declared support."""
+    validate_value_bounds(value_min, value_max)
+    if rewards.shape != dones.shape:
+        raise ValueError(f"rewards and dones must have the same shape ({rewards.shape} != {dones.shape}).")
+    terminal_rewards = rewards[dones.bool()].float()
+    if terminal_rewards.numel() == 0:
+        return
+    if not bool(torch.isfinite(terminal_rewards).all()):
+        raise ValueError("Observed a non-finite terminal reward while constructing value targets.")
+    tolerance = 1e-5
+    invalid = (terminal_rewards < value_min - tolerance) | (terminal_rewards > value_max + tolerance)
+    if bool(invalid.any()):
+        observed_min = float(terminal_rewards.min())
+        observed_max = float(terminal_rewards.max())
+        raise ValueError(
+            "Observed terminal rewards outside the configured value range: "
+            f"observed [{observed_min}, {observed_max}], configured [{value_min}, {value_max}]. "
+            "Set --value_reward_min and --value_reward_max to the true reward support."
+        )
+
+
+def bounded_value_prediction(logits: torch.Tensor, value_min: float, value_max: float) -> torch.Tensor:
+    """Map an unconstrained scalar head into the open reward interval with BPCO's scaled arctangent."""
+    validate_value_bounds(value_min, value_max)
+    unit_value = 0.5 + torch.atan(logits.float()) / math.pi
+    return value_min + (value_max - value_min) * unit_value
+
+
+@overload
+def unit_value_to_reward(value: float, value_min: float, value_max: float) -> float: ...
+
+
+@overload
+def unit_value_to_reward(value: torch.Tensor, value_min: float, value_max: float) -> torch.Tensor: ...
+
+
+def unit_value_to_reward(value: float | torch.Tensor, value_min: float, value_max: float) -> float | torch.Tensor:
+    """Map a value on [0, 1] to the configured outcome-reward range."""
+    validate_value_bounds(value_min, value_max)
+    return value_min + (value_max - value_min) * value
+
+
+def reward_to_unit_value(value: float, value_min: float, value_max: float) -> float:
+    """Map an outcome reward to [0, 1], clipping only after applying the affine transform."""
+    validate_value_bounds(value_min, value_max)
+    return max(0.0, min(1.0, (value - value_min) / (value_max - value_min)))
+
+
+def missing_value_fallback(value_min: float, value_max: float) -> float:
+    """Return the reward-support value closest to zero for a missing prediction."""
+    validate_value_bounds(value_min, value_max)
+    return max(value_min, min(0.0, value_max))
+
+
+def predict_values(
+    logits: torch.Tensor,
+    loss_type: str,
+    *,
+    bound_predictions: bool = False,
+    value_min: float = 0.0,
+    value_max: float = 1.0,
+) -> torch.Tensor:
+    """Convert value-head outputs to scalar predictions in the configured reward range."""
     if loss_type == "mse":
-        return logits.squeeze(-1).float()
+        values = logits.squeeze(-1).float()
+        return bounded_value_prediction(values, value_min, value_max) if bound_predictions else values
     if loss_type == "classification":
         if logits.shape[-1] != 2:
             raise ValueError(f"Classification value head must have 2 outputs, got {logits.shape[-1]}.")
-        return logits.float().softmax(dim=-1)[..., 1]
+        probability = logits.float().softmax(dim=-1)[..., 1]
+        return unit_value_to_reward(probability, value_min, value_max)
     raise ValueError(f"Unknown value loss type: {loss_type}")
 
 
 def classification_value_loss(
-    logits: torch.Tensor, returns: torch.Tensor, mask: torch.Tensor
+    logits: torch.Tensor, returns: torch.Tensor, mask: torch.Tensor, value_min: float = 0.0, value_max: float = 1.0
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Two-bin cross entropy for continuous targets on the support [0, 1]."""
+    """Two-bin cross entropy for continuous targets on the configured reward support."""
+    validate_value_bounds(value_min, value_max)
     tolerance = 1e-5
-    invalid = (returns < -tolerance) | (returns > 1.0 + tolerance)
+    invalid = (returns < value_min - tolerance) | (returns > value_max + tolerance)
     if bool((invalid & mask).any()):
         invalid_target = returns[invalid & mask][0].item()
-        raise ValueError(f"Classification value target {invalid_target} is outside [0, 1].")
+        raise ValueError(f"Classification value target {invalid_target} is outside [{value_min}, {value_max}].")
 
-    targets = returns.float().clamp(0.0, 1.0)
+    targets = ((returns.float() - value_min) / (value_max - value_min)).clamp(0.0, 1.0)
     target_distribution = torch.stack((1.0 - targets, targets), dim=-1)
     per_token = -(target_distribution * F.log_softmax(logits.float(), dim=-1)).sum(dim=-1)
     clipfrac = torch.zeros((), dtype=torch.float32, device=logits.device)
@@ -68,13 +139,172 @@ def compute_value_loss(
     mask: torch.Tensor,
     loss_type: str,
     clip_range: float,
+    *,
+    bound_predictions: bool = False,
+    value_min: float = 0.0,
+    value_max: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute the configured per-token value loss and clipping diagnostic."""
     if loss_type == "classification":
-        return classification_value_loss(logits, returns, mask)
+        return classification_value_loss(logits, returns, mask, value_min, value_max)
     if loss_type == "mse":
-        return value_clipped_mse_loss(predict_values(logits, loss_type), returns, old_values, mask, clip_range)
+        values = predict_values(
+            logits, loss_type, bound_predictions=bound_predictions, value_min=value_min, value_max=value_max
+        )
+        return value_clipped_mse_loss(values, returns, old_values, mask, clip_range)
     raise ValueError(f"Unknown value loss type: {loss_type}")
+
+
+def accumulation_group_token_counts(masks: Sequence[torch.Tensor], accumulation_steps: int) -> torch.Tensor:
+    """Return local valid-token counts for each gradient-accumulation group."""
+    if accumulation_steps <= 0:
+        raise ValueError(f"accumulation_steps must be positive, got {accumulation_steps}.")
+    if not masks:
+        return torch.empty(0, dtype=torch.float32)
+
+    num_groups = math.ceil(len(masks) / accumulation_steps)
+    counts = torch.zeros(num_groups, dtype=torch.float32, device=masks[0].device)
+    for sample_idx, mask in enumerate(masks):
+        counts[sample_idx // accumulation_steps] += mask.sum(dtype=torch.float32)
+    return counts
+
+
+def balanced_accumulation_group_ids(num_samples: int, num_groups: int) -> list[int]:
+    """Assign contiguous samples to exactly ``num_groups`` balanced groups."""
+    if num_samples < 0:
+        raise ValueError(f"num_samples must be non-negative, got {num_samples}.")
+    if num_groups <= 0:
+        raise ValueError(f"num_groups must be positive, got {num_groups}.")
+    if num_samples == 0:
+        return []
+    if num_groups > num_samples:
+        raise ValueError(
+            f"num_groups cannot exceed num_samples when every optimizer step needs data "
+            f"({num_groups} > {num_samples})."
+        )
+
+    base_size, extra = divmod(num_samples, num_groups)
+    group_ids: list[int] = []
+    for group_idx in range(num_groups):
+        group_size = base_size + int(group_idx < extra)
+        group_ids.extend([group_idx] * group_size)
+    return group_ids
+
+
+def grouped_token_counts(masks: Sequence[torch.Tensor], group_ids: Sequence[int]) -> torch.Tensor:
+    """Return local token counts for an explicit contiguous accumulation grouping."""
+    if len(masks) != len(group_ids):
+        raise ValueError(f"masks and group_ids must have the same length ({len(masks)} != {len(group_ids)}).")
+    if not masks:
+        return torch.empty(0, dtype=torch.float32)
+    if not group_ids or min(group_ids) < 0:
+        raise ValueError(f"group_ids must be non-negative, got {list(group_ids)}.")
+    if list(group_ids) != sorted(group_ids):
+        raise ValueError(f"group_ids must define contiguous ordered groups, got {list(group_ids)}.")
+    if sorted(set(group_ids)) != list(range(max(group_ids) + 1)):
+        raise ValueError(f"group_ids must not skip group numbers, got {list(group_ids)}.")
+
+    counts = torch.zeros(max(group_ids) + 1, dtype=torch.float32, device=masks[0].device)
+    for mask, group_idx in zip(masks, group_ids, strict=True):
+        counts[group_idx] += mask.sum(dtype=torch.float32)
+    return counts
+
+
+def normalize_value_loss(
+    per_token_loss: torch.Tensor,
+    global_token_count: float | torch.Tensor,
+    loss_coef: float,
+    data_parallel_world_size: int,
+) -> torch.Tensor:
+    """Scale one local value-loss contribution into a global token mean.
+
+    DeepSpeed averages gradients over data-parallel ranks, so the DP multiplier
+    restores the sum of local numerators after division by the global token count.
+    Contributions from every pack in the accumulation group must be backpropagated
+    before stepping the optimizer.
+    """
+    if data_parallel_world_size <= 0:
+        raise ValueError(f"data_parallel_world_size must be positive, got {data_parallel_world_size}.")
+    if isinstance(global_token_count, torch.Tensor):
+        denominator = global_token_count.to(device=per_token_loss.device, dtype=torch.float32).clamp(min=1)
+    else:
+        denominator = max(float(global_token_count), 1.0)
+    return per_token_loss.sum() / denominator * loss_coef * data_parallel_world_size
+
+
+def value_metric_sums(per_token_loss: torch.Tensor, clipfrac: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Return loss numerator, clipped-token count, and token count for reduction."""
+    token_count = mask.sum(dtype=torch.float64)
+    return torch.stack(
+        (
+            per_token_loss.detach().sum(dtype=torch.float64),
+            clipfrac.detach().to(torch.float64) * token_count,
+            token_count,
+        )
+    )
+
+
+def value_metrics_from_sums(metric_sums: torch.Tensor, loss_coef: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute globally token-weighted value loss and clipping fraction."""
+    token_count = metric_sums[2].clamp(min=1.0)
+    value_loss = metric_sums[0] / token_count * loss_coef
+    clipfrac = metric_sums[1] / token_count
+    return value_loss, clipfrac
+
+
+def regression_metric_sums(returns: torch.Tensor, predictions: torch.Tensor) -> torch.Tensor:
+    """Return sufficient statistics for exact distributed regression diagnostics."""
+    if returns.shape != predictions.shape:
+        raise ValueError(f"returns and predictions must have the same shape ({returns.shape} != {predictions.shape}).")
+    returns = returns.detach().to(torch.float64).reshape(-1)
+    predictions = predictions.detach().to(torch.float64).reshape(-1)
+    residuals = returns - predictions
+    return torch.stack(
+        (
+            torch.tensor(float(returns.numel()), dtype=torch.float64, device=returns.device),
+            returns.sum(),
+            returns.square().sum(),
+            predictions.sum(),
+            predictions.square().sum(),
+            residuals.sum(),
+            residuals.square().sum(),
+        )
+    )
+
+
+def regression_metrics_from_sums(metric_sums: torch.Tensor) -> dict[str, float]:
+    """Compute means, population standard deviations, and explained variance from global sums."""
+    if metric_sums.numel() != 7:
+        raise ValueError(f"Expected seven regression sufficient statistics, got {metric_sums.numel()}.")
+    count = float(metric_sums[0])
+    if count <= 0.0:
+        return {}
+
+    returns_mean = float(metric_sums[1]) / count
+    predictions_mean = float(metric_sums[3]) / count
+    residual_mean = float(metric_sums[5]) / count
+    returns_variance = max(float(metric_sums[2]) / count - returns_mean**2, 0.0)
+    predictions_variance = max(float(metric_sums[4]) / count - predictions_mean**2, 0.0)
+    residual_variance = max(float(metric_sums[6]) / count - residual_mean**2, 0.0)
+    return {
+        "value/returns_mean": returns_mean,
+        "value/returns_std": math.sqrt(returns_variance),
+        "value/predictions_mean": predictions_mean,
+        "value/predictions_std": math.sqrt(predictions_variance),
+        "value/explained_variance": 1.0 - residual_variance / (returns_variance + 1e-8),
+    }
+
+
+def generative_value_reinforce_reward(outcome: float, prediction: float | None) -> tuple[float, float | None]:
+    """Return the GenAC critic reward and parsed-prediction squared error.
+
+    Malformed generations receive no REINFORCE signal. Their prediction error is undefined rather
+    than being reported as though the critic had intentionally predicted zero.
+    """
+    if prediction is None:
+        return 0.0, None
+    squared_error = (outcome - prediction) ** 2
+    return 1.0 - squared_error, squared_error
 
 
 logger = logger_utils.setup_logger(__name__)
@@ -127,7 +357,9 @@ def segment_rollout(
             if lp < log_threshold:
                 boundaries.append(t)
     else:  # fixed
-        t = fixed_chunk_size
+        # Boundaries are inclusive. A chunk of size N therefore ends at N - 1,
+        # not N; the old loop made the first chunk one token too long.
+        t = fixed_chunk_size - 1
         while t < length:
             boundaries.append(t)
             t += fixed_chunk_size
@@ -147,6 +379,76 @@ def segment_rollout(
     return boundaries
 
 
+def add_observation_segment_boundaries(
+    response_mask: Sequence[bool], segment_end_boundaries: Sequence[int]
+) -> list[int]:
+    """End a critic segment before every masked gap between policy actions.
+
+    A masked gap is typically a tool/environment observation. The first action
+    after that gap belongs to a new state and must therefore receive a value
+    computed from a prefix that includes the observation.
+    """
+    response_positions = [idx for idx, is_response in enumerate(response_mask) if is_response]
+    if not response_positions:
+        if segment_end_boundaries:
+            raise ValueError("Cannot define response segments without response tokens.")
+        return []
+
+    boundaries = set(segment_end_boundaries)
+    for response_idx in range(1, len(response_positions)):
+        if response_positions[response_idx] > response_positions[response_idx - 1] + 1:
+            boundaries.add(response_idx - 1)
+    boundaries.add(len(response_positions) - 1)
+    return sorted(boundaries)
+
+
+def causal_segment_start_prefix_token_ids(
+    sequence_token_ids: Sequence[int], response_mask: Sequence[bool], segment_end_boundaries: Sequence[int]
+) -> list[list[int]]:
+    """Return the full trajectory prefix available before each response segment.
+
+    ``segment_end_boundaries`` are inclusive indices in the compressed sequence of
+    policy-produced response tokens. The returned prefixes instead slice the original
+    uncompressed trajectory, so masked tool observations between policy actions remain
+    visible to the critic. Prefix ``i`` ends immediately before the first policy action
+    in segment ``i``; consequently no score can depend on an action it will baseline.
+    """
+    if len(sequence_token_ids) != len(response_mask):
+        raise ValueError(
+            "sequence_token_ids and response_mask must have the same length "
+            f"({len(sequence_token_ids)} != {len(response_mask)})."
+        )
+
+    response_positions = [idx for idx, is_response in enumerate(response_mask) if is_response]
+    if not response_positions:
+        if segment_end_boundaries:
+            raise ValueError("Cannot define response segments without response tokens.")
+        return []
+
+    boundaries = list(segment_end_boundaries)
+    if not boundaries:
+        raise ValueError("At least one segment boundary is required for a non-empty response.")
+    if boundaries != sorted(set(boundaries)):
+        raise ValueError(f"Segment boundaries must be strictly increasing, got {boundaries}.")
+    if boundaries[-1] != len(response_positions) - 1:
+        raise ValueError(
+            "The final segment boundary must be the final response token "
+            f"({boundaries[-1]} != {len(response_positions) - 1})."
+        )
+    if boundaries[0] < 0:
+        raise ValueError(f"Segment boundaries must be non-negative, got {boundaries}.")
+
+    segment_starts = [0, *(boundary + 1 for boundary in boundaries[:-1])]
+    first_response_position = response_positions[0]
+    prefixes: list[list[int]] = []
+    for response_start in segment_starts:
+        if response_start >= len(response_positions):
+            raise ValueError(f"Segment start {response_start} exceeds response length {len(response_positions)}.")
+        original_start_position = response_positions[response_start]
+        prefixes.append(list(sequence_token_ids[first_response_position:original_start_position]))
+    return prefixes
+
+
 def rescale_gen_value_score(parsed: float, score_min: float, score_max: float) -> float:
     """Rescale a raw gen-value score from [score_min, score_max] to [0, 1]."""
     return max(0.0, min(1.0, (parsed - score_min) / max(score_max - score_min, 1e-8)))
@@ -160,9 +462,7 @@ def is_postfix_template(template: str) -> bool:
     return template in _POSTFIX_TEMPLATES
 
 
-def resolve_num_siblings_to_sample(
-    template: str, num_siblings_to_sample: int, num_samples_per_prompt: int
-) -> int:
+def resolve_num_siblings_to_sample(template: str, num_siblings_to_sample: int, num_samples_per_prompt: int) -> int:
     """Resolve the auto sibling count used by rollout-context-style templates.
 
     ``correct_demo`` needs access to every other rollout by default so it does not

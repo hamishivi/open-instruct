@@ -146,6 +146,7 @@ class CompletionOutput:
     mask: list[int] | None = None
     rollout_state: dict = dataclasses.field(default_factory=dict)
     """Rollout state dict — rewards, step_count, done, tool_output, tool_error, etc."""
+    text: str | None = None
 
 
 @dataclasses.dataclass
@@ -259,16 +260,22 @@ def truncate_tool_output_tokens(
 
 
 def bound_completion_request_to_context(
-    tokenizer,
-    prompt: str,
-    max_model_len: int,
-    max_tokens: int,
+    tokenizer, prompt: str, max_model_len: int, max_tokens: int, allow_prompt_truncation: bool = True
 ) -> tuple[list[int], int, bool]:
     """Return prompt token IDs and max_tokens that fit within the model context."""
     if max_model_len <= 1:
         raise ValueError(f"max_model_len must be > 1 for completions, got {max_model_len}.")
 
-    prompt_token_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    # The critic prompt is raw text rather than an already-tokenized policy
+    # sequence. Let its own tokenizer add model-native framing such as a BOS;
+    # the exact resulting IDs are returned and reused unchanged for training.
+    prompt_token_ids = tokenizer.encode(prompt, add_special_tokens=True)
+    if not allow_prompt_truncation and len(prompt_token_ids) + max_tokens > max_model_len:
+        raise ValueError(
+            "Completion request exceeds the model context "
+            f"({len(prompt_token_ids)} prompt + {max_tokens} completion > {max_model_len} tokens); "
+            "refusing to truncate the prompt or reduce max_tokens."
+        )
     request_max_tokens = max(1, min(max_tokens, max_model_len - 1))
     prompt_budget = max_model_len - request_max_tokens
     prompt_truncated = False
@@ -277,6 +284,11 @@ def bound_completion_request_to_context(
         if len(prompt_token_ids) < max_model_len:
             request_max_tokens = max_model_len - len(prompt_token_ids)
         else:
+            if not allow_prompt_truncation:
+                raise ValueError(
+                    "Completion prompt exceeds the model context "
+                    f"({len(prompt_token_ids)} >= {max_model_len} tokens); refusing to truncate it."
+                )
             prompt_budget = max_model_len - 1
             prompt_token_ids = prompt_token_ids[-prompt_budget:]
             request_max_tokens = 1
@@ -701,6 +713,10 @@ class LLMRayActor:
         # model-provided HF generation_config (e.g., max_new_tokens=2048)
         # cannot cap request max_tokens via OpenAI serving defaults.
         kwargs["generation_config"] = "vllm"
+        # TIS and old-policy ratios need the probability distribution that
+        # actually sampled each token. vLLM V1 otherwise returns raw model
+        # log-probabilities from before temperature/top-p processing.
+        kwargs["logprobs_mode"] = "processed_logprobs"
         engine_args = vllm.AsyncEngineArgs(*args, **kwargs)
         engine_args.disable_log_stats = True
         engine_args.disable_cascade_attn = True
@@ -838,12 +854,7 @@ class LLMRayActor:
             update_info = args[0]["update_info"]
         elif len(args) == 5:
             names, dtype_names, shapes, packed, model_step = args
-            update_info = {
-                "names": names,
-                "dtype_names": dtype_names,
-                "shapes": shapes,
-                "packed": packed,
-            }
+            update_info = {"names": names, "dtype_names": dtype_names, "shapes": shapes, "packed": packed}
         else:
             raise TypeError(
                 f"LLMRayActor.update_weights received an unexpected call: "
@@ -874,18 +885,44 @@ class LLMRayActor:
     ) -> list[str]:
         """Batch completions via the actor's internal OpenAI server. Returns texts in prompt order."""
 
+        request_outputs = self.generate_request_outputs(
+            prompts,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            stop=stop,
+            include_stop_str_in_output=include_stop_str_in_output,
+        )
+        return [request_output.outputs[0].text or "" for request_output in request_outputs]
+
+    def generate_request_outputs(
+        self,
+        prompts: list[str],
+        *,
+        temperature: float = 1.0,
+        max_tokens: int = 8,
+        top_p: float = 1.0,
+        stop: list[str] | None = None,
+        include_stop_str_in_output: bool = False,
+        allow_prompt_truncation: bool = True,
+    ) -> list[RequestOutput]:
+        """Batch simple completions using the same token-preserving output shape as policy rollouts."""
+
         async def _run():
-            extra_body = {"include_stop_str_in_output": True} if include_stop_str_in_output else None
+            extra_body = {"return_token_ids": True}
+            if include_stop_str_in_output:
+                extra_body["include_stop_str_in_output"] = True
             max_model_len = self.llm_engine.model_config.max_model_len
             adjusted_requests = 0
 
-            async def _one(prompt: str) -> str:
+            async def _one(request_index: int, prompt: str) -> RequestOutput:
                 nonlocal adjusted_requests
                 prompt_token_ids, request_max_tokens, prompt_truncated = bound_completion_request_to_context(
                     self.llm_engine.tokenizer,
                     prompt,
                     max_model_len,
                     max_tokens,
+                    allow_prompt_truncation=allow_prompt_truncation,
                 )
                 if request_max_tokens != max_tokens or prompt_truncated:
                     adjusted_requests += 1
@@ -896,15 +933,40 @@ class LLMRayActor:
                     "max_tokens": request_max_tokens,
                     "top_p": top_p,
                     "n": 1,
+                    "logprobs": 1,
                 }
                 if stop:
                     kwargs["stop"] = stop
-                if extra_body:
-                    kwargs["extra_body"] = extra_body
+                kwargs["extra_body"] = extra_body
                 resp = await self.client.completions.create(**kwargs)
-                return resp.choices[0].text
+                output = resp.choices[0]
+                completion_token_ids = getattr(output, "token_ids", None)
+                if completion_token_ids is None:
+                    raise RuntimeError("vLLM did not return token IDs for a token-preserving completion request.")
+                if output.logprobs is None or output.logprobs.token_logprobs is None:
+                    raise RuntimeError("vLLM did not return log-probabilities for a completion request.")
+                raw_token_logprobs = output.logprobs.token_logprobs
+                if any(logprob is None for logprob in raw_token_logprobs):
+                    raise RuntimeError("vLLM returned an empty token log-probability for a completion request.")
+                token_logprobs = [float(logprob) for logprob in raw_token_logprobs if logprob is not None]
+                if len(token_logprobs) != len(completion_token_ids):
+                    raise RuntimeError(
+                        "vLLM returned different numbers of completion token IDs and token log-probabilities."
+                    )
+                completion = CompletionOutput(
+                    index=0,
+                    token_ids=list(completion_token_ids),
+                    logprobs=token_logprobs,
+                    finish_reason=output.finish_reason or "stop",
+                    text=output.text,
+                    cumulative_logprob=sum(token_logprobs),
+                    mask=[1] * len(completion_token_ids),
+                )
+                return RequestOutput(
+                    request_id=f"simple_{request_index}_0", prompt_token_ids=prompt_token_ids, outputs=[completion]
+                )
 
-            results = list(await asyncio.gather(*[_one(p) for p in prompts]))
+            results = list(await asyncio.gather(*[_one(i, prompt) for i, prompt in enumerate(prompts)]))
             if adjusted_requests:
                 logger.warning(
                     "Adjusted %d/%d completion request(s) to fit max_model_len=%d.",
@@ -931,6 +993,10 @@ class LLMRayActor:
             raise RuntimeError(
                 "vLLM engine loop thread has died. Check logs for errors in EngineCore or async engine."
             )
+
+    def get_max_model_len(self) -> int:
+        """Return the effective context limit selected by vLLM."""
+        return int(self.llm_engine.model_config.max_model_len)
 
     def get_kv_cache_info(self) -> int:
         """Get KV cache max concurrency from the vLLM engine."""
@@ -1303,7 +1369,7 @@ def create_vllm_engines(
     revision: str | None,
     seed: int,
     enable_prefix_caching: bool,
-    max_model_len: int,
+    max_model_len: int | None,
     vllm_gpu_memory_utilization: float = 0.9,
     single_gpu_mode: bool = False,
     pg: PlacementGroup | None = None,
@@ -1325,6 +1391,7 @@ def create_vllm_engines(
     trust_remote_code: bool = False,
     vllm_attention_backend: str | None = None,
     vllm_gdn_prefill_backend: str | None = None,
+    tokenizer_revision: str | None = None,
 ) -> list[ray.actor.ActorHandle]:
     vllm_engines = []
     # Use "mp" (multiprocessing) for TP > 1 when running inside a Ray actor.
@@ -1350,6 +1417,9 @@ def create_vllm_engines(
 
     # ensure we use bundles on the same node where possible if tp>1.
     bundle_indices_list = get_bundle_indices_list(pg)
+    resolved_tokenizer_revision = (
+        revision if tokenizer_revision is None and tokenizer_name_or_path == pretrain else tokenizer_revision
+    )
 
     for i in range(num_engines):
         if use_hybrid_engine:
@@ -1382,7 +1452,7 @@ def create_vllm_engines(
                 model=pretrain,
                 revision=revision,
                 tokenizer=tokenizer_name_or_path,
-                tokenizer_revision=revision,
+                tokenizer_revision=resolved_tokenizer_revision,
                 weight_transfer_config=WeightTransferConfig(backend="ipc" if use_hybrid_engine else "nccl"),
                 tensor_parallel_size=tensor_parallel_size,
                 enforce_eager=enforce_eager,

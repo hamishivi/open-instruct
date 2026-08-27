@@ -1,4 +1,6 @@
 import math
+import pathlib
+import tempfile
 import unittest
 from queue import Empty
 from types import SimpleNamespace
@@ -17,11 +19,15 @@ from open_instruct.dataset_transformation import (
     RAW_PROMPT_KEY,
     VERIFIER_SOURCE_KEY,
 )
+from open_instruct.environments.tools.utils import EnvsConfig
 from open_instruct.grpo_fast import (
+    CHECKPOINT_COMPLETE_MARKER,
     PolicyTrainerRayProcess,
     _is_in_warmup_window,
     create_generation_configs,
     maybe_evaluate,
+    maybe_save_checkpoint,
+    setup_runtime_variables,
 )
 
 
@@ -90,10 +96,161 @@ class TestWarmupWindows(unittest.TestCase):
         self.assertFalse(_is_in_warmup_window(args, 61))
 
 
+class TestValueRewardRangeSetup(unittest.TestCase):
+    def test_requires_explicit_bounds_for_summed_rewards(self):
+        args = grpo_utils.GRPOExperimentConfig(use_value_model=True)
+        streaming_config = data_loader_lib.StreamingDataLoaderConfig(reward_aggregator="sum")
+
+        with self.assertRaisesRegex(ValueError, "summed multi-turn rewards"):
+            setup_runtime_variables(args, streaming_config, EnvsConfig())
+
+    def test_requires_explicit_bounds_for_tool_rewards(self):
+        args = grpo_utils.GRPOExperimentConfig(use_value_model=True)
+        streaming_config = data_loader_lib.StreamingDataLoaderConfig()
+
+        with self.assertRaisesRegex(ValueError, "tool/environment rewards"):
+            setup_runtime_variables(args, streaming_config, EnvsConfig(tools=["python"]))
+
+    def test_accepts_explicit_bounds_for_tool_rewards(self):
+        args = grpo_utils.GRPOExperimentConfig(use_value_model=True, value_reward_min=-5.0, value_reward_max=5.0)
+        streaming_config = data_loader_lib.StreamingDataLoaderConfig()
+
+        resolved = setup_runtime_variables(args, streaming_config, EnvsConfig(tools=["python"]))
+
+        self.assertEqual(resolved.value_reward_min, -5.0)
+        self.assertEqual(resolved.value_reward_max, 5.0)
+
+
+class TestValueCheckpointState(unittest.TestCase):
+    def test_value_engine_checkpoint_is_tagged_with_policy_step(self):
+        trainer = object.__new__(PolicyTrainerRayProcess)
+        value_mpu = object()
+        trainer.value_model = SimpleNamespace(mpu=value_mpu, save_checkpoint=Mock(return_value=True))
+        trainer._save_value_model = Mock()
+
+        trainer._save_value_checkpoint_state("/tmp/value-checkpoint", training_step=17)
+
+        trainer._save_value_model.assert_called_once_with("/tmp/value-checkpoint")
+        trainer.value_model.save_checkpoint.assert_called_once_with(
+            "/tmp/value-checkpoint/deepspeed", tag="global_step17", client_state={"training_step": 17}
+        )
+        self.assertIs(trainer.value_model.mpu, value_mpu)
+
+
+class TestModelCompletionMarker(unittest.TestCase):
+    @patch("open_instruct.grpo_fast.ray_get_with_progress")
+    def test_periodic_marker_is_published_after_external_model(self, wait_for_policy):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            args = SimpleNamespace(
+                save_freq=1,
+                eval_on_step_0=False,
+                output_dir=str(pathlib.Path(tmp_dir) / "model"),
+                world_size=1,
+                try_launch_beaker_eval_jobs_on_weka=False,
+            )
+            policy_model = SimpleNamespace(save_model=SimpleNamespace(remote=Mock(return_value="policy-save")))
+            policy_group = SimpleNamespace(models=[policy_model])
+            step_dir = pathlib.Path(f"{args.output_dir}_checkpoints") / "step_2"
+            events = []
+
+            def finish_policy(*_args, **_kwargs):
+                step_dir.mkdir(parents=True)
+                events.append("policy")
+
+            def save_critic(output_dir, training_step):
+                self.assertEqual(pathlib.Path(output_dir), step_dir)
+                self.assertEqual(training_step, 2)
+                self.assertFalse((step_dir / CHECKPOINT_COMPLETE_MARKER).exists())
+                events.append("critic")
+
+            wait_for_policy.side_effect = finish_policy
+            maybe_save_checkpoint(args, 2, policy_group, "chat", Mock(), "wandb", save_critic)
+
+            self.assertEqual(events, ["policy", "critic"])
+            self.assertTrue((step_dir / CHECKPOINT_COMPLETE_MARKER).exists())
+
+    @patch("open_instruct.grpo_fast.ray_get_with_progress")
+    def test_periodic_marker_is_not_published_when_external_model_fails(self, wait_for_policy):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            args = SimpleNamespace(
+                save_freq=1,
+                eval_on_step_0=False,
+                output_dir=str(pathlib.Path(tmp_dir) / "model"),
+                world_size=1,
+                try_launch_beaker_eval_jobs_on_weka=False,
+            )
+            policy_model = SimpleNamespace(save_model=SimpleNamespace(remote=Mock(return_value="policy-save")))
+            policy_group = SimpleNamespace(models=[policy_model])
+            step_dir = pathlib.Path(f"{args.output_dir}_checkpoints") / "step_2"
+
+            def finish_policy(*_args, **_kwargs):
+                step_dir.mkdir(parents=True, exist_ok=True)
+
+            def fail_critic(*_args, **_kwargs):
+                raise RuntimeError("critic save failed")
+
+            wait_for_policy.side_effect = finish_policy
+            undecorated_save = maybe_save_checkpoint.__wrapped__
+            with self.assertRaisesRegex(RuntimeError, "critic save failed"):
+                undecorated_save(args, 2, policy_group, "chat", Mock(), "wandb", fail_critic)
+
+            self.assertFalse((step_dir / CHECKPOINT_COMPLETE_MARKER).exists())
+
+
+class TestValueTokenAlignment(unittest.TestCase):
+    def test_rejects_non_sequence_parallel_shape_mismatch(self):
+        trainer = object.__new__(PolicyTrainerRayProcess)
+        trainer._sp_world_size = 1
+
+        with self.assertRaisesRegex(RuntimeError, "only a masked sequence-parallel padding suffix"):
+            trainer._align_value_predictions(
+                torch.tensor([[1.0]]), torch.tensor([[True, False]]), "test value forward"
+            )
+
+    def test_allows_only_masked_sequence_parallel_padding_suffix(self):
+        trainer = object.__new__(PolicyTrainerRayProcess)
+        trainer._sp_world_size = 2
+
+        aligned = trainer._align_value_predictions(
+            torch.tensor([[1.0]]), torch.tensor([[True, False, False]]), "test value forward"
+        )
+
+        torch.testing.assert_close(aligned, torch.tensor([[1.0, 0.0, 0.0]]))
+
+    def test_rejects_sequence_parallel_padding_over_real_tokens(self):
+        trainer = object.__new__(PolicyTrainerRayProcess)
+        trainer._sp_world_size = 2
+
+        with self.assertRaisesRegex(RuntimeError, "only a masked sequence-parallel padding suffix"):
+            trainer._align_value_predictions(
+                torch.tensor([[1.0]]), torch.tensor([[True, True, False]]), "test value forward"
+            )
+
+    def test_dummy_value_forward_uses_one_attended_token(self):
+        trainer = object.__new__(PolicyTrainerRayProcess)
+        trainer.tokenizer = SimpleNamespace(pad_token_id=7)
+        trainer.value_model = Mock(return_value=SimpleNamespace(logits=torch.ones(1, 1, 1, requires_grad=True)))
+        dummy_outputs = []
+
+        trainer._dummy_value_forward(torch.long, torch.device("cpu"), dummy_outputs)
+
+        kwargs = trainer.value_model.call_args.kwargs
+        torch.testing.assert_close(kwargs["input_ids"], torch.tensor([[7]]))
+        torch.testing.assert_close(kwargs["attention_mask"], torch.ones(1, 1, dtype=torch.long))
+        torch.testing.assert_close(kwargs["position_ids"], torch.zeros(1, 1, dtype=torch.long))
+        self.assertEqual(len(dummy_outputs), 1)
+
+
 class TestConditionedClassificationValueForward(unittest.TestCase):
     def test_preserves_two_logits_and_converts_to_scalar_values(self):
         trainer = object.__new__(PolicyTrainerRayProcess)
-        trainer.args = SimpleNamespace(value_loss="classification", sequence_parallel_size=1)
+        trainer.args = SimpleNamespace(
+            value_loss="classification",
+            bound_value_predictions=False,
+            value_reward_min=0.0,
+            value_reward_max=1.0,
+            sequence_parallel_size=1,
+        )
         trainer._sp_world_size = 1
 
         query_responses = torch.tensor([[10, 11, 12, 13]])

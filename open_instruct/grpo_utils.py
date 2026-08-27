@@ -59,6 +59,7 @@ def compute_pass_at_k_metrics(correct_per_prompt: np.ndarray) -> dict[str, float
 
 class GRPOLossType(enum.StrEnum):
     dapo = "dapo"
+    dppo = "dppo"
     cispo = "cispo"
 
 
@@ -129,7 +130,13 @@ class GRPOExperimentConfig(
     load_ref_policy: bool = True
     """Whether to load and use a reference policy for KL penalty calculation."""
     loss_fn: GRPOLossType = GRPOLossType.dapo
-    """Whether to use DAPO or CISPO loss function."""
+    """Policy loss."""
+    dppo_clip: float | None = None
+    """Required symmetric absolute sampled-token probability-change bound for DPPO.
+
+    This is separate from DAPO's asymmetric probability-ratio ``clip_lower`` and
+    ``clip_higher`` so DPPO cannot silently inherit their defaults.
+    """
     record_entropy: bool = False
     """whether to record the entropy of the policy during training. Uses extra memory."""
     use_vllm_logprobs: bool = False
@@ -147,7 +154,13 @@ class GRPOExperimentConfig(
     init_value_from_pretrained_checkpoint: str | None = None
     """Path to a directory containing a previously-saved `value_model.bin` to load into the value model."""
     value_loss: Literal["mse", "classification"] = "mse"
-    """Value-model objective. Classification uses soft two-bin targets over [0, 1]."""
+    """Value-model objective. Classification uses soft two-bin targets over the configured reward range."""
+    bound_value_predictions: bool = True
+    """Map scalar-head outputs through a scaled arctangent into the known reward range."""
+    value_reward_min: float | None = None
+    """Known minimum outcome reward for bounded values. Inferred from the reward config when unset."""
+    value_reward_max: float | None = None
+    """Known maximum outcome reward for bounded values. Inferred from the reward config when unset."""
     value_loss_coef: float = 1.0
     """Coefficient for the value loss (multiplied inside the value backward)."""
     value_learning_rate: float | None = None
@@ -364,6 +377,17 @@ class GRPOExperimentConfig(
                 "When load_ref_policy=False, beta must be 0.0. "
                 f"Got beta={self.beta}. Set --beta 0.0 or --load_ref_policy to use KL penalty."
             )
+        if self.clip_lower < 0.0 or self.clip_higher < 0.0:
+            raise ValueError(
+                f"clip_lower and clip_higher must be non-negative, got {self.clip_lower=} and {self.clip_higher=}."
+            )
+        if self.loss_fn == GRPOLossType.dppo:
+            if self.dppo_clip is None:
+                raise ValueError("--loss_fn dppo requires an explicit --dppo_clip value.")
+            if not 0.0 < self.dppo_clip <= 1.0:
+                raise ValueError(f"dppo_clip must be in (0, 1], got {self.dppo_clip}.")
+        elif self.dppo_clip is not None:
+            raise ValueError("--dppo_clip is only valid with --loss_fn dppo.")
 
         # Value model validation
         if self.init_value_from_rm and not self.use_value_model:
@@ -379,6 +403,12 @@ class GRPOExperimentConfig(
             )
         if self.value_loss == "classification" and self.init_value_from_rm:
             raise ValueError("--value_loss classification does not support --init_value_from_rm.")
+        if (
+            self.value_reward_min is not None
+            and self.value_reward_max is not None
+            and self.value_reward_max <= self.value_reward_min
+        ):
+            raise ValueError("--value_reward_max must be greater than --value_reward_min.")
         if self.length_adaptive_gae and not self.use_value_model:
             raise ValueError("--length_adaptive_gae requires --use_value_model.")
         if self.decoupled_gae and not self.use_value_model:
@@ -416,11 +446,13 @@ class GRPOExperimentConfig(
             raise ValueError(f"--rollout_context_num_siblings must be >=-1, got {self.rollout_context_num_siblings}.")
 
 
-def mask_logprobs(vllm_logprobs: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
-    """Set non-response positions to INVALID_LOGPROB and replace NaNs."""
-    vllm_logprobs = torch.masked_fill(vllm_logprobs, ~response_mask, INVALID_LOGPROB)
-    vllm_logprobs = torch.nan_to_num(vllm_logprobs, nan=INVALID_LOGPROB)
-    return vllm_logprobs
+def mask_logprobs(logprobs: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
+    """Validate response logprobs and fill positions excluded from training."""
+    invalid_response = response_mask & ~torch.isfinite(logprobs)
+    if bool(invalid_response.any()):
+        invalid_count = int(invalid_response.sum())
+        raise ValueError(f"Found {invalid_count} non-finite logprob(s) on policy response tokens.")
+    return torch.masked_fill(logprobs, ~response_mask, INVALID_LOGPROB)
 
 
 def compute_tis_weights(
@@ -486,13 +518,20 @@ def resolve_old_logprob(
     use_vllm_logprobs: bool,
     vllm_logprobs: torch.Tensor,
     new_logprobs: torch.Tensor,
+    loss_fn: GRPOLossType,
 ) -> torch.Tensor:
     """Return the old (baseline) logprobs for a sample.
+
+    DPPO's trust region must be anchored to the behavior distribution that
+    generated the rollout, so it always uses the vLLM logprobs. Other losses
+    retain the configured recomputed-old-policy behavior.
 
     With multiple mini-batches, old logprobs are pre-computed and cached.
     With a single mini-batch, they are lazily set on the first epoch from
     either vllm logprobs or the current policy's detached logprobs.
     """
+    if loss_fn == GRPOLossType.dppo:
+        return vllm_logprobs.detach()
     if num_mini_batches > 1:
         result = old_logprobs_cache[sample_idx]
     else:
@@ -507,8 +546,19 @@ def resolve_old_logprob(
     return result
 
 
+def compute_policy_ratio(
+    new_logprobs: torch.Tensor, old_logprobs: torch.Tensor, loss_fn: GRPOLossType
+) -> torch.Tensor:
+    """Compute the policy/old-policy ratio, using DPPO's reference stability clamp."""
+    log_ratio = new_logprobs - old_logprobs
+    if loss_fn == GRPOLossType.dppo:
+        log_ratio = log_ratio.clamp(-20.0, 20.0)
+    return torch.exp(log_ratio)
+
+
 def compute_grpo_loss(
     new_logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor | None,
     ratio: torch.Tensor,
     advantages: torch.Tensor,
     ref_logprobs: torch.Tensor | None,
@@ -518,19 +568,38 @@ def compute_grpo_loss(
     if config.loss_fn == GRPOLossType.dapo:
         pg_losses = -advantages * ratio
         pg_losses2 = -advantages * torch.clamp(ratio, 1.0 - config.clip_lower, 1.0 + config.clip_higher)
+        pg_loss = torch.max(pg_losses, pg_losses2)
+    elif config.loss_fn == GRPOLossType.dppo:
+        if old_logprobs is None:
+            raise ValueError("DPPO requires old_logprobs from the old policy.")
+        if config.dppo_clip is None:
+            raise ValueError("DPPO requires an explicit dppo_clip probability-change bound.")
+        # Binary-TV DPPO applies the sampled-action divergence constraint directly
+        # in probability space. Updates stop after changing the sampled token's
+        # probability by the symmetric dppo_clip bound.
+        old_prob = old_logprobs.detach().float().exp()
+        pg_losses = -advantages * ratio
+        safe_old_prob = old_prob.clamp_min(torch.finfo(torch.float32).tiny)
+        ratio_lower = 1.0 - config.dppo_clip / safe_old_prob
+        ratio_higher = 1.0 + config.dppo_clip / safe_old_prob
+        pg_losses2 = -advantages * torch.clamp(ratio, min=ratio_lower, max=ratio_higher)
+        # This is the literal bounded surrogate from the paper. It has the same
+        # zero gradient beyond the sign-dependent probability boundary as the old
+        # hard mask, while keeping loss/policy_avg and clipfrac truthful.
+        pg_loss = torch.max(pg_losses, pg_losses2)
     elif config.loss_fn == GRPOLossType.cispo:
         # cispo: directly clip ratio, no lower bound.
         # reinforce loss, so multiply by new logprobs
         pg_losses = -advantages * torch.clamp(ratio.detach(), max=1.0 + config.clip_higher) * new_logprobs
         pg_losses2 = pg_losses
+        pg_loss = pg_losses
     else:
         raise ValueError(f"Invalid loss function: {config.loss_fn}")
 
     if tis_weights is not None:
         pg_losses = pg_losses * tis_weights
         pg_losses2 = pg_losses2 * tis_weights
-
-    pg_loss_max = torch.max(pg_losses, pg_losses2)
+        pg_loss = pg_loss * tis_weights
 
     if ref_logprobs is not None:
         # We want the KL loss to backpropagate through the model.
@@ -540,9 +609,9 @@ def compute_grpo_loss(
         kl_all = model_utils.estimate_kl(ref_logprobs_diff, ratio)
         kl = kl_all[config.kl_estimator]
     else:
-        kl = torch.zeros_like(pg_loss_max)
+        kl = torch.zeros_like(pg_loss)
 
-    return pg_losses, pg_losses2, pg_loss_max, kl
+    return pg_losses, pg_losses2, pg_loss, kl
 
 
 def forward_for_logprobs(

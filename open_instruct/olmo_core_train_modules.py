@@ -370,7 +370,7 @@ class GRPOTrainModule(TransformerTrainModule):
         accumulation_steps = max(math.ceil(num_samples / num_mini_batches), 1)
 
         old_logprobs_BT: list[torch.Tensor | None] = [None for _ in range(num_samples)]
-        if num_mini_batches > 1:
+        if num_mini_batches > 1 and self.grpo_config.loss_fn != grpo_utils.GRPOLossType.dppo:
             with torch.no_grad():
                 local_old_logprobs_BT = None
                 if not self.grpo_config.use_vllm_logprobs:
@@ -439,12 +439,12 @@ class GRPOTrainModule(TransformerTrainModule):
                     self.grpo_config.use_vllm_logprobs,
                     vllm_logprobs,
                     new_logprobs,
+                    self.grpo_config.loss_fn,
                 )
 
                 advantages = data_BT.advantages[sample_idx]
 
-                log_ratio = new_logprobs - old_logprob
-                ratio = torch.exp(log_ratio)
+                ratio = grpo_utils.compute_policy_ratio(new_logprobs, old_logprob, self.grpo_config.loss_fn)
 
                 tis_clamped, tis_unclamped = grpo_utils.compute_tis_weights(
                     old_logprob, vllm_logprobs, response_mask, self.grpo_config.truncated_importance_sampling_ratio_cap
@@ -460,6 +460,7 @@ class GRPOTrainModule(TransformerTrainModule):
 
                 pg_losses, pg_losses2, pg_loss, kl = grpo_utils.compute_grpo_loss(
                     new_logprobs=new_logprobs,
+                    old_logprobs=old_logprob,
                     ratio=ratio,
                     advantages=advantages[:, 1:],
                     ref_logprobs=ref_logprobs_BT[sample_idx] if ref_logprobs_BT is not None else None,

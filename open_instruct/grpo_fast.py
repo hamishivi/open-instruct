@@ -56,6 +56,7 @@ import random
 import shutil
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import asdict
 from queue import Empty, Full, Queue
 from typing import Any
@@ -297,12 +298,17 @@ class PolicyTrainerRayProcess(RayProcess):
         # Gen-value model handles (set by grpo_fast_genvalue.main() when applicable).
         self._gen_value_engines: list | None = None
         self._gen_value_training_queue = None
+        self._gen_value_version = 0
+        self._gen_value_latest_enqueued_policy_training_step: int | None = None
 
     def set_gen_value_engines(self, engines: list) -> None:
         self._gen_value_engines = engines
 
-    def set_gen_value_training_queue(self, queue: Any) -> None:
-        self._gen_value_training_queue = queue
+    def set_gen_value_training_queue(self, training_queue: Any) -> None:
+        self._gen_value_training_queue = training_queue
+
+    def set_gen_value_version(self, version: int) -> None:
+        self._gen_value_version = int(version)
 
     def get_dataloader_state(self) -> dict[str, Any]:
         return self._streaming_dataloader.state_dict()
@@ -483,11 +489,31 @@ class PolicyTrainerRayProcess(RayProcess):
 
                 # Save value model path to load later (after value_model is initialized)
                 self.value_model_checkpoint_path = None
-                if _uses_scalar_value_model(args) and states.get("value_model_saved", False):
-                    value_model_dir = os.path.join(args.checkpoint_state_dir, "value_model")
-                    if os.path.exists(os.path.join(value_model_dir, "value_model.bin")):
-                        self.value_model_checkpoint_path = value_model_dir
-                        logger.info(f"{self.rank=}: Will load value model from {value_model_dir}")
+                self.value_model_checkpoint_tag = None
+                if _uses_scalar_value_model(args):
+                    if states.get("value_model_engine_saved", False):
+                        value_engine_dir = os.path.join(args.checkpoint_state_dir, "value_model", "deepspeed")
+                        value_engine_tag = f"global_step{int(states['training_step'])}"
+                        if not os.path.isdir(os.path.join(value_engine_dir, value_engine_tag)):
+                            raise ValueError(
+                                "Checkpoint says the scalar value engine was saved, but its DeepSpeed "
+                                f"checkpoint tag {value_engine_tag} is missing from {value_engine_dir}."
+                            )
+                        self.value_model_checkpoint_path = value_engine_dir
+                        self.value_model_checkpoint_tag = value_engine_tag
+                        logger.info(f"{self.rank=}: Will load value engine from {value_engine_dir}/{value_engine_tag}")
+                    elif states.get("value_model_saved", False):
+                        raise ValueError(
+                            "This checkpoint contains only scalar value-model weights, not critic optimizer/scheduler "
+                            "state. Resume it with an older revision or start a new run; partial critic resume is no "
+                            "longer supported."
+                        )
+                    else:
+                        raise ValueError(
+                            "Cannot resume scalar value training because the policy checkpoint does not contain a "
+                            "scalar value-engine checkpoint. Start a new run from the policy weights instead of "
+                            "resuming partial optimizer state."
+                        )
 
                 logger.info(
                     f"{self.rank=}: Loaded checkpoint from {args.checkpoint_state_dir} with {optimization_steps_done=}"
@@ -720,12 +746,6 @@ class PolicyTrainerRayProcess(RayProcess):
 
         _hf_ds_integration._hf_deepspeed_config_weak_ref = saved_ds_config
 
-        if checkpoint_path is not None:
-            model_file = os.path.join(checkpoint_path, "value_model.bin")
-            state_dict = torch.load(model_file, map_location=self.device, weights_only=True)
-            self.value_model.load_state_dict(state_dict)
-            logger.info(f"{self.rank=}: Loaded value model weights from checkpoint {model_file}")
-
         value_ds_config = get_train_ds_config(
             offload=args.deepspeed_offload_param,
             adam_offload=args.deepspeed_offload_optimizer,
@@ -770,6 +790,24 @@ class PolicyTrainerRayProcess(RayProcess):
             dist_init_required=False,
             mpu=self.mpu,
         )
+
+        if checkpoint_path is not None:
+            old_value_mpu = self.value_model.mpu
+            self.value_model.mpu = None
+            try:
+                loaded_path, _ = self.value_model.load_checkpoint(
+                    checkpoint_path,
+                    tag=self.value_model_checkpoint_tag,
+                    load_module_strict=True,
+                    load_optimizer_states=True,
+                    load_lr_scheduler_states=True,
+                    load_module_only=False,
+                )
+            finally:
+                self.value_model.mpu = old_value_mpu
+            if loaded_path is None:
+                raise ValueError(f"Failed to load scalar value-engine checkpoint from {checkpoint_path}")
+            logger.info(f"{self.rank=}: Restored scalar value model, optimizer, and scheduler from {loaded_path}")
 
         unwrapped = self.value_model.module if hasattr(self.value_model, "module") else self.value_model
         if model_config.gradient_checkpointing and hasattr(unwrapped, "gradient_checkpointing_enable"):
@@ -970,13 +1008,20 @@ class PolicyTrainerRayProcess(RayProcess):
                 fixed_chunk_size=chunk_size,
                 max_segments=max_segments,
             )
+            boundaries = value_model_utils.add_observation_segment_boundaries(mask.tolist(), boundaries)
 
             gt_str = ground_truths_pack[s_idx] if s_idx < len(ground_truths_pack) else ""
             siblings = siblings_pack[s_idx] if siblings_pack is not None and s_idx < len(siblings_pack) else None
 
             scores_start = len(prompts)
-            for bdry in boundaries:
-                partial_text = self.tokenizer.decode(resp_token_ids[: bdry + 1], skip_special_tokens=True)
+            # Query V(s) at the start of each segment, then carry that causal
+            # value forward over the segment. Prefixes are sliced from the full
+            # trajectory rather than ids[mask], retaining masked tool observations.
+            segment_start_prefixes = value_model_utils.causal_segment_start_prefix_token_ids(
+                ids.tolist(), mask.tolist(), boundaries
+            )
+            for partial_token_ids in segment_start_prefixes:
+                partial_text = self.tokenizer.decode(partial_token_ids, skip_special_tokens=False)
                 p = value_model_utils.build_generative_value_prompt(
                     partial_response=partial_text,
                     conditioning=conditioning,
@@ -1017,7 +1062,7 @@ class PolicyTrainerRayProcess(RayProcess):
         }
 
     def _finish_gen_value_scoring_request(
-        self, request: dict[str, Any], generated_texts: list[str]
+        self, request: dict[str, Any], request_outputs: list[vllm_utils.RequestOutput]
     ) -> tuple[torch.Tensor, list[dict]]:
         """Scatter generated gen-value scores for one request back to token positions."""
         args = self.args
@@ -1028,19 +1073,34 @@ class PolicyTrainerRayProcess(RayProcess):
         per_subseq_info: list[dict] = request["per_subseq_info"]
         score_min: float = getattr(args, "gen_value_score_min", 0.0)
         score_max: float = getattr(args, "gen_value_score_max", 10.0)
+        value_min = args.value_reward_min
+        value_max = args.value_reward_max
+        if value_min is None or value_max is None:
+            raise RuntimeError("Value reward bounds must be resolved before generative-value scoring.")
 
         values_BT = torch.zeros(1, seq_len - 1, device=device)
         if not prompts:
             return values_BT, []
 
+        if len(request_outputs) != len(prompts):
+            raise RuntimeError(f"Expected {len(prompts)} generative-value outputs, received {len(request_outputs)}.")
+        completions: list[vllm_utils.CompletionOutput] = []
+        for request_output in request_outputs:
+            if len(request_output.outputs) != 1 or request_output.outputs[0].text is None:
+                raise RuntimeError("Generative-value scoring requires exactly one completion with generated text.")
+            completions.append(request_output.outputs[0])
+
         all_scores: list[float] = []
-        for text in generated_texts:
-            raw = value_model_utils.parse_generative_value_score(text, score_min, score_max)
-            # Parse failure -> v_hat = 0 (piecewise-constant value of 0 for that segment),
-            # matching the REINFORCE reward semantics in grpo_fast_genvalue.GenValueTrainerActor.
-            all_scores.append(
-                value_model_utils.rescale_gen_value_score(raw, score_min, score_max) if raw is not None else 0.0
-            )
+        for completion in completions:
+            assert completion.text is not None
+            raw = value_model_utils.parse_generative_value_score(completion.text, score_min, score_max)
+            if raw is None:
+                # REINFORCE assigns malformed generations reward zero. GAE still needs a
+                # numeric baseline, so use zero (or the closest supported endpoint).
+                all_scores.append(value_model_utils.missing_value_fallback(value_min, value_max))
+            else:
+                unit_score = value_model_utils.rescale_gen_value_score(raw, score_min, score_max)
+                all_scores.append(value_model_utils.unit_value_to_reward(unit_score, value_min, value_max))
 
         for info in per_subseq_info:
             boundaries = info["boundaries"]
@@ -1052,6 +1112,8 @@ class PolicyTrainerRayProcess(RayProcess):
             segment_ends = torch.tensor([b + 1 for b in boundaries], device=device)
             scores_t = torch.tensor(sub_scores, device=device)
             idx = torch.bucketize(torch.arange(n_resp_sub, device=device), segment_ends, right=True)
+            # Each score was produced from the state before its segment's first
+            # action, so carrying it forward is causal for every action below.
             values_flat = scores_t[idx]  # (n_resp_sub,)
             resp_shifted = info["resp_shifted"]
             if resp_shifted is None or resp_shifted.numel() == 0:
@@ -1061,9 +1123,9 @@ class PolicyTrainerRayProcess(RayProcess):
             values_BT[0, resp_shifted] = values_flat[n_dropped : n_dropped + resp_shifted.numel()]
 
         training_pairs: list[dict] = []
-        for k, (prompt, generated) in enumerate(zip(prompts, generated_texts)):
+        for k, request_output in enumerate(request_outputs):
             training_pairs.append(
-                {"prompt": prompt, "generated": generated, "outcome": None, "subseq_idx": prompt_subseq_idx[k]}
+                {"request_output": request_output, "outcome": None, "subseq_idx": prompt_subseq_idx[k]}
             )
         return values_BT, training_pairs
 
@@ -1075,43 +1137,54 @@ class PolicyTrainerRayProcess(RayProcess):
             return [(torch.zeros(1, request["seq_len"] - 1, device=request["device"]), []) for request in requests]
 
         flat_entries: list[tuple[int, int, str]] = []
-        generated_by_request: list[list[str]] = []
+        outputs_by_request: list[list[vllm_utils.RequestOutput | None]] = []
         for request_idx, request in enumerate(requests):
             prompts: list[str] = request["prompts"]
-            generated_by_request.append([""] * len(prompts))
+            outputs_by_request.append([None] * len(prompts))
             for prompt_idx, prompt in enumerate(prompts):
                 flat_entries.append((request_idx, prompt_idx, prompt))
 
-        if flat_entries:
-            args = self.args
-            max_new_tokens: int = getattr(args, "gen_value_max_new_tokens", 8)
-            temperature: float = getattr(args, "gen_value_temperature", 1.0)
-            n_eng = len(self._gen_value_engines)
-            buckets: list[list[tuple[int, str]]] = [[] for _ in range(n_eng)]
-            for flat_idx, (_, _, prompt) in enumerate(flat_entries):
-                buckets[flat_idx % n_eng].append((flat_idx, prompt))
-            non_empty = [(e, b) for e, b in enumerate(buckets) if b]
-            refs = [
-                self._gen_value_engines[e].generate_completions.remote(
-                    [p for _, p in bucket],
-                    temperature=temperature,
-                    max_tokens=max_new_tokens,
-                    top_p=1.0,
-                    stop=["</answer>"],
-                    include_stop_str_in_output=True,
-                )
-                for e, bucket in non_empty
-            ]
-            results = ray.get(refs)
-            for (_, bucket), bucket_texts in zip(non_empty, results):
-                for (flat_idx, _), text in zip(bucket, bucket_texts):
-                    request_idx, prompt_idx, _ = flat_entries[flat_idx]
-                    generated_by_request[request_idx][prompt_idx] = text
-
-        return [
-            self._finish_gen_value_scoring_request(request, generated_texts)
-            for request, generated_texts in zip(requests, generated_by_request)
+        critic_version = self._gen_value_version
+        args = self.args
+        max_new_tokens: int = getattr(args, "gen_value_max_new_tokens", 8)
+        temperature: float = getattr(args, "gen_value_temperature", 1.0)
+        n_eng = len(self._gen_value_engines)
+        buckets: list[list[tuple[int, str]]] = [[] for _ in range(n_eng)]
+        for flat_idx, (_, _, prompt) in enumerate(flat_entries):
+            buckets[flat_idx % n_eng].append((flat_idx, prompt))
+        non_empty = [(e, b) for e, b in enumerate(buckets) if b]
+        refs = [
+            self._gen_value_engines[e].generate_request_outputs.remote(
+                [p for _, p in bucket],
+                temperature=temperature,
+                max_tokens=max_new_tokens,
+                top_p=1.0,
+                stop=["</answer>"],
+                include_stop_str_in_output=True,
+                allow_prompt_truncation=False,
+            )
+            for e, bucket in non_empty
         ]
+        engine_results, _ = ray_get_with_progress(
+            refs, desc="Scoring rollouts with generative critic", enable=False, timeout=WEIGHT_SYNC_TIMEOUT_S
+        )
+
+        for (_, bucket), bucket_outputs in zip(non_empty, engine_results):
+            for (flat_idx, _), request_output in zip(bucket, bucket_outputs):
+                request_idx, prompt_idx, _ = flat_entries[flat_idx]
+                outputs_by_request[request_idx][prompt_idx] = request_output
+
+        results = []
+        for request, request_outputs in zip(requests, outputs_by_request):
+            if any(request_output is None for request_output in request_outputs):
+                raise RuntimeError("A generative-value completion was not returned by the vLLM pool.")
+            scoring_result = self._finish_gen_value_scoring_request(
+                request, [request_output for request_output in request_outputs if request_output is not None]
+            )
+            for pair in scoring_result[1]:
+                pair["critic_version"] = critic_version
+            results.append(scoring_result)
+        return results
 
     def _score_rollout_with_gen_value(
         self,
@@ -1189,8 +1262,10 @@ class PolicyTrainerRayProcess(RayProcess):
     def _dummy_value_forward(
         self, dtype: torch.dtype, device: torch.device, dummy_grad_outputs: list | None = None
     ) -> None:
-        dummy = torch.zeros(1, 1, dtype=dtype, device=device)
-        dummy_out = self.value_model(input_ids=dummy, attention_mask=dummy, position_ids=dummy)
+        dummy_ids = torch.full((1, 1), self.tokenizer.pad_token_id, dtype=dtype, device=device)
+        dummy_mask = torch.ones_like(dummy_ids)
+        dummy_positions = torch.zeros_like(dummy_ids)
+        dummy_out = self.value_model(input_ids=dummy_ids, attention_mask=dummy_mask, position_ids=dummy_positions)
         if dummy_grad_outputs is not None:
             logits = getattr(dummy_out, "logits", dummy_out)
             dummy_grad_outputs.append(logits.reshape(-1)[0])
@@ -1204,6 +1279,12 @@ class PolicyTrainerRayProcess(RayProcess):
 
     @staticmethod
     def _pad_and_slice_last_dim(tensor: torch.Tensor, padded_len: int, start: int, end: int, pad_value: float | int):
+        if tensor.shape[-1] > padded_len:
+            raise RuntimeError(
+                f"Cannot pad tensor of length {tensor.shape[-1]} to the shorter requested length {padded_len}."
+            )
+        if not 0 <= start <= end <= padded_len:
+            raise RuntimeError(f"Invalid padded slice [{start}:{end}] for length {padded_len}.")
         if tensor.shape[-1] < padded_len:
             pad = tensor.new_full((*tensor.shape[:-1], padded_len - tensor.shape[-1]), pad_value)
             tensor = torch.cat([tensor, pad], dim=-1)
@@ -1318,9 +1399,14 @@ class PolicyTrainerRayProcess(RayProcess):
                         base = sub["offset_in_pack"]
                         resp_positions = sub["response_is_resp"][1:].bool().nonzero(as_tuple=True)[0] + base
                         cond_positions = entry["orig_mask"][1:].bool().nonzero(as_tuple=True)[0] + row_offset
-                        n = min(resp_positions.numel(), cond_positions.numel())
-                        if n > 0:
-                            full_to_orig_shifted[cond_positions[:n]] = resp_positions[:n]
+                        if resp_positions.numel() != cond_positions.numel():
+                            raise RuntimeError(
+                                "Conditioned scalar-value token mapping is inconsistent: "
+                                f"{resp_positions.numel()} response positions != "
+                                f"{cond_positions.numel()} conditioned positions."
+                            )
+                        if resp_positions.numel() > 0:
+                            full_to_orig_shifted[cond_positions] = resp_positions
                     row_offset += entry_len
             else:
                 packed_ids = torch.full((pad_len,), self.tokenizer.pad_token_id, dtype=token_dtype, device=device)
@@ -1352,13 +1438,12 @@ class PolicyTrainerRayProcess(RayProcess):
             local_logits = logits[:, :-1].float()
 
             local_seq_len = local_ids.shape[-1]
-            if local_logits.shape[1] != local_seq_len - 1:
-                local_logits = local_logits[:, : local_seq_len - 1]
-                if local_logits.shape[1] < local_seq_len - 1:
-                    pad = local_logits.new_zeros(
-                        local_logits.shape[0], local_seq_len - 1 - local_logits.shape[1], local_logits.shape[2]
-                    )
-                    local_logits = torch.cat((local_logits, pad), dim=1)
+            expected_logits_shape = (local_ids.shape[0], local_seq_len - 1, value_head_size)
+            if local_logits.shape != expected_logits_shape:
+                raise RuntimeError(
+                    "Sequence-parallel scalar-value logits do not align with their input tokens: "
+                    f"got {tuple(local_logits.shape)}, expected {expected_logits_shape}."
+                )
             cond_start = local_seq_len * self._sp_rank
             cond_end = local_seq_len * (self._sp_rank + 1)
             cond_padded_len = local_seq_len * self._sp_world_size
@@ -1409,6 +1494,12 @@ class PolicyTrainerRayProcess(RayProcess):
             output = self.value_model(input_ids=packed_ids, attention_mask=None, position_ids=packed_pos)
             logits = getattr(output, "logits", output)
             pack_logits = logits[0, :-1].float()
+            expected_pack_shape = (packed_ids.shape[1] - 1, value_head_size)
+            if pack_logits.shape != expected_pack_shape:
+                raise RuntimeError(
+                    "Repacked scalar-value logits do not align with their input tokens: "
+                    f"got {tuple(pack_logits.shape)}, expected {expected_pack_shape}."
+                )
 
             row_offset = 0
             for entry in pack_entries:
@@ -1423,11 +1514,35 @@ class PolicyTrainerRayProcess(RayProcess):
                 base = sub["offset_in_pack"]
                 resp_mask = sub["response_is_resp"]
                 resp_positions = resp_mask[1:].nonzero(as_tuple=True)[0] + base
-                n = min(resp_positions.numel(), new_resp_logits.shape[0])
-                out_logits[0, resp_positions[:n]] = new_resp_logits[:n]
+                if resp_positions.numel() != new_resp_logits.shape[0]:
+                    raise RuntimeError(
+                        "Repacked scalar-value response tokens do not align: "
+                        f"{resp_positions.numel()} response positions != {new_resp_logits.shape[0]} logits."
+                    )
+                out_logits[0, resp_positions] = new_resp_logits
                 row_offset += entry_len
 
         return out_logits
+
+    def _predict_value_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        value_min = self.args.value_reward_min
+        value_max = self.args.value_reward_max
+        if value_min is None or value_max is None:
+            raise RuntimeError("Value reward bounds must be resolved before value-model forward passes.")
+        return value_model_utils.predict_values(
+            logits,
+            self.args.value_loss,
+            bound_predictions=self.args.bound_value_predictions,
+            value_min=value_min,
+            value_max=value_max,
+        )
+
+    def _predict_and_mask_value_logits(
+        self, logits: torch.Tensor, unshifted_response_mask: torch.Tensor
+    ) -> torch.Tensor:
+        values = self._predict_value_logits(logits)
+        value_mask = value_model_utils.causal_value_mask(unshifted_response_mask)
+        return torch.where(value_mask, values, torch.zeros_like(values))
 
     def _forward_value_with_conditioning(
         self,
@@ -1462,7 +1577,7 @@ class PolicyTrainerRayProcess(RayProcess):
         out_logits = torch.zeros(1, full_len - 1, value_head_size, dtype=torch.float32, device=device)
 
         if not subseqs:
-            return out_logits if return_logits else value_model_utils.predict_values(out_logits, args.value_loss)
+            return out_logits if return_logits else self._predict_and_mask_value_logits(out_logits, response_mask)
 
         value_entries = self._build_conditioned_value_entries(
             query_responses,
@@ -1488,7 +1603,7 @@ class PolicyTrainerRayProcess(RayProcess):
             return (
                 conditioned_logits
                 if return_logits
-                else value_model_utils.predict_values(conditioned_logits, args.value_loss)
+                else self._predict_and_mask_value_logits(conditioned_logits, response_mask)
             )
 
         if sequential:
@@ -1504,7 +1619,7 @@ class PolicyTrainerRayProcess(RayProcess):
                 return (
                     conditioned_logits
                     if return_logits
-                    else value_model_utils.predict_values(conditioned_logits, args.value_loss)
+                    else self._predict_and_mask_value_logits(conditioned_logits, response_mask)
                 )
 
             # ZeRO-3 requires all DP ranks to call the value model the same number of times
@@ -1530,15 +1645,19 @@ class PolicyTrainerRayProcess(RayProcess):
                     base = sub["offset_in_pack"]
                     resp_mask = sub["response_is_resp"]
                     resp_positions = resp_mask[1:].nonzero(as_tuple=True)[0] + base
-                    n = min(resp_positions.numel(), new_resp_logits.shape[0])
-                    out_logits[0, resp_positions[:n]] = new_resp_logits[:n]
+                    if resp_positions.numel() != new_resp_logits.shape[0]:
+                        raise RuntimeError(
+                            "Sequential scalar-value response tokens do not align: "
+                            f"{resp_positions.numel()} response positions != {new_resp_logits.shape[0]} logits."
+                        )
+                    out_logits[0, resp_positions] = new_resp_logits
                 else:
                     # Dummy forward to keep ZeRO-3 ALLGATHER in sync across ranks.
                     # During the loss pass, the caller collects dummy_grad_outputs and folds
                     # them into v_loss with a 0 weight so that backward also traverses the
                     # same number of layers on all ranks (ZeRO-3 backward allgather parity).
                     self._dummy_value_forward(query_responses.dtype, device, dummy_grad_outputs=dummy_grad_outputs)
-            return out_logits if return_logits else value_model_utils.predict_values(out_logits, args.value_loss)
+            return out_logits if return_logits else self._predict_and_mask_value_logits(out_logits, response_mask)
 
         # Pad all expanded sequences to the same length for a single batched forward.
         n_subs = len(expanded_ids_list)
@@ -1556,6 +1675,12 @@ class PolicyTrainerRayProcess(RayProcess):
         output = self.value_model(input_ids=padded_ids, attention_mask=padded_attn, position_ids=padded_pos)
         logits = getattr(output, "logits", output)
         all_logits = logits[:, :-1].float()
+        expected_logits_shape = (n_subs, max_len - 1, value_head_size)
+        if all_logits.shape != expected_logits_shape:
+            raise RuntimeError(
+                "Batched scalar-value logits do not align with their input tokens: "
+                f"got {tuple(all_logits.shape)}, expected {expected_logits_shape}."
+            )
 
         # Scatter values back into out_values at original response positions.
         for i, sub in enumerate(subseqs):
@@ -1565,38 +1690,36 @@ class PolicyTrainerRayProcess(RayProcess):
             base = sub["offset_in_pack"]
             mask = sub["response_is_resp"]
             resp_positions = mask[1:].nonzero(as_tuple=True)[0] + base
-            n = min(resp_positions.numel(), new_resp_logits.shape[0])
-            out_logits[0, resp_positions[:n]] = new_resp_logits[:n]
+            if resp_positions.numel() != new_resp_logits.shape[0]:
+                raise RuntimeError(
+                    "Batched scalar-value response tokens do not align: "
+                    f"{resp_positions.numel()} response positions != {new_resp_logits.shape[0]} logits."
+                )
+            out_logits[0, resp_positions] = new_resp_logits
 
-        return out_logits if return_logits else value_model_utils.predict_values(out_logits, args.value_loss)
+        return out_logits if return_logits else self._predict_and_mask_value_logits(out_logits, response_mask)
 
-    def _align_value_predictions(self, values: torch.Tensor, target_shape: torch.Size, context: str) -> torch.Tensor:
-        """Align value predictions to the local shifted token shape.
-
-        Under SP, the conditioned value path may run on a shorter effective
-        slice than the policy shard when the policy shard contains trailing
-        padding. Padding with zeros is safe because those positions are masked
-        out of GAE and value loss.
-        """
+    def _align_value_predictions(self, values: torch.Tensor, target_mask: torch.Tensor, context: str) -> torch.Tensor:
+        """Allow only an explicitly masked sequence-parallel padding suffix."""
+        target_shape = target_mask.shape
         if values.shape == target_shape:
             return values
         if values.dim() != len(target_shape) or values.shape[:-1] != target_shape[:-1]:
-            raise AssertionError(
+            raise RuntimeError(
                 f"{context}: value predictions shape {values.shape} is incompatible with target shape {target_shape}"
             )
 
         target_len = target_shape[-1]
         current_len = values.shape[-1]
-        if current_len < target_len:
+        padding_suffix = target_mask[..., current_len:] if current_len < target_len else None
+        if self._sp_world_size > 1 and padding_suffix is not None and not bool(padding_suffix.bool().any().item()):
             pad = values.new_zeros(*values.shape[:-1], target_len - current_len)
-            aligned = torch.cat([values, pad], dim=-1)
-        else:
-            aligned = values[..., :target_len]
+            return torch.cat([values, pad], dim=-1)
 
-        if not getattr(self, "_value_alignment_warning_logged", False):
-            logger.warning(f"{context}: aligned value predictions from {tuple(values.shape)} to {tuple(target_shape)}")
-            self._value_alignment_warning_logged = True
-        return aligned
+        raise RuntimeError(
+            f"{context}: value predictions shape {values.shape} does not match target shape {target_shape}; "
+            "only a masked sequence-parallel padding suffix may be added."
+        )
 
     def forward_value_logits(
         self, query_responses: torch.Tensor, position_ids: torch.Tensor, response_mask: torch.Tensor
@@ -1606,11 +1729,10 @@ class PolicyTrainerRayProcess(RayProcess):
         logits = getattr(output, "logits", output)[:, :-1]
         target_shape = torch.Size((*response_mask.shape, logits.shape[-1]))
         if logits.shape != target_shape:
-            target_len = target_shape[-2]
-            logits = logits[:, :target_len]
-            if logits.shape[-2] < target_len:
-                pad = logits.new_zeros(logits.shape[0], target_len - logits.shape[-2], logits.shape[-1])
-                logits = torch.cat((logits, pad), dim=-2)
+            raise RuntimeError(
+                "Scalar-value logits do not align with their input tokens: "
+                f"got {tuple(logits.shape)}, expected {tuple(target_shape)}."
+            )
         return logits
 
     def forward_value(
@@ -1618,8 +1740,8 @@ class PolicyTrainerRayProcess(RayProcess):
     ) -> torch.Tensor:
         """Compute scalar per-token values for a packed sequence."""
         logits = self.forward_value_logits(query_responses, position_ids, response_mask)
-        values = value_model_utils.predict_values(logits, self.args.value_loss)
-        values = self._align_value_predictions(values, response_mask.shape, "forward_value")
+        values = self._predict_value_logits(logits)
+        values = self._align_value_predictions(values, response_mask, "forward_value")
         values = torch.where(response_mask, values, torch.zeros_like(values))
         return values
 
@@ -1696,20 +1818,15 @@ class PolicyTrainerRayProcess(RayProcess):
     def calculate_token_counts(
         self, accumulation_steps: int, data_BT: data_types.CollatedBatchData
     ) -> dict[int, float]:
-        accumulation_counts: dict[int, float] = {}
-        local_counts = [mask[:, 1:].sum().float() for mask in data_BT.response_masks]
-        if not local_counts:
-            return accumulation_counts
+        return self.calculate_mask_token_counts(accumulation_steps, [mask[:, 1:] for mask in data_BT.response_masks])
 
-        counts_tensor = torch.stack(local_counts)
-        dist.all_reduce(counts_tensor, op=dist.ReduceOp.SUM)
-
-        for i, count in enumerate(counts_tensor):
-            group_idx = i // accumulation_steps
-            key = int(group_idx * accumulation_steps)
-            accumulation_counts[key] = accumulation_counts.get(key, 0.0) + count.item()
-
-        return accumulation_counts
+    def calculate_mask_token_counts(self, accumulation_steps: int, masks: list[torch.Tensor]) -> dict[int, float]:
+        """Count valid tokens globally for each gradient-accumulation group."""
+        counts = value_model_utils.accumulation_group_token_counts(masks, accumulation_steps)
+        if counts.numel() == 0:
+            return {}
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+        return {group_idx * accumulation_steps: count.item() for group_idx, count in enumerate(counts)}
 
     def _compute_loss_metrics(self, loss_stats_B: dict[str, torch.Tensor], token_counts: torch.Tensor) -> None:
         metrics = grpo_utils.compute_metrics_from_loss_stats(loss_stats_B, token_counts)
@@ -1774,6 +1891,7 @@ class PolicyTrainerRayProcess(RayProcess):
             logger.warning(f"{leftover} samples are dropped due to batch size {self.num_mini_batches}")
 
         num_mini_batches = len(data_BT.query_responses) // accumulation_steps
+        _use_gen_value = getattr(self.args, "use_generative_value_model", False) and bool(self._gen_value_engines)
         sp_value_data_BT = (
             unsplit_data_BT.to(self.device)
             if self.splitter is not None
@@ -1781,6 +1899,7 @@ class PolicyTrainerRayProcess(RayProcess):
             and self.args.value_model_ground_truth_conditioning
             else None
         )
+        gen_value_source_BT = unsplit_data_BT if self.splitter is not None and _use_gen_value else data_BT
         self._log_sp_forward_kwargs_diagnostics(data_BT, training_step)
 
         ref_logprobs_BT: list[torch.Tensor] = []
@@ -1794,7 +1913,7 @@ class PolicyTrainerRayProcess(RayProcess):
         # following gtrl scripts in just doing this on the current active policy, rather than use the logprobs
         # from the generator (note that async mode means these are a bit diff!)
         old_logprobs_BT: list[torch.Tensor | None] = [None for _ in range(len(data_BT.query_responses))]
-        if num_mini_batches > 1:
+        if num_mini_batches > 1 and self.args.loss_fn != grpo_utils.GRPOLossType.dppo:
             with Timer("Old logprobs Calculation", noop=self.rank != 0):
                 local_old_logprobs_BT = None
                 if not self.args.use_vllm_logprobs:
@@ -1829,8 +1948,7 @@ class PolicyTrainerRayProcess(RayProcess):
         # When use_generative_value_model=True and gen-value engines are wired up, we score
         # each rollout at fixed-chunk boundaries and use those piecewise-constant estimates as
         # the value function for GAE instead of the scalar value head.
-        _use_gen_value = getattr(self.args, "use_generative_value_model", False) and bool(self._gen_value_engines)
-        _gen_value_training_pairs: list[dict] = []
+        _gen_value_training_rollouts: list[dict] = []
 
         if self.args.use_value_model:
             assert data_BT.rewards is not None and data_BT.dones is not None, (
@@ -1855,32 +1973,75 @@ class PolicyTrainerRayProcess(RayProcess):
                 gen_value_results: list[tuple[torch.Tensor, list[dict]]] = []
                 if _use_gen_value:
                     gen_value_requests: list[dict[str, Any]] = []
-                    for i in range(num_samples):
-                        gts_pack = (data_BT.ground_truths[i][0] if data_BT.ground_truths is not None else []) or []
-                        siblings_pack = (
-                            data_BT.sibling_rollouts[i][0] if data_BT.sibling_rollouts is not None else None
-                        )
-                        gv_logprobs_full = None
-                        if (
-                            getattr(self.args, "gen_value_segmentation", "fixed") == "sae"
-                            and self.args.use_sae
-                            and data_BT.vllm_logprobs is not None
-                        ):
-                            gv_logprobs_full = data_BT.vllm_logprobs[i]
-                        gen_value_requests.append(
-                            self._build_gen_value_scoring_request(
-                                data_BT.query_responses[i],
-                                data_BT.position_ids[i],
-                                data_BT.response_masks[i],
-                                list(gts_pack),
-                                response_logprobs_full=gv_logprobs_full,
-                                siblings_pack=siblings_pack,
+                    if self._sp_rank == 0:
+                        for i in range(num_samples):
+                            gts_pack = (
+                                gen_value_source_BT.ground_truths[i][0]
+                                if gen_value_source_BT.ground_truths is not None
+                                else []
+                            ) or []
+                            siblings_pack = (
+                                gen_value_source_BT.sibling_rollouts[i][0]
+                                if gen_value_source_BT.sibling_rollouts is not None
+                                else None
                             )
-                        )
-                    sae_step_metrics["gen_value/num_segment_prompts"] = float(
-                        sum(len(request["prompts"]) for request in gen_value_requests)
-                    )
+                            gv_logprobs_full = None
+                            if (
+                                getattr(self.args, "gen_value_segmentation", "fixed") == "sae"
+                                and self.args.use_sae
+                                and gen_value_source_BT.vllm_logprobs is not None
+                            ):
+                                gv_logprobs_full = gen_value_source_BT.vllm_logprobs[i]
+                            gen_value_requests.append(
+                                self._build_gen_value_scoring_request(
+                                    gen_value_source_BT.query_responses[i],
+                                    gen_value_source_BT.position_ids[i],
+                                    gen_value_source_BT.response_masks[i],
+                                    list(gts_pack),
+                                    response_logprobs_full=gv_logprobs_full,
+                                    siblings_pack=siblings_pack,
+                                )
+                            )
+                    num_segment_prompts = sum(len(request["prompts"]) for request in gen_value_requests)
+                    sae_step_metrics["gen_value/num_segment_prompts"] = float(num_segment_prompts)
                     gen_value_results = self._score_gen_value_requests(gen_value_requests)
+                    if self._sp_world_size > 1:
+                        # Followers need only the numeric values. Keeping request outputs
+                        # on SP rank 0 prevents duplicate critic examples and avoids
+                        # broadcasting large prompt/completion payloads.
+                        payload: list[Any] = [
+                            {
+                                "values": [values.cpu() for values, _ in gen_value_results],
+                                "num_segment_prompts": num_segment_prompts,
+                            }
+                            if self._sp_rank == 0
+                            else None
+                        ]
+                        dist.broadcast_object_list(payload, group=self._sp_group, group_src=0, device=self.device)
+                        broadcast_result = payload[0]
+                        if not isinstance(broadcast_result, dict):
+                            raise RuntimeError(
+                                "Sequence-parallel generative-value broadcast returned an invalid payload."
+                            )
+                        full_values = broadcast_result.get("values")
+                        if not isinstance(full_values, list) or len(full_values) != num_samples:
+                            raise RuntimeError(
+                                "Sequence-parallel generative-value broadcast returned an invalid value batch."
+                            )
+                        sae_step_metrics["gen_value/num_segment_prompts"] = float(
+                            broadcast_result["num_segment_prompts"]
+                        )
+                        max_source_len = max(t.shape[-1] for t in gen_value_source_BT.query_responses)
+                        sp_start, sp_end, sp_padded_len = self._sp_slice_bounds(max_source_len)
+                        leader_pairs = [pairs for _, pairs in gen_value_results] if self._sp_rank == 0 else []
+                        localized_results: list[tuple[torch.Tensor, list[dict]]] = []
+                        for sample_idx, full_value in enumerate(full_values):
+                            local_value = self._pad_and_slice_last_dim(
+                                full_value.to(self.device), sp_padded_len - 1, sp_start, sp_end - 1, 0.0
+                            )
+                            pairs = leader_pairs[sample_idx] if self._sp_rank == 0 else []
+                            localized_results.append((local_value, pairs))
+                        gen_value_results = localized_results
 
                 for i in range(num_samples):
                     resp_mask = value_model_utils.causal_value_mask(data_BT.response_masks[i])
@@ -1910,13 +2071,26 @@ class PolicyTrainerRayProcess(RayProcess):
                         )
                     else:
                         values_BT = self.forward_value(data_BT.query_responses[i], data_BT.position_ids[i], resp_mask)
-                    values_BT = self._align_value_predictions(values_BT, resp_mask.shape, "value forward")
+                    values_BT = self._align_value_predictions(values_BT, resp_mask, "value forward")
                     assert values_BT.shape == resp_mask.shape, (
                         f"value predictions shape {values_BT.shape} must match shifted response mask {resp_mask.shape}"
                     )
                     # Build per-pack numpy arrays aligned with values (seq_len - 1).
-                    rewards = data_BT.rewards[i][:, 1:].float().cpu().numpy()
-                    dones = data_BT.dones[i][:, 1:].long().cpu().numpy()
+                    rewards_tensor = data_BT.rewards[i][:, 1:].float()
+                    dones_tensor = data_BT.dones[i][:, 1:].long()
+                    if (
+                        self.args.bound_value_predictions
+                        or self.args.value_loss == "classification"
+                        or _uses_generative_value_model(self.args)
+                    ):
+                        value_model_utils.validate_terminal_rewards(
+                            rewards_tensor,
+                            dones_tensor,
+                            float(self.args.value_reward_min),
+                            float(self.args.value_reward_max),
+                        )
+                    rewards = rewards_tensor.cpu().numpy()
+                    dones = dones_tensor.cpu().numpy()
                     if gv_pairs:
                         # Stamp each gv_pair with the per-sub-sequence outcome the
                         # segment actually belongs to (training pairs are tagged
@@ -1924,11 +2098,14 @@ class PolicyTrainerRayProcess(RayProcess):
                         # We work in the unshifted pack layout for
                         # rewards / dones so sub-sequence slicing lines up with
                         # the offsets from _unpack_subseqs.
-                        max_score = float(getattr(self.streaming_config, "max_possible_score", 1.0)) or 1.0
-                        rewards_full = data_BT.rewards[i][0].float().cpu().numpy()
-                        dones_full = data_BT.dones[i][0].cpu().numpy().astype(bool)
+                        value_min = float(self.args.value_reward_min)
+                        value_max = float(self.args.value_reward_max)
+                        rewards_full = gen_value_source_BT.rewards[i][0].float().cpu().numpy()
+                        dones_full = gen_value_source_BT.dones[i][0].cpu().numpy().astype(bool)
                         subseqs_for_outcome = self._unpack_subseqs(
-                            data_BT.query_responses[i], data_BT.position_ids[i], data_BT.response_masks[i]
+                            gen_value_source_BT.query_responses[i],
+                            gen_value_source_BT.position_ids[i],
+                            gen_value_source_BT.response_masks[i],
                         )
                         subseq_outcomes: list[float] = []
                         for sub in subseqs_for_outcome:
@@ -1938,13 +2115,34 @@ class PolicyTrainerRayProcess(RayProcess):
                             sub_rewards = rewards_full[s_off : s_off + s_len]
                             if sub_dones.any():
                                 n_d = int(sub_dones.sum())
-                                subseq_outcomes.append(float(sub_rewards[sub_dones].sum()) / (n_d * max_score))
+                                raw_outcome = float(sub_rewards[sub_dones].sum()) / n_d
+                                subseq_outcomes.append(
+                                    value_model_utils.reward_to_unit_value(raw_outcome, value_min, value_max)
+                                )
                             else:
                                 subseq_outcomes.append(0.0)
                         for pair in gv_pairs:
                             s_idx = int(pair.get("subseq_idx", 0))
                             pair["outcome"] = subseq_outcomes[s_idx] if 0 <= s_idx < len(subseq_outcomes) else 0.0
-                        _gen_value_training_pairs.extend(gv_pairs)
+                        pairs_by_subseq: dict[int, list[dict]] = {}
+                        for pair in gv_pairs:
+                            pairs_by_subseq.setdefault(int(pair["subseq_idx"]), []).append(pair)
+                        for subseq_idx, rollout_pairs in pairs_by_subseq.items():
+                            critic_versions = {int(pair["critic_version"]) for pair in rollout_pairs}
+                            if len(critic_versions) != 1:
+                                raise RuntimeError(
+                                    "All generative-value samples from one rollout must use one critic version, "
+                                    f"got {sorted(critic_versions)}."
+                                )
+                            _gen_value_training_rollouts.append(
+                                {
+                                    "rollout_id": f"{training_step}:{self.rank}:{i}:{subseq_idx}",
+                                    "policy_training_step": training_step,
+                                    "policy_rank": self.rank,
+                                    "critic_version": critic_versions.pop(),
+                                    "pairs": rollout_pairs,
+                                }
+                            )
                     resp_masks_np = resp_mask.long().cpu().numpy()
                     logprobs_np = None
                     if self.args.use_sae:
@@ -1972,7 +2170,8 @@ class PolicyTrainerRayProcess(RayProcess):
                         # directly see whether the critic creates a useful correct-vs-incorrect
                         # training signal. These are computed on the same shifted layout as
                         # values_BT / adv_np.
-                        max_score = float(getattr(self.streaming_config, "max_possible_score", 1.0)) or 1.0
+                        value_min = float(self.args.value_reward_min)
+                        value_max = float(self.args.value_reward_max)
                         rewards_full_diag = data_BT.rewards[i][0].float().cpu().numpy()
                         dones_full_diag = data_BT.dones[i][0].cpu().numpy().astype(bool)
                         vals_np_diag = values_BT.float().cpu().numpy()
@@ -1986,7 +2185,10 @@ class PolicyTrainerRayProcess(RayProcess):
                             sub_rewards = rewards_full_diag[s_off : s_off + s_len]
                             if sub_dones.any():
                                 n_d = int(sub_dones.sum())
-                                outcome_norm = float(sub_rewards[sub_dones].sum()) / (n_d * max_score)
+                                raw_outcome = float(sub_rewards[sub_dones].sum()) / n_d
+                                outcome_norm = value_model_utils.reward_to_unit_value(
+                                    raw_outcome, value_min, value_max
+                                )
                             else:
                                 outcome_norm = 0.0
                             is_correct_subseq = outcome_norm > 0.5
@@ -2017,90 +2219,126 @@ class PolicyTrainerRayProcess(RayProcess):
                                 "value_mask": value_mask,
                             }
                         )
-                    # Accumulate per-token value diagnostics split by correct/incorrect.
-                    # A pack is "correct" if any terminal reward is positive.
-                    term_rewards = rewards * dones.astype("float32")
-                    is_correct = bool(term_rewards.sum() > 0)
                     vm_np = value_mask.cpu().numpy()  # shape (B, T-1), True at value positions
                     vals_np = values_BT.float().cpu().numpy()  # (B, T-1)
                     rets_np_v = returns_np * vm_np  # zero non-value positions
-                    for b in range(vm_np.shape[0]):
-                        resp_pos = vm_np[b].nonzero()[0]  # indices in T-1 space
-                        if len(resp_pos) == 0:
+                    _vdiag_returns_all.extend(rets_np_v[vm_np].tolist())
+                    _vdiag_preds_all.extend(vals_np[vm_np].tolist())
+
+                    # Build correctness and response-percentile labels on the unsplit
+                    # packed sample, then take this SP rank's ordinary contiguous slice.
+                    # This labels each response from its own outcome instead of assigning
+                    # one aggregate label to every response in the pack.
+                    diag_query = unsplit_data_BT.query_responses[i]
+                    diag_positions = unsplit_data_BT.position_ids[i]
+                    diag_response_mask = unsplit_data_BT.response_masks[i].bool()
+                    full_correct = torch.zeros_like(diag_response_mask[:, 1:], dtype=torch.bool)
+                    full_bins = torch.full_like(diag_response_mask[:, 1:], -1, dtype=torch.long)
+                    full_rewards = unsplit_data_BT.rewards[i][0].float()
+                    full_dones = unsplit_data_BT.dones[i][0].bool()
+                    for sub in self._unpack_subseqs(diag_query, diag_positions, diag_response_mask):
+                        offset = int(sub["offset_in_pack"])
+                        length = int(sub["length"])
+                        terminal_mask = full_dones[offset : offset + length]
+                        terminal_rewards = full_rewards[offset : offset + length][terminal_mask]
+                        raw_outcome = float(terminal_rewards.mean()) if terminal_rewards.numel() else 0.0
+                        is_correct = (
+                            value_model_utils.reward_to_unit_value(
+                                raw_outcome, float(self.args.value_reward_min), float(self.args.value_reward_max)
+                            )
+                            > 0.5
+                        )
+                        response_positions = sub["response_is_resp"].bool().nonzero(as_tuple=True)[0] + offset
+                        shifted_positions = response_positions[response_positions > 0] - 1
+                        num_response_tokens = shifted_positions.numel()
+                        if num_response_tokens == 0:
                             continue
-                        n = len(resp_pos)
-                        v_tokens = vals_np[b][resp_pos]
-                        r_tokens = rets_np_v[b][resp_pos]
-                        _vdiag_returns_all.extend(r_tokens.tolist())
-                        _vdiag_preds_all.extend(v_tokens.tolist())
-                        # Bucket by percentile position within this response.
-                        bins = np.minimum((np.arange(n) * _NUM_PCT_BINS / n).astype(int), _NUM_PCT_BINS - 1)
-                        target = _vdiag_correct if is_correct else _vdiag_incorrect
-                        for pos_idx, bin_idx in enumerate(bins):
-                            target[bin_idx].append(float(v_tokens[pos_idx]))
-            if per_sample_bf:
-                sae_step_metrics["value/sae_boundary_frac"] = float(np.mean(per_sample_bf))
-            if per_sample_lam:
-                sae_step_metrics["value/avg_lambda"] = float(np.mean(per_sample_lam))
-            if _gen_value_adv_correct:
-                sae_step_metrics["gen_value/advantage_correct_mean"] = float(np.mean(_gen_value_adv_correct))
-            if _gen_value_adv_incorrect:
-                sae_step_metrics["gen_value/advantage_incorrect_mean"] = float(np.mean(_gen_value_adv_incorrect))
-            if _gen_value_adv_correct and _gen_value_adv_incorrect:
-                sae_step_metrics["gen_value/advantage_gap"] = float(
-                    np.mean(_gen_value_adv_correct) - np.mean(_gen_value_adv_incorrect)
-                )
-            if _gen_value_terminal_vhat_correct:
-                sae_step_metrics["gen_value/terminal_vhat_correct_mean"] = float(
-                    np.mean(_gen_value_terminal_vhat_correct)
-                )
-            if _gen_value_terminal_vhat_incorrect:
-                sae_step_metrics["gen_value/terminal_vhat_incorrect_mean"] = float(
-                    np.mean(_gen_value_terminal_vhat_incorrect)
-                )
-            if _gen_value_terminal_vhat_correct and _gen_value_terminal_vhat_incorrect:
-                sae_step_metrics["gen_value/terminal_vhat_gap"] = float(
-                    np.mean(_gen_value_terminal_vhat_correct) - np.mean(_gen_value_terminal_vhat_incorrect)
-                )
-            # Push gen-value training pairs to the REINFORCE queue. ray.util.queue.Queue
-            # methods are regular sync methods (they proxy to an actor internally);
-            # the previous code called .put_nowait.remote(...) which raised
-            # AttributeError and was silently swallowed, so training pairs were
-            # being dropped on the floor and the REINFORCE thread never learned.
-            if _use_gen_value and self._gen_value_training_queue is not None:
-                try:
-                    self._gen_value_training_queue.put_nowait(
-                        {"policy_step": training_step, "producer_rank": self.rank, "pairs": _gen_value_training_pairs}
+                        percentile_bins = torch.minimum(
+                            torch.arange(num_response_tokens, device=shifted_positions.device)
+                            * _NUM_PCT_BINS
+                            // num_response_tokens,
+                            torch.tensor(_NUM_PCT_BINS - 1, device=shifted_positions.device),
+                        )
+                        full_correct[0, shifted_positions] = is_correct
+                        full_bins[0, shifted_positions] = percentile_bins
+
+                    if self._sp_world_size > 1:
+                        original_padded_len = max(t.shape[-1] for t in unsplit_data_BT.query_responses)
+                        original_start, original_end, padded_len = self._sp_slice_bounds(original_padded_len)
+                        full_correct = self._pad_and_slice_last_dim(
+                            full_correct, padded_len - 1, original_start, original_end - 1, False
+                        )
+                        full_bins = self._pad_and_slice_last_dim(
+                            full_bins, padded_len - 1, original_start, original_end - 1, -1
+                        )
+                    if full_correct.shape != value_mask.shape or full_bins.shape != value_mask.shape:
+                        raise RuntimeError(
+                            "Scalar-value diagnostic labels do not align with value tokens: "
+                            f"correct={tuple(full_correct.shape)}, bins={tuple(full_bins.shape)}, "
+                            f"values={tuple(value_mask.shape)}."
+                        )
+                    correct_np = full_correct.cpu().numpy()
+                    bins_np = full_bins.cpu().numpy()
+                    for bin_idx in range(_NUM_PCT_BINS):
+                        in_bin = vm_np & (bins_np == bin_idx)
+                        _vdiag_correct[bin_idx].extend(vals_np[in_bin & correct_np].tolist())
+                        _vdiag_incorrect[bin_idx].extend(vals_np[in_bin & ~correct_np].tolist())
+            # Reduce numerators and denominators rather than rank-local means. This
+            # keeps diagnostics exact when ranks process unequal numbers of tokens.
+            diagnostic_series: list[tuple[str, list[float]]] = [
+                ("value/sae_boundary_frac", per_sample_bf),
+                ("value/avg_lambda", per_sample_lam),
+                ("gen_value/advantage_correct_mean", _gen_value_adv_correct),
+                ("gen_value/advantage_incorrect_mean", _gen_value_adv_incorrect),
+                ("gen_value/terminal_vhat_correct_mean", _gen_value_terminal_vhat_correct),
+                ("gen_value/terminal_vhat_incorrect_mean", _gen_value_terminal_vhat_incorrect),
+            ]
+            for bin_idx in range(_NUM_PCT_BINS):
+                tag = f"{bin_idx:03d}"
+                diagnostic_series.extend(
+                    (
+                        (f"value/correct_pct_{tag}", _vdiag_correct[bin_idx]),
+                        (f"value/incorrect_pct_{tag}", _vdiag_incorrect[bin_idx]),
                     )
-                except Full:
-                    logger.warning(
-                        "[GenValue] training-pair queue is full; dropping %d pairs. "
-                        "REINFORCE thread may be falling behind.",
-                        len(_gen_value_training_pairs),
-                    )
-                except Exception:
-                    logger.exception(
-                        "[GenValue] failed to enqueue %d training pairs; REINFORCE step will be skipped",
-                        len(_gen_value_training_pairs),
-                    )
-            # Compute and stash value diagnostics metrics.
+                )
+            diagnostic_sums = torch.tensor(
+                [(sum(values), len(values)) for _, values in diagnostic_series], dtype=torch.float64, device=device
+            )
+            if dist.is_initialized():
+                dist.all_reduce(diagnostic_sums)
+            for (name, _), (value_sum, value_count) in zip(diagnostic_series, diagnostic_sums.tolist(), strict=True):
+                if value_count > 0.0:
+                    sae_step_metrics[name] = value_sum / value_count
+
+            correct_advantage = sae_step_metrics.get("gen_value/advantage_correct_mean")
+            incorrect_advantage = sae_step_metrics.get("gen_value/advantage_incorrect_mean")
+            if correct_advantage is not None and incorrect_advantage is not None:
+                sae_step_metrics["gen_value/advantage_gap"] = correct_advantage - incorrect_advantage
+            correct_vhat = sae_step_metrics.get("gen_value/terminal_vhat_correct_mean")
+            incorrect_vhat = sae_step_metrics.get("gen_value/terminal_vhat_incorrect_mean")
+            if correct_vhat is not None and incorrect_vhat is not None:
+                sae_step_metrics["gen_value/terminal_vhat_gap"] = correct_vhat - incorrect_vhat
+            # Pipe complete rollouts to the independent critic loop. The bounded
+            # queue provides backpressure instead of silently dropping critic data.
+            if _use_gen_value and self._gen_value_training_queue is not None and _gen_value_training_rollouts:
+                self._gen_value_training_queue.put(_gen_value_training_rollouts)
+                self._gen_value_latest_enqueued_policy_training_step = training_step
+                sae_step_metrics["gen_value/enqueued_rollouts"] = float(len(_gen_value_training_rollouts))
+                sae_step_metrics["gen_value/training_queue_size"] = float(self._gen_value_training_queue.qsize())
+            if self._gen_value_latest_enqueued_policy_training_step is not None:
+                sae_step_metrics["gen_value/latest_enqueued_policy_training_step"] = float(
+                    self._gen_value_latest_enqueued_policy_training_step
+                )
+            # Compute global regression diagnostics from additive sufficient
+            # statistics, including the second moments needed for exact variance.
             with torch.no_grad():
-                for bin_idx in range(_NUM_PCT_BINS):
-                    tag = f"{bin_idx:03d}"
-                    if _vdiag_correct[bin_idx]:
-                        sae_step_metrics[f"value/correct_pct_{tag}"] = float(np.mean(_vdiag_correct[bin_idx]))
-                    if _vdiag_incorrect[bin_idx]:
-                        sae_step_metrics[f"value/incorrect_pct_{tag}"] = float(np.mean(_vdiag_incorrect[bin_idx]))
-                if _vdiag_returns_all and _vdiag_preds_all:
-                    rets = np.array(_vdiag_returns_all, dtype="float32")
-                    preds = np.array(_vdiag_preds_all, dtype="float32")
-                    residuals = rets - preds
-                    ret_var = float(np.var(rets))
-                    sae_step_metrics["value/returns_mean"] = float(np.mean(rets))
-                    sae_step_metrics["value/returns_std"] = float(np.std(rets))
-                    sae_step_metrics["value/predictions_mean"] = float(np.mean(preds))
-                    sae_step_metrics["value/predictions_std"] = float(np.std(preds))
-                    sae_step_metrics["value/explained_variance"] = 1.0 - float(np.var(residuals)) / (ret_var + 1e-8)
+                regression_sums = value_model_utils.regression_metric_sums(
+                    torch.tensor(_vdiag_returns_all, dtype=torch.float64, device=device),
+                    torch.tensor(_vdiag_preds_all, dtype=torch.float64, device=device),
+                )
+                if dist.is_initialized():
+                    dist.all_reduce(regression_sums)
+                sae_step_metrics.update(value_model_utils.regression_metrics_from_sums(regression_sums))
 
         # Whiten the advantages that will feed the policy loss. With a value model these are
         # GAE/SAE advantages; without one they remain the group-relative advantages prepared
@@ -2180,11 +2418,10 @@ class PolicyTrainerRayProcess(RayProcess):
                         self.args.use_vllm_logprobs,
                         vllm_logprobs_BT,
                         local_logprobs_BT,
+                        self.args.loss_fn,
                     )
 
-                    # Calculate the policy's loss
-                    logprobs_diff_BT = new_logprobs_BT - old_logprob_BT
-                    ratio_BT = torch.exp(logprobs_diff_BT)
+                    ratio_BT = grpo_utils.compute_policy_ratio(new_logprobs_BT, old_logprob_BT, self.args.loss_fn)
                     tis_clamped_BT, tis_unclamped_BT = grpo_utils.compute_tis_weights(
                         old_logprob_BT,
                         vllm_logprobs_BT,
@@ -2205,6 +2442,7 @@ class PolicyTrainerRayProcess(RayProcess):
 
                     pg_losses_BT, pg_losses2_BT, pg_loss_max_BT, kl_BT = grpo_utils.compute_grpo_loss(
                         new_logprobs=new_logprobs_BT,
+                        old_logprobs=old_logprob_BT,
                         ratio=ratio_BT,
                         advantages=data_BT.advantages[i][:, 1:],
                         ref_logprobs=ref_logprobs_BT[i] if self.args.load_ref_policy else None,
@@ -2257,11 +2495,16 @@ class PolicyTrainerRayProcess(RayProcess):
                 # Let the value model reuse any CUDA blocks released by the policy pass.
                 torch.cuda.empty_cache()
                 with Timer("[Training Processes] Value loss", noop=self.rank != 0):
-                    value_accum_steps = max(
-                        math.ceil(num_samples / max(self._value_effective_mini_batches, 1) - 0.5), 1
+                    value_group_ids = value_model_utils.balanced_accumulation_group_ids(
+                        num_samples, self._value_effective_mini_batches
                     )
-                    value_losses: list[float] = []
-                    value_clipfracs: list[float] = []
+                    value_accumulation_token_counts = value_model_utils.grouped_token_counts(
+                        [ctx["value_mask"] for ctx in value_loss_inputs], value_group_ids
+                    )
+                    dist.all_reduce(value_accumulation_token_counts, op=dist.ReduceOp.SUM)
+                    value_metric_sums = torch.zeros(3, dtype=torch.float64, device=device)
+                    value_grad_norms: list[float] = []
+                    dp_world_size = self.args.world_size // self.args.sequence_parallel_size
                     for _value_epoch_idx in range(self.args.value_num_epochs):
                         for i in range(num_samples):
                             ctx = value_loss_inputs[i]
@@ -2298,7 +2541,7 @@ class PolicyTrainerRayProcess(RayProcess):
                                 )
                                 if self.args.value_loss == "classification":
                                     value_logits = conditioned_output
-                                    new_values = value_model_utils.predict_values(value_logits, self.args.value_loss)
+                                    new_values = self._predict_value_logits(value_logits)
                                 else:
                                     value_logits = None
                                     new_values = conditioned_output
@@ -2307,8 +2550,8 @@ class PolicyTrainerRayProcess(RayProcess):
                                 value_logits = self.forward_value_logits(
                                     data_BT.query_responses[i], data_BT.position_ids[i], resp_mask
                                 )
-                                new_values = value_model_utils.predict_values(value_logits, self.args.value_loss)
-                            new_values = self._align_value_predictions(new_values, returns.shape, "value loss forward")
+                                new_values = self._predict_value_logits(value_logits)
+                            new_values = self._align_value_predictions(new_values, value_mask, "value loss forward")
                             assert new_values.shape == returns.shape == old_values.shape, (
                                 f"value loss tensors must align: new={new_values.shape}, "
                                 f"returns={returns.shape}, old={old_values.shape}"
@@ -2325,10 +2568,17 @@ class PolicyTrainerRayProcess(RayProcess):
                                     value_mask,
                                     self.args.value_loss,
                                     self.args.vf_clip_range,
+                                    bound_predictions=self.args.bound_value_predictions,
+                                    value_min=self.args.value_reward_min,
+                                    value_max=self.args.value_reward_max,
                                 )
-                            denom = value_mask.sum().clamp(min=1).float()
-                            v_loss = (per_tok.sum() / denom) * self.args.value_loss_coef
-                            v_loss = v_loss * (self.args.world_size // self.args.sequence_parallel_size)
+                            value_group_idx = value_group_ids[i]
+                            # Every pack in an optimizer step contributes to one global token mean.
+                            loss_denominator = value_accumulation_token_counts[value_group_idx]
+                            v_loss = value_model_utils.normalize_value_loss(
+                                per_tok, loss_denominator, self.args.value_loss_coef, dp_world_size
+                            )
+                            value_metric_sums += value_model_utils.value_metric_sums(per_tok, v_clipfrac, value_mask)
                             # Fold dummy outputs into v_loss with zero weight so that backward
                             # traverses the same number of ZeRO-3 allgather layers on all DP ranks.
                             # Ranks with fewer real sub-sequences ran dummy forwards; without this,
@@ -2346,22 +2596,25 @@ class PolicyTrainerRayProcess(RayProcess):
                                 )
                                 v_loss = v_loss + sum(0.0 * d.reshape(-1).sum() for d in dummy_grad_outputs)
                             v_loss = v_loss.reshape(-1).sum()
-                            is_value_boundary = (i + 1) % value_accum_steps == 0 or (i + 1) == num_samples
+                            is_value_boundary = (i + 1) == num_samples or value_group_ids[i + 1] != value_group_idx
                             self.value_model.set_gradient_accumulation_boundary(is_value_boundary)
                             self.value_model.backward(v_loss)
                             if is_value_boundary:
                                 torch.cuda.empty_cache()
                                 self.value_model.step()
-                            value_losses.append(float(v_loss.detach()))
-                            value_clipfracs.append(float(v_clipfrac.detach()))
+                                if hasattr(self.value_model, "get_global_grad_norm"):
+                                    gn = float(self.value_model.get_global_grad_norm())
+                                    if math.isfinite(gn):
+                                        value_grad_norms.append(gn)
 
-                if value_losses:
-                    self.local_metrics["loss/value_avg"] = sum(value_losses) / len(value_losses)
-                    self.local_metrics["value/clipfrac_avg"] = sum(value_clipfracs) / len(value_clipfracs)
-                    if hasattr(self.value_model, "get_global_grad_norm"):
-                        gn = float(self.value_model.get_global_grad_norm())
-                        if math.isfinite(gn):
-                            self.local_metrics["value/grad_norm"] = gn
+                dist.all_reduce(value_metric_sums, op=dist.ReduceOp.SUM)
+                value_loss_avg, value_clipfrac_avg = value_model_utils.value_metrics_from_sums(
+                    value_metric_sums, self.args.value_loss_coef
+                )
+                self.local_metrics["loss/value_avg"] = float(value_loss_avg)
+                self.local_metrics["value/clipfrac_avg"] = float(value_clipfrac_avg)
+                if value_grad_norms:
+                    self.local_metrics["value/grad_norm"] = sum(value_grad_norms) / len(value_grad_norms)
             if tis_mask_enabled:
                 frac_kept = (
                     tis_mask_kept_tokens / tis_mask_total_tokens if tis_mask_total_tokens > 0 else torch.zeros(())
@@ -2408,9 +2661,22 @@ class PolicyTrainerRayProcess(RayProcess):
                 out_path.mkdir(parents=True, exist_ok=True)
                 torch.save(value_to_save.state_dict(), out_path / "value_model.bin")
 
-    def save_checkpoint_state(self, checkpoint_state_dir: str, client_state: dict[str, Any]) -> None:
-        args = self.args
+    def _save_value_checkpoint_state(self, output_dir: str | pathlib.Path, training_step: int) -> None:
+        """Save portable value weights plus the complete DeepSpeed training state."""
+        self._save_value_model(output_dir)
+        engine_dir = pathlib.Path(output_dir) / "deepspeed"
+        old_value_mpu = self.value_model.mpu
+        self.value_model.mpu = None
+        try:
+            saved = self.value_model.save_checkpoint(
+                str(engine_dir), tag=f"global_step{training_step}", client_state={"training_step": training_step}
+            )
+        finally:
+            self.value_model.mpu = old_value_mpu
+        if saved is False:
+            raise RuntimeError(f"Failed to save scalar value-engine checkpoint to {engine_dir}")
 
+    def save_checkpoint_state(self, checkpoint_state_dir: str, client_state: dict[str, Any]) -> None:
         # Save comprehensive RNG states for each rank
         rng_states = {
             "torch_cpu_rng_state": torch.get_rng_state(),
@@ -2446,16 +2712,14 @@ class PolicyTrainerRayProcess(RayProcess):
 
             client_state["ref_policy_saved"] = True
 
-        # Save value model checkpoint (model only, no optimizer) alongside the policy.
+        # Save the complete value-engine checkpoint alongside portable weights.
         if self.args.use_value_model and self.value_model is not None:
             value_dir = os.path.join(checkpoint_state_dir, "value_model")
-            try:
-                self._save_value_model(value_dir)
-                if self.rank == 0:
-                    logger.info(f"Saved value model to {value_dir}")
-                client_state["value_model_saved"] = True
-            except Exception as e:
-                logger.warning(f"Failed to save value model checkpoint: {e}")
+            self._save_value_checkpoint_state(value_dir, int(client_state["training_step"]))
+            if self.rank == 0:
+                logger.info(f"Saved complete scalar value-engine checkpoint to {value_dir}")
+            client_state["value_model_saved"] = True
+            client_state["value_model_engine_saved"] = True
 
         # Save the main model checkpoint with enhanced client state
         # mpu is just used for sequence parallel, so we remove it for saving, and then re-add it after.
@@ -2465,16 +2729,6 @@ class PolicyTrainerRayProcess(RayProcess):
             self.model.mpu = None
         self.model.save_checkpoint(checkpoint_state_dir, client_state=client_state)
 
-        # `save_checkpoint` needs to be called on all ranks, only rank 0 will have all the states
-        if self.rank == 0:
-            if args.keep_last_n_checkpoints >= 0:
-                clean_last_n_checkpoints_deepspeed(checkpoint_state_dir, args.keep_last_n_checkpoints)
-
-            # Sync to GCS if configured (check the actual target, not just gs_bucket_path)
-            if args.gs_checkpoint_state_dir is not None:
-                ray.remote(sync_gs_bucket).options(num_cpus=1).remote(
-                    checkpoint_state_dir, args.gs_checkpoint_state_dir
-                )
         # add back the mpu
         if old_mpu is not None:
             self.model.mpu = old_mpu
@@ -2565,11 +2819,12 @@ class PolicyTrainerRayProcess(RayProcess):
             except Exception as e:  # pragma: no cover - purely advisory
                 logger.warning(f"Failed to write training_args.json: {e}")
 
-            marker_path.touch()
-
         # Save the value model alongside the policy in the HF-style checkpoint dir.
         if self.args.use_value_model and self.value_model is not None:
             self._save_value_model(output_path / "value_model")
+
+        # The driver publishes the completion marker after every requested artifact,
+        # including any external generative critic, has been written successfully.
 
     # we need this because we don't know which node is rank 0 is on
     def launch_ai2_evals_on_weka_wrapper(self, step_dir, leaderboard_name, wandb_url, training_step):
@@ -2705,6 +2960,57 @@ def setup_runtime_variables(
         )
     if args.eval_pass_at_k < 1:
         raise ValueError(f"eval_pass_at_k must be >= 1, got {args.eval_pass_at_k}.")
+    if args.use_value_model:
+        needs_known_value_range = (
+            args.bound_value_predictions or args.value_loss == "classification" or _uses_generative_value_model(args)
+        )
+        reward_range_requires_explicit_bounds = (
+            tools_config.enabled
+            or streaming_config.reward_aggregator == "sum"
+            or streaming_config.apply_evolving_rubric_reward
+        )
+        if (
+            needs_known_value_range
+            and reward_range_requires_explicit_bounds
+            and (args.value_reward_min is None or args.value_reward_max is None)
+        ):
+            reasons = []
+            if tools_config.enabled:
+                reasons.append("tool/environment rewards")
+            if streaming_config.reward_aggregator == "sum":
+                reasons.append("summed multi-turn rewards")
+            if streaming_config.apply_evolving_rubric_reward:
+                reasons.append("evolving-rubric rewards")
+            raise ValueError(
+                "Cannot infer a safe bounded-critic reward range for "
+                f"{', '.join(reasons)}. Set both --value_reward_min and --value_reward_max explicitly."
+            )
+
+        inferred_value_min = 0.0
+        inferred_value_max = 0.0
+        if streaming_config.apply_verifiable_reward:
+            verifier_reward = float(streaming_config.verification_reward)
+            inferred_value_min += min(0.0, verifier_reward)
+            inferred_value_max += max(0.0, verifier_reward)
+        if streaming_config.apply_r1_style_format_reward and (
+            streaming_config.additive_format_reward or not streaming_config.apply_verifiable_reward
+        ):
+            format_reward = float(streaming_config.r1_style_format_reward)
+            inferred_value_min += min(0.0, format_reward)
+            inferred_value_max += max(0.0, format_reward)
+        if streaming_config.non_stop_penalty:
+            inferred_value_min = min(inferred_value_min, float(streaming_config.non_stop_penalty_value))
+            inferred_value_max = max(inferred_value_max, float(streaming_config.non_stop_penalty_value))
+        if args.value_reward_min is None:
+            args.value_reward_min = inferred_value_min
+        if args.value_reward_max is None:
+            args.value_reward_max = inferred_value_max
+        if needs_known_value_range and args.value_reward_max <= args.value_reward_min:
+            raise ValueError(
+                "A finite reward range is required for bounded/classification/generative values, but inferred "
+                f"[{args.value_reward_min}, {args.value_reward_max}]. Set --value_reward_min and "
+                "--value_reward_max explicitly for custom reward functions."
+            )
     args.run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
     args.output_dir = os.path.join(args.output_dir, args.run_name)
     streaming_config.dataset_local_cache_dir = os.path.abspath(streaming_config.dataset_local_cache_dir)
@@ -3273,6 +3579,9 @@ def one_training_step(
     model_dims: utils.ModelDims,
     actor_manager: ActorManager | None = None,
     model_save_callback=None,
+    background_health_check: Callable[[], None] | None = None,
+    background_metrics_callback: Callable[[], dict[str, Any]] | None = None,
+    post_training_metrics_callback: Callable[[], dict[str, Any]] | None = None,
 ) -> int:
     """Train the model for one step. Returns the number of tokens processed."""
     update_ref_policy_future = []
@@ -3280,10 +3589,13 @@ def one_training_step(
         results, _ = ray_get_with_progress(
             [policy_group.models[i].step.remote(training_step) for i in range(args.world_size)],
             desc=f"Running training step {training_step}",
+            health_check_fn=background_health_check,
         )
         metrics, array_metrics = zip(*results)
         if all(len(m) == 0 for m in metrics):
             logger.warning("[Main Thread] 🤡 After packing, there is not enough data to train")
+            if post_training_metrics_callback is not None:
+                post_training_metrics_callback()
             return 0
         if (
             args.load_ref_policy
@@ -3294,7 +3606,11 @@ def one_training_step(
             update_ref_policy_future.extend(
                 [policy_group.models[i].update_ref_policy.remote() for i in range(args.world_size)]
             )
-            ray_get_with_progress(update_ref_policy_future, desc=f"Updating reference policy at step {training_step}")
+            ray_get_with_progress(
+                update_ref_policy_future,
+                desc=f"Updating reference policy at step {training_step}",
+                health_check_fn=background_health_check,
+            )
 
     save_time = maybe_save_checkpoint(
         args,
@@ -3305,6 +3621,13 @@ def one_training_step(
         wandb_url,
         model_save_callback=model_save_callback,
     )
+    if background_metrics_callback is not None:
+        data_thread_metrics.update(background_metrics_callback())
+    if post_training_metrics_callback is not None:
+        # Some asynchronous learners can only report an exact progress snapshot
+        # after every policy actor has completed. Fold that snapshot into this
+        # policy step's single metrics write instead of logging it one step late.
+        data_thread_metrics.update(post_training_metrics_callback())
 
     ray.get(actor_manager.report_training_step_time.remote(train_timer.duration))
 
@@ -3325,6 +3648,7 @@ def one_training_step(
         "val/ratio",
         "val/ratio_var",
     }
+    max_metrics = {"gen_value/latest_enqueued_policy_training_step"}
     average_metrics = {}
     # Average scalar metrics from each worker (union of keys — some metrics are sparse,
     # e.g. value diagnostic bins that only exist when the bin is non-empty on a given rank).
@@ -3336,6 +3660,10 @@ def one_training_step(
         if k in token_weighted_metrics:
             # Token-weighted average
             average_metrics[k] = sum(m.get(k, 0.0) * w for m, w in zip(metrics, weights))
+        elif k in max_metrics:
+            # Watermarks are maxima, not rank averages. Missing values mean that
+            # rank has not enqueued critic data yet.
+            average_metrics[k] = max(m[k] for m in metrics if k in m)
         else:
             # Simple average for other metrics
             average_metrics[k] = sum(m.get(k, 0.0) for m in metrics) / len(metrics)
@@ -3426,6 +3754,7 @@ def maybe_save_checkpoint(
             )
             if model_save_callback is not None:
                 model_save_callback(step_dir, training_step)
+            pathlib.Path(step_dir, CHECKPOINT_COMPLETE_MARKER).touch()
             if args.try_launch_beaker_eval_jobs_on_weka and is_beaker_job():
                 leaderboard_name = f"{args.hf_repo_revision}_step_{training_step}"
                 for i in range(args.world_size):
@@ -3559,6 +3888,7 @@ def save_final_model(
     training_step: int,
     wandb_url: str,
     chat_template_name: str,
+    model_save_callback=None,
 ):
     """Save the final model and launch evaluation jobs if configured."""
     logger.info(f"Saving final model at step {training_step} to {args.output_dir}")
@@ -3570,6 +3900,9 @@ def save_final_model(
             ],
             desc="Saving final model",
         )
+        if model_save_callback is not None:
+            model_save_callback(args.output_dir, training_step)
+        pathlib.Path(args.output_dir, CHECKPOINT_COMPLETE_MARKER).touch()
         if args.try_launch_beaker_eval_jobs_on_weka and is_beaker_job():
             leaderboard_name = args.hf_repo_revision
             for i in range(args.world_size):
@@ -3694,6 +4027,7 @@ def run_training(
     checkpoint_state=None,
     base_env_config: EnvConfig | None = None,
     checkpoint_callback=None,
+    checkpoint_commit_callback=None,
     model_save_callback=None,
 ):
     if base_env_config is None:
@@ -3908,6 +4242,22 @@ def run_training(
                     ],
                     desc=f"Saving checkpoint state at step {training_step}",
                 )
+                # Commit retention only after every rank has completed the new
+                # policy checkpoint, so a failed save cannot delete the previous
+                # recoverable policy or critic state.
+                if args.keep_last_n_checkpoints >= 0:
+                    clean_last_n_checkpoints_deepspeed(args.checkpoint_state_dir, args.keep_last_n_checkpoints)
+                    if _uses_scalar_value_model(args):
+                        clean_last_n_checkpoints_deepspeed(
+                            os.path.join(args.checkpoint_state_dir, "value_model", "deepspeed"),
+                            args.keep_last_n_checkpoints,
+                        )
+                if checkpoint_commit_callback is not None:
+                    checkpoint_commit_callback(args.checkpoint_state_dir, training_step)
+                if args.gs_checkpoint_state_dir is not None:
+                    ray.remote(sync_gs_bucket).options(num_cpus=1).remote(
+                        args.checkpoint_state_dir, args.gs_checkpoint_state_dir
+                    )
                 logger.info(f"Saved checkpoint state at step {training_step} to {args.checkpoint_state_dir}")
 
         # Skip weight sync during any value/policy warmup window: the policy hasn't changed, so
@@ -3944,9 +4294,15 @@ def run_training(
     if resume_training_step > args.num_training_steps:
         raise ValueError(f"Training didn't run since {resume_training_step=} > {args.num_training_steps=}")
 
-    save_final_model(args, policy_group, tokenizer, training_step, wandb_url, tc.chat_template_name)
-    if model_save_callback is not None:
-        model_save_callback(args.output_dir, training_step)
+    save_final_model(
+        args,
+        policy_group,
+        tokenizer,
+        training_step,
+        wandb_url,
+        tc.chat_template_name,
+        model_save_callback=model_save_callback,
+    )
 
 
 def _discover_tools_from_datasets(dataset_mixer_list: list[str], dataset_mixer_list_splits: list[str]) -> set[str]:

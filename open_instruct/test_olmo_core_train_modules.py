@@ -159,9 +159,12 @@ def _make_grpo_config(**kwargs) -> grpo_utils.GRPOExperimentConfig:
         "beta": 0.05,
         "kl_estimator": 2,
         "loss_fn": grpo_utils.GRPOLossType.dapo,
+        "dppo_clip": None,
         "load_ref_policy": False,
     }
     defaults.update(kwargs)
+    if defaults["loss_fn"] == grpo_utils.GRPOLossType.dppo and defaults["dppo_clip"] is None:
+        defaults["dppo_clip"] = 0.2
     config = MagicMock(spec=grpo_utils.GRPOExperimentConfig)
     for key, value in defaults.items():
         setattr(config, key, value)
@@ -169,7 +172,13 @@ def _make_grpo_config(**kwargs) -> grpo_utils.GRPOExperimentConfig:
 
 
 class TestComputeGRPOLoss(unittest.TestCase):
-    @parameterized.expand([("dapo", grpo_utils.GRPOLossType.dapo), ("cispo", grpo_utils.GRPOLossType.cispo)])
+    @parameterized.expand(
+        [
+            ("dapo", grpo_utils.GRPOLossType.dapo),
+            ("dppo", grpo_utils.GRPOLossType.dppo),
+            ("cispo", grpo_utils.GRPOLossType.cispo),
+        ]
+    )
     def test_output_shapes(self, _name, loss_type):
         batch_size, seq_len = 2, 4
         config = _make_grpo_config(loss_fn=loss_type)
@@ -178,7 +187,12 @@ class TestComputeGRPOLoss(unittest.TestCase):
         advantages = torch.randn(batch_size, seq_len)
 
         pg_losses, pg_losses2, pg_loss_max, kl = grpo_utils.compute_grpo_loss(
-            new_logprobs=new_logprobs, ratio=ratio, advantages=advantages, ref_logprobs=None, config=config
+            new_logprobs=new_logprobs,
+            old_logprobs=new_logprobs - ratio.log(),
+            ratio=ratio,
+            advantages=advantages,
+            ref_logprobs=None,
+            config=config,
         )
 
         self.assertEqual(pg_losses.shape, (batch_size, seq_len))
@@ -193,11 +207,90 @@ class TestComputeGRPOLoss(unittest.TestCase):
         advantages = torch.ones(1, 3)
 
         pg_losses, pg_losses2, pg_loss_max, _ = grpo_utils.compute_grpo_loss(
-            new_logprobs=new_logprobs, ratio=ratio, advantages=advantages, ref_logprobs=None, config=config
+            new_logprobs=new_logprobs,
+            old_logprobs=new_logprobs - ratio.log(),
+            ratio=ratio,
+            advantages=advantages,
+            ref_logprobs=None,
+            config=config,
         )
 
         expected_clamped = torch.clamp(ratio, 0.8, 1.2)
         torch.testing.assert_close(pg_losses2, -advantages * expected_clamped)
+
+    def test_dppo_masks_absolute_probability_change(self):
+        config = _make_grpo_config(loss_fn=grpo_utils.GRPOLossType.dppo, dppo_clip=0.02)
+        old_prob = torch.tensor([[0.1, 0.01]])
+        ratio = torch.tensor([[1.3, 2.0]])
+        old_logprobs = old_prob.log()
+        new_logprobs = old_logprobs + ratio.log()
+        advantages = torch.ones_like(ratio)
+
+        _, _, pg_loss, _ = grpo_utils.compute_grpo_loss(
+            new_logprobs=new_logprobs,
+            old_logprobs=old_logprobs,
+            ratio=ratio,
+            advantages=advantages,
+            ref_logprobs=None,
+            config=config,
+        )
+
+        # For pi_old=0.1, epsilon=0.02 blocks the increase to 0.13. For
+        # pi_old=0.01, the increase to 0.02 remains in the TV trust region.
+        torch.testing.assert_close(pg_loss, torch.tensor([[0.0, -2.0]]))
+
+    def test_dppo_requires_old_policy_logprobs(self):
+        config = _make_grpo_config(loss_fn=grpo_utils.GRPOLossType.dppo, dppo_clip=0.02)
+        with self.assertRaisesRegex(ValueError, "requires old_logprobs"):
+            grpo_utils.compute_grpo_loss(
+                new_logprobs=torch.zeros(1, 1),
+                old_logprobs=None,
+                ratio=torch.ones(1, 1),
+                advantages=torch.ones(1, 1),
+                ref_logprobs=None,
+                config=config,
+            )
+
+    def test_dppo_stops_gradient_after_absolute_probability_boundary(self):
+        config = _make_grpo_config(loss_fn=grpo_utils.GRPOLossType.dppo, dppo_clip=0.02)
+        old_logprobs = torch.tensor([[0.1, 0.01]]).log()
+        log_ratio = torch.tensor([[1.3, 2.0]]).log().requires_grad_()
+        new_logprobs = old_logprobs + log_ratio
+        ratio = log_ratio.exp()
+
+        _, _, pg_loss_max, _ = grpo_utils.compute_grpo_loss(
+            new_logprobs=new_logprobs,
+            old_logprobs=old_logprobs,
+            ratio=ratio,
+            advantages=torch.ones_like(ratio),
+            ref_logprobs=None,
+            config=config,
+        )
+        pg_loss_max.sum().backward()
+
+        # The common token crosses a +0.02 probability boundary (0.10 -> 0.13),
+        # while the rare token's +0.01 shift (0.01 -> 0.02) remains valid.
+        torch.testing.assert_close(log_ratio.grad, torch.tensor([[0.0, -2.0]]))
+
+    def test_dppo_uses_lower_tv_boundary_for_negative_advantage(self):
+        config = _make_grpo_config(loss_fn=grpo_utils.GRPOLossType.dppo, dppo_clip=0.02)
+        old_prob = torch.tensor([[0.1, 0.01]])
+        ratio = torch.tensor([[0.7, 0.5]])
+        old_logprobs = old_prob.log()
+        new_logprobs = old_logprobs + ratio.log()
+
+        _, _, pg_loss, _ = grpo_utils.compute_grpo_loss(
+            new_logprobs=new_logprobs,
+            old_logprobs=old_logprobs,
+            ratio=ratio,
+            advantages=-torch.ones_like(ratio),
+            ref_logprobs=None,
+            config=config,
+        )
+
+        # The common token falls by 0.03 and is blocked; the rare token falls
+        # by only 0.005 and retains its REINFORCE loss.
+        torch.testing.assert_close(pg_loss, torch.tensor([[0.0, 0.5]]))
 
     def test_cispo_uses_detached_ratio(self):
         config = _make_grpo_config(loss_fn=grpo_utils.GRPOLossType.cispo, clip_higher=0.2)
@@ -206,7 +299,12 @@ class TestComputeGRPOLoss(unittest.TestCase):
         advantages = torch.ones(1, 3)
 
         pg_losses, pg_losses2, pg_loss_max, _ = grpo_utils.compute_grpo_loss(
-            new_logprobs=new_logprobs, ratio=ratio, advantages=advantages, ref_logprobs=None, config=config
+            new_logprobs=new_logprobs,
+            old_logprobs=new_logprobs - ratio.detach().log(),
+            ratio=ratio,
+            advantages=advantages,
+            ref_logprobs=None,
+            config=config,
         )
 
         pg_loss_max.sum().backward()
@@ -222,7 +320,12 @@ class TestComputeGRPOLoss(unittest.TestCase):
         ref_logprobs = torch.randn(batch_size, seq_len)
 
         _, _, _, kl = grpo_utils.compute_grpo_loss(
-            new_logprobs=new_logprobs, ratio=ratio, advantages=advantages, ref_logprobs=ref_logprobs, config=config
+            new_logprobs=new_logprobs,
+            old_logprobs=new_logprobs - ratio.log(),
+            ratio=ratio,
+            advantages=advantages,
+            ref_logprobs=ref_logprobs,
+            config=config,
         )
 
         self.assertFalse(torch.all(kl == 0))
@@ -234,7 +337,12 @@ class TestComputeGRPOLoss(unittest.TestCase):
         advantages = torch.randn(2, 4)
 
         _, _, _, kl = grpo_utils.compute_grpo_loss(
-            new_logprobs=new_logprobs, ratio=ratio, advantages=advantages, ref_logprobs=None, config=config
+            new_logprobs=new_logprobs,
+            old_logprobs=new_logprobs - ratio.log(),
+            ratio=ratio,
+            advantages=advantages,
+            ref_logprobs=None,
+            config=config,
         )
 
         torch.testing.assert_close(kl, torch.zeros_like(kl))
@@ -248,6 +356,7 @@ class TestComputeGRPOLoss(unittest.TestCase):
 
         pg_no_tis, pg2_no_tis, _, _ = grpo_utils.compute_grpo_loss(
             new_logprobs=new_logprobs,
+            old_logprobs=new_logprobs - ratio.log(),
             ratio=ratio,
             advantages=advantages,
             ref_logprobs=None,
@@ -257,6 +366,7 @@ class TestComputeGRPOLoss(unittest.TestCase):
 
         pg_tis, pg2_tis, _, _ = grpo_utils.compute_grpo_loss(
             new_logprobs=new_logprobs,
+            old_logprobs=new_logprobs - ratio.log(),
             ratio=ratio,
             advantages=advantages,
             ref_logprobs=None,
@@ -272,6 +382,7 @@ class TestComputeGRPOLoss(unittest.TestCase):
         with self.assertRaises(ValueError):
             grpo_utils.compute_grpo_loss(
                 new_logprobs=torch.randn(2, 4),
+                old_logprobs=torch.randn(2, 4),
                 ratio=torch.exp(torch.randn(2, 4)),
                 advantages=torch.randn(2, 4),
                 ref_logprobs=None,

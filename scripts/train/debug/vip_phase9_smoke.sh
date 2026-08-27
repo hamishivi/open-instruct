@@ -41,7 +41,7 @@ mkdir -p "$HOME/.triton/autotune"
     --apply_r1_style_format_reward --apply_verifiable_reward true \
     --ground_truths_key ground_truth \
     --chat_template_name r1_simple_chat_postpend_think \
-    --temperature 0.7 --beta 0.0 \
+    --temperature 1.0 --beta 0.0 \
     --learning_rate 3e-7 --total_episodes 160 \
     --deepspeed_stage 2 --num_epochs 1 \
     --num_learners_per_node 1 --vllm_num_engines 1 --vllm_tensor_parallel_size 1 \
@@ -57,6 +57,7 @@ mkdir -p "$HOME/.triton/autotune"
     --gen_value_segmentation fixed \
     --gen_value_chunk_size 256 \
     --gen_value_score_min 0 --gen_value_score_max 10 \
+    --gen_value_max_model_len 8192 \
     --gen_value_conditioning none
 
 echo "Phase 9 smoke test: PASS"

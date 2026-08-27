@@ -34,17 +34,100 @@ from open_instruct.rl_utils import (
     calculate_length_adaptive_lambda,
 )
 from open_instruct.value_model_utils import (
+    accumulation_group_token_counts,
+    add_observation_segment_boundaries,
+    balanced_accumulation_group_ids,
+    bounded_value_prediction,
     build_conditioning_text,
     build_generative_value_prompt,
+    causal_segment_start_prefix_token_ids,
     causal_value_mask,
     compute_value_loss,
+    generative_value_reinforce_reward,
+    grouped_token_counts,
     is_postfix_template,
+    missing_value_fallback,
+    normalize_value_loss,
     parse_generative_value_score,
     predict_values,
+    regression_metric_sums,
+    regression_metrics_from_sums,
     resolve_num_siblings_to_sample,
+    reward_to_unit_value,
     segment_rollout,
+    unit_value_to_reward,
+    validate_terminal_rewards,
     value_clipped_mse_loss,
+    value_metric_sums,
+    value_metrics_from_sums,
 )
+
+
+class TestCausalGenValuePrefixes(unittest.TestCase):
+    def test_observation_gap_starts_a_new_segment(self):
+        response_mask = [False, True, False, False, True, True]
+
+        boundaries = add_observation_segment_boundaries(response_mask, [2])
+
+        self.assertEqual(boundaries, [0, 2])
+
+    def test_observation_boundaries_merge_with_existing_segments(self):
+        response_mask = [False, True, True, False, True, True, True]
+
+        boundaries = add_observation_segment_boundaries(response_mask, [1, 4])
+
+        self.assertEqual(boundaries, [1, 4])
+
+    def test_scores_segment_starts_instead_of_segment_ends(self):
+        # prompt=[10, 11], response actions=[20, 21, 22, 23, 24, 25]
+        sequence = [10, 11, 20, 21, 22, 23, 24, 25]
+        response_mask = [False, False, True, True, True, True, True, True]
+
+        prefixes = causal_segment_start_prefix_token_ids(sequence, response_mask, [2, 5])
+
+        self.assertEqual(prefixes, [[], [20, 21, 22]])
+
+    def test_retains_masked_tool_observations_before_next_action(self):
+        # The first segment contains action 20. Tokens 30 and 31 are a masked
+        # tool observation that must remain visible before action 21.
+        sequence = [10, 11, 20, 30, 31, 21, 22]
+        response_mask = [False, False, True, False, False, True, True]
+
+        prefixes = causal_segment_start_prefix_token_ids(sequence, response_mask, [0, 2])
+
+        self.assertEqual(prefixes, [[], [20, 30, 31]])
+
+    def test_requires_terminal_boundary(self):
+        with self.assertRaisesRegex(ValueError, "final segment boundary"):
+            causal_segment_start_prefix_token_ids([10, 20, 21], [False, True, True], [0])
+
+
+class TestValueRewardBounds(unittest.TestCase):
+    def test_missing_prediction_falls_back_to_zero_when_supported(self):
+        self.assertEqual(missing_value_fallback(-2.0, 3.0), 0.0)
+
+    def test_missing_prediction_uses_endpoint_closest_to_zero(self):
+        self.assertEqual(missing_value_fallback(1.0, 3.0), 1.0)
+        self.assertEqual(missing_value_fallback(-3.0, -1.0), -1.0)
+
+    def test_accepts_terminal_rewards_inside_declared_support(self):
+        rewards = torch.tensor([[0.0, -1.0, 0.0, 2.0]])
+        dones = torch.tensor([[0, 1, 0, 1]])
+
+        validate_terminal_rewards(rewards, dones, -1.0, 2.0)
+
+    def test_rejects_terminal_rewards_outside_declared_support(self):
+        rewards = torch.tensor([[0.0, 3.0]])
+        dones = torch.tensor([[0, 1]])
+
+        with self.assertRaisesRegex(ValueError, "outside the configured value range"):
+            validate_terminal_rewards(rewards, dones, 0.0, 1.0)
+
+    def test_ignores_nonterminal_values(self):
+        rewards = torch.tensor([[100.0, 1.0]])
+        dones = torch.tensor([[0, 1]])
+
+        validate_terminal_rewards(rewards, dones, 0.0, 1.0)
 
 
 class TestGAEVariants(unittest.TestCase):
@@ -200,6 +283,22 @@ class TestGAEVariants(unittest.TestCase):
 
 
 class TestTISMask(unittest.TestCase):
+    def test_cap_and_mask_match_policy_token_weighting(self):
+        ratios = torch.tensor([[0.25, 1.0, 3.0]])
+        trainer_logprobs = torch.log(ratios)
+        rollout_logprobs = torch.zeros_like(trainer_logprobs)
+        response_mask = torch.ones_like(trainer_logprobs, dtype=torch.bool)
+
+        clamped, _ = grpo_utils.compute_tis_weights(
+            trainer_logprobs.detach(), rollout_logprobs, response_mask, cap=2.0
+        )
+        mask = grpo_utils.compute_tis_mask(
+            trainer_logprobs, rollout_logprobs, response_mask, lower_bound=0.5, upper_bound=2.0
+        )
+        combined = grpo_utils.combine_tis_terms(clamped, mask)
+
+        torch.testing.assert_close(combined, torch.tensor([[0.0, 1.0, 0.0]]))
+
     def test_upper_and_lower_bounds(self):
         ratios = torch.tensor([[0.49, 0.5, 1.0, 1.99, 2.0, 3.0]])
         new_logprobs = torch.log(ratios)
@@ -369,7 +468,47 @@ class TestValueLoss(unittest.TestCase):
         config = grpo_utils.GRPOExperimentConfig()
         self.assertEqual(config.value_loss, "mse")
         self.assertEqual(config.value_loss_coef, 1.0)
+        self.assertTrue(config.bound_value_predictions)
         self.assertTrue(config.skip_tool_outputs)
+
+    def test_bounded_value_default_is_inert_without_value_model(self):
+        config = grpo_utils.GRPOExperimentConfig(use_value_model=False)
+
+        self.assertTrue(config.bound_value_predictions)
+
+    def test_dppo_is_a_configured_loss_option(self):
+        config = grpo_utils.GRPOExperimentConfig(loss_fn=grpo_utils.GRPOLossType.dppo, dppo_clip=0.02)
+        self.assertEqual(config.loss_fn, grpo_utils.GRPOLossType.dppo)
+
+    def test_dppo_requires_an_explicit_clip(self):
+        with self.assertRaisesRegex(ValueError, "requires an explicit --dppo_clip"):
+            grpo_utils.GRPOExperimentConfig(loss_fn=grpo_utils.GRPOLossType.dppo)
+
+    def test_dppo_rejects_out_of_range_clip(self):
+        with self.assertRaisesRegex(ValueError, "dppo_clip must be in"):
+            grpo_utils.GRPOExperimentConfig(loss_fn=grpo_utils.GRPOLossType.dppo, dppo_clip=0.0)
+
+    def test_bounded_value_prediction_uses_reward_range(self):
+        logits = torch.tensor([-10.0, 0.0, 10.0])
+        values = bounded_value_prediction(logits, value_min=-2.0, value_max=4.0)
+
+        self.assertTrue(bool((values > -2.0).all()))
+        self.assertTrue(bool((values < 4.0).all()))
+        torch.testing.assert_close(values[1], torch.tensor(1.0))
+        self.assertLess(float(values[0]), 0.0)
+        self.assertGreater(float(values[2]), 2.0)
+
+    def test_predict_values_can_bound_mse_head(self):
+        logits = torch.tensor([[[-100.0], [0.0], [100.0]]])
+        values = predict_values(logits, "mse", bound_predictions=True, value_min=0.0, value_max=10.0)
+
+        self.assertTrue(bool((values > 0.0).all()))
+        self.assertTrue(bool((values < 10.0).all()))
+        torch.testing.assert_close(values[0, 1], torch.tensor(5.0))
+
+    def test_gen_value_unit_score_maps_to_reward_range(self):
+        self.assertEqual(unit_value_to_reward(0.25, value_min=-2.0, value_max=6.0), 0.0)
+        self.assertEqual(reward_to_unit_value(0.0, value_min=-2.0, value_max=6.0), 0.25)
 
     def test_classification_supports_ground_truth_conditioning(self):
         config = grpo_utils.GRPOExperimentConfig(
@@ -385,6 +524,94 @@ class TestValueLoss(unittest.TestCase):
         response_mask = torch.tensor([[False, False, True, False, True]])
         expected = torch.tensor([[False, True, False, True]])
         torch.testing.assert_close(causal_value_mask(response_mask), expected)
+
+    def test_accumulation_group_token_counts_handles_variable_pack_lengths(self):
+        masks = [
+            torch.tensor([[True, True, False]]),
+            torch.tensor([[True, True, True, False]]),
+            torch.tensor([[False, True]]),
+        ]
+
+        counts = accumulation_group_token_counts(masks, accumulation_steps=2)
+
+        torch.testing.assert_close(counts, torch.tensor([5.0, 1.0]))
+
+    def test_balanced_accumulation_groups_use_exact_requested_step_count(self):
+        self.assertEqual(balanced_accumulation_group_ids(num_samples=5, num_groups=2), [0, 0, 0, 1, 1])
+
+    def test_balanced_accumulation_groups_reject_more_steps_than_packs(self):
+        with self.assertRaisesRegex(ValueError, "num_groups cannot exceed num_samples"):
+            balanced_accumulation_group_ids(num_samples=2, num_groups=5)
+
+    def test_grouped_token_counts_follow_balanced_accumulation_groups(self):
+        masks = [torch.ones(1, token_count, dtype=torch.bool) for token_count in (1, 2, 3, 4, 5)]
+        group_ids = balanced_accumulation_group_ids(num_samples=len(masks), num_groups=2)
+
+        counts = grouped_token_counts(masks, group_ids)
+
+        torch.testing.assert_close(counts, torch.tensor([6.0, 9.0]))
+
+    def test_value_loss_contributions_form_one_token_weighted_mean(self):
+        short_pack = torch.tensor([1.0, 3.0])
+        long_pack = torch.tensor([5.0, 7.0, 9.0])
+        global_token_count = short_pack.numel() + long_pack.numel()
+
+        loss = normalize_value_loss(short_pack, global_token_count, loss_coef=0.5, data_parallel_world_size=1)
+        loss += normalize_value_loss(long_pack, global_token_count, loss_coef=0.5, data_parallel_world_size=1)
+
+        expected = torch.cat((short_pack, long_pack)).mean() * 0.5
+        torch.testing.assert_close(loss, expected)
+
+    def test_value_loss_normalization_compensates_for_dp_averaging(self):
+        rank_0 = normalize_value_loss(
+            torch.tensor([1.0, 3.0]), global_token_count=5, loss_coef=1.0, data_parallel_world_size=2
+        )
+        rank_1 = normalize_value_loss(
+            torch.tensor([5.0, 7.0, 9.0]), global_token_count=5, loss_coef=1.0, data_parallel_world_size=2
+        )
+
+        deepspeed_averaged_loss = (rank_0 + rank_1) / 2
+        torch.testing.assert_close(deepspeed_averaged_loss, torch.tensor(5.0))
+
+    def test_value_metrics_are_token_weighted_across_packs(self):
+        short_pack_stats = value_metric_sums(torch.tensor([1.0, 3.0]), torch.tensor(0.5), torch.tensor([True, True]))
+        long_pack_stats = value_metric_sums(
+            torch.tensor([5.0, 7.0, 9.0]), torch.tensor(1 / 3), torch.tensor([True, True, True])
+        )
+
+        value_loss, clipfrac = value_metrics_from_sums(short_pack_stats + long_pack_stats, loss_coef=0.5)
+
+        torch.testing.assert_close(value_loss, torch.tensor(2.5, dtype=torch.float64))
+        torch.testing.assert_close(clipfrac, torch.tensor(0.4, dtype=torch.float64))
+
+    def test_regression_diagnostics_are_exact_with_unequal_rank_token_counts(self):
+        rank_0 = regression_metric_sums(torch.tensor([0.0]), torch.tensor([0.2]))
+        rank_1 = regression_metric_sums(torch.tensor([1.0, 1.0, 1.0]), torch.tensor([0.5, 0.75, 1.0]))
+
+        metrics = regression_metrics_from_sums(rank_0 + rank_1)
+        returns = np.array([0.0, 1.0, 1.0, 1.0])
+        predictions = np.array([0.2, 0.5, 0.75, 1.0])
+        residuals = returns - predictions
+
+        self.assertAlmostEqual(metrics["value/returns_mean"], float(returns.mean()))
+        self.assertAlmostEqual(metrics["value/returns_std"], float(returns.std()))
+        self.assertAlmostEqual(metrics["value/predictions_mean"], float(predictions.mean()))
+        self.assertAlmostEqual(metrics["value/predictions_std"], float(predictions.std()))
+        self.assertAlmostEqual(
+            metrics["value/explained_variance"], 1.0 - float(residuals.var()) / (float(returns.var()) + 1e-8)
+        )
+
+    def test_gen_value_parse_failure_has_zero_reinforce_reward(self):
+        reward, squared_error = generative_value_reinforce_reward(outcome=0.0, prediction=None)
+
+        self.assertEqual(reward, 0.0)
+        self.assertIsNone(squared_error)
+
+    def test_gen_value_parsed_prediction_uses_mse_shaped_reward(self):
+        reward, squared_error = generative_value_reinforce_reward(outcome=1.0, prediction=0.25)
+
+        self.assertEqual(squared_error, 0.75**2)
+        self.assertEqual(reward, 1.0 - 0.75**2)
 
     def test_classification_loss_preserves_continuous_targets(self):
         probabilities = torch.tensor([[[0.75, 0.25], [0.25, 0.75]]])
@@ -402,7 +629,7 @@ class TestValueLoss(unittest.TestCase):
         torch.testing.assert_close(predict_values(logits, "classification"), returns)
 
     def test_classification_loss_rejects_out_of_range_targets(self):
-        with self.assertRaisesRegex(ValueError, "outside \\[0, 1\\]"):
+        with self.assertRaisesRegex(ValueError, "outside \\[0.0, 1.0\\]"):
             compute_value_loss(
                 torch.zeros(1, 1, 2),
                 torch.tensor([[1.1]]),
@@ -411,6 +638,27 @@ class TestValueLoss(unittest.TestCase):
                 loss_type="classification",
                 clip_range=0.2,
             )
+
+    def test_classification_supports_custom_reward_range(self):
+        probabilities = torch.tensor([[[0.75, 0.25], [0.25, 0.75]]])
+        logits = probabilities.log()
+        returns = torch.tensor([[0.0, 4.0]])
+        mask = torch.tensor([[True, True]])
+
+        per_token, _ = compute_value_loss(
+            logits,
+            returns,
+            old_values=None,
+            mask=mask,
+            loss_type="classification",
+            clip_range=0.2,
+            value_min=-2.0,
+            value_max=6.0,
+        )
+
+        expected = -(probabilities * probabilities.log()).sum(dim=-1)
+        torch.testing.assert_close(per_token, expected)
+        torch.testing.assert_close(predict_values(logits, "classification", value_min=-2.0, value_max=6.0), returns)
 
     def test_mse_loss_no_clip(self):
         new_v = torch.tensor([[1.0, 2.0, 3.0]])
@@ -437,8 +685,8 @@ class TestValueLoss(unittest.TestCase):
 class TestGenValueSegmentation(unittest.TestCase):
     def test_fixed_segmentation(self):
         boundaries = segment_rollout(list(range(1500)), None, mode="fixed", fixed_chunk_size=500)
-        # Boundaries at 500 and 1000, plus a final boundary at L-1.
-        self.assertEqual(boundaries, [500, 1000, 1499])
+        # Inclusive ends for three exactly 500-token chunks.
+        self.assertEqual(boundaries, [499, 999, 1499])
 
     def test_sae_segmentation(self):
         logps = [-0.1] * 10 + [-3.0] + [-0.1] * 10  # one boundary at t=10

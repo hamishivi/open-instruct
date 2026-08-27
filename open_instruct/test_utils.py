@@ -735,6 +735,20 @@ class TestRayGetWithProgress(unittest.TestCase):
         with pytest.raises(TimeoutError, match=desc):
             utils.ray_get_with_progress(refs, desc=desc, enable=False, timeout=0.1)
 
+    def test_background_health_failure_aborts_wait(self):
+        @ray.remote
+        def slow_task():
+            time.sleep(10)
+            return "done"
+
+        def failed_health_check():
+            raise RuntimeError("critic trainer failed")
+
+        with pytest.raises(RuntimeError, match="critic trainer failed"):
+            utils.ray_get_with_progress(
+                [slow_task.remote()], enable=False, health_check_fn=failed_health_check, health_check_interval_s=0.01
+            )
+
 
 class TestUlyssesSPSplitter(unittest.TestCase):
     """Test the UlyssesSPSplitter for sequence parallelism splitting."""

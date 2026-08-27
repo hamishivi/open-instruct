@@ -46,7 +46,7 @@ import sys
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from concurrent import futures
 from ctypes import CDLL, POINTER, Structure, c_char_p, c_int, c_ulong, c_void_p
 from dataclasses import dataclass
@@ -191,7 +191,12 @@ def repeat_each(seq, k):
 
 
 def ray_get_with_progress(
-    ray_refs: list[ray.ObjectRef], desc: str = "Processing", enable: bool = True, timeout: float | None = None
+    ray_refs: list[ray.ObjectRef],
+    desc: str = "Processing",
+    enable: bool = True,
+    timeout: float | None = None,
+    health_check_fn: Callable[[], None] | None = None,
+    health_check_interval_s: float = 1.0,
 ):
     """Execute ray.get() with a progress bar using futures and collect timings.
 
@@ -200,6 +205,8 @@ def ray_get_with_progress(
         desc: Description for the progress bar
         enable: Whether to show the progress bar (default: True)
         timeout: Optional timeout in seconds for all operations to complete
+        health_check_fn: Optional callback polled while waiting. Exceptions abort the wait.
+        health_check_interval_s: Maximum delay before polling ``health_check_fn`` again.
 
     Returns:
         (results, completion_times)
@@ -217,17 +224,35 @@ def ray_get_with_progress(
     results = [None] * len(ray_refs)
     completion_times = [None] * len(ray_refs)
 
-    futures_iter = futures.as_completed(ray_futures, timeout=timeout)
-    if enable:
-        futures_iter = tqdm(futures_iter, total=len(ray_futures), desc=desc, bar_format="{l_bar}{bar}{r_bar}\n")
-
+    if health_check_interval_s <= 0:
+        raise ValueError(f"health_check_interval_s must be positive, got {health_check_interval_s}.")
+    pending = set(ray_futures)
+    deadline = t0 + timeout if timeout is not None else None
+    progress = tqdm(total=len(ray_futures), desc=desc, bar_format="{l_bar}{bar}{r_bar}\n") if enable else None
     try:
-        for future in futures_iter:
-            idx = fut_to_idx[future]
-            results[idx] = future.result()
-            completion_times[idx] = time.perf_counter() - t0
-    except TimeoutError as e:
-        raise TimeoutError(f"{desc} failed.") from e
+        while pending:
+            remaining = None if deadline is None else max(deadline - time.perf_counter(), 0.0)
+            wait_timeout = remaining
+            if health_check_fn is not None:
+                wait_timeout = (
+                    health_check_interval_s if remaining is None else min(health_check_interval_s, remaining)
+                )
+            done, pending = futures.wait(pending, timeout=wait_timeout, return_when=futures.FIRST_COMPLETED)
+
+            if health_check_fn is not None:
+                health_check_fn()
+            if not done and deadline is not None and time.perf_counter() >= deadline:
+                raise TimeoutError(f"{desc} failed.")
+
+            for future in done:
+                idx = fut_to_idx[future]
+                results[idx] = future.result()
+                completion_times[idx] = time.perf_counter() - t0
+                if progress is not None:
+                    progress.update()
+    finally:
+        if progress is not None:
+            progress.close()
 
     return results, completion_times
 
@@ -2675,8 +2700,7 @@ class UlyssesSPSplitter:
                 "query_shapes": [tuple(t.shape) for t in result.query_responses],
                 "position_shapes": [tuple(t.shape) for t in result.position_ids],
                 "local_position_resets": [
-                    bool((t.diff(dim=-1) < 0).any().item()) if t.shape[-1] > 1 else False
-                    for t in result.position_ids
+                    bool((t.diff(dim=-1) < 0).any().item()) if t.shape[-1] > 1 else False for t in result.position_ids
                 ],
                 "local_position_start_counts": [int((t == 0).sum().item()) for t in result.position_ids],
             }

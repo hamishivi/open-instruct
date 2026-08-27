@@ -16,21 +16,22 @@ The generative value model has its own weights and vLLM pool.  During each polic
 boundaries via the gen-value vLLM pool and uses the returned piecewise-constant scores as the
 value function for GAE (replacing the scalar value head when ``use_generative_value_model=True``).
 
-A background REINFORCE thread collects ``(prompt, generated_score, outcome)`` training pairs from
-the policy actors via a shared Ray queue.  A ``GenValueTrainerActor`` (one per cluster) holds a
-PyTorch copy of the gen-value model and computes REINFORCE gradients using the paper's
+A background critic loop reads complete rollouts from a bounded queue and forms fixed-size
+batches. Policy actors pipe through the exact prompt and sampled token IDs, generated score
+text, rollout outcome, and source critic version without waiting for critic training. A
+``GenValueTrainerActor`` holds a DeepSpeed-wrapped copy of the gen-value model and computes
+REINFORCE gradients using the paper's
 MSE-shaped critic reward ``R_v = 1 - (outcome - v_hat)**2``, following §5.2 of "Bringing Value
-Models Back" (arXiv:2604.10701).  On parse failure we treat the critic as having predicted
-``v_hat = 0`` (instead of the paper's reward-zero convention) so the gradient signal stays
-consistent with the piecewise-constant values we feed into GAE.
+Models Back" (arXiv:2604.10701). Parse failures receive reward zero; the numeric value supplied
+to GAE remains zero because GAE cannot consume a missing prediction.
 
 Weight sync from the trainer actor back to the gen-value vLLM pool happens in-place over NCCL,
 mirroring how the policy syncs to its own vLLM pool in
 ``grpo_fast.PolicyTrainerRayProcess.broadcast_to_vllm``.  A NCCL group is established once at
-startup via ``GenValueTrainerActor.setup_model_update_group``; every ``gen_value_sync_freq``
-policy steps (default: 1 = every step) we then broadcast the latest PyTorch weights into the
-running vLLM engines.  Set ``gen_value_sync_freq=0`` to skip sync entirely and keep the vLLM
-critic frozen while REINFORCE gradients are still computed (useful for debugging).
+startup via ``GenValueTrainerActor.setup_model_update_group``. Critic training stays asynchronous;
+the latest eligible version is published between policy steps, after distributed critic scoring
+has completed. Set ``gen_value_sync_freq=0`` to keep the serving critic frozen while REINFORCE
+gradients are still computed.
 
 Usage::
 
@@ -49,17 +50,21 @@ Usage::
 
 from __future__ import annotations
 
-import logging
+import math
 import os
 import pathlib
 import queue as queue_lib
 import random
 import threading
+import time
+from collections import deque
+from collections.abc import Callable
 from concurrent import futures
 from dataclasses import dataclass
-from queue import Full, Queue
+from queue import Queue
 from typing import Any
 
+import deepspeed
 import ray
 import torch
 import torch.distributed as dist
@@ -69,26 +74,40 @@ from vllm.distributed.weight_transfer.base import WeightTransferInitRequest
 from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
 
 from open_instruct import data_loader as data_loader_lib
-from open_instruct import grpo_fast_resource_plan, grpo_utils, utils, value_model_utils, vllm_utils
+from open_instruct import grpo_fast_resource_plan, grpo_utils, logger_utils, utils, value_model_utils, vllm_utils
 
 # grpo_fast is heavy (pulls in vLLM) so it is imported lazily inside main().
 from open_instruct.dataset_transformation import INPUT_IDS_PROMPT_KEY, TokenizerConfig
 from open_instruct.environments.tools.utils import EnvsConfig
 from open_instruct.ground_truth_utils import RewardConfig, build_all_verifiers
-from open_instruct.model_utils import ModelConfig
+from open_instruct.model_utils import ModelConfig, disable_dropout_in_model
 from open_instruct.utils import ArgumentParserPlus
 
-logger = logging.getLogger(__name__)
+logger = logger_utils.setup_logger(__name__)
 
 _GEN_VALUE_SAMPLE_SIZE = 4  # prompts sampled per step for background scoring
+_GEN_VALUE_OPERATION_TIMEOUT_S = 7200.0
+_GEN_VALUE_HEALTH_TIMEOUT_S = 60.0
+
+
+def _check_gen_value_engines(vllm_engines: list) -> None:
+    """Raise promptly if a critic vLLM background task or loop has failed."""
+    if not vllm_engines:
+        return
+    utils.ray_get_with_progress(
+        [engine.check_background_threads.remote() for engine in vllm_engines],
+        desc="Checking generative critic vLLM engine health",
+        enable=False,
+        timeout=_GEN_VALUE_HEALTH_TIMEOUT_S,
+    )
 
 
 @ray.remote(num_gpus=1, num_cpus=1)
 class GenValueTrainerActor:
-    """Ray actor that holds the gen-value model (PyTorch) and performs REINFORCE updates.
+    """Ray actor that holds the gen-value model (DeepSpeed) and performs REINFORCE updates.
 
-    The actor receives training pairs (prompt, generated, outcome) via ``reinforce_step``
-    and optimises the paper's accuracy-shaped REINFORCE reward::
+    The actor receives token-preserving training pairs via ``reinforce_step`` and optimises the
+    paper's accuracy-shaped REINFORCE reward::
 
         R_v = 1 - (outcome - v_hat)**2    if v_hat was parsed from the generation
             = 0                           otherwise
@@ -105,37 +124,106 @@ class GenValueTrainerActor:
     def __init__(
         self,
         model_path: str,
+        model_revision: str | None,
+        tokenizer_path: str,
+        tokenizer_revision: str | None,
         learning_rate: float,
         score_min: float,
         score_max: float,
+        max_sequence_tokens: int,
+        temperature: float = 1.0,
+        truncated_importance_sampling_ratio_cap: float = 2.0,
+        tis_mask_lower: float = 0.0,
+        tis_mask_upper: float = 0.0,
         tensor_parallel_size: int = 1,
-        max_prompt_tokens: int = 8192,
         reinforce_coef: float = 0.1,
-        expected_producers: int = 1,
-        checkpoint_file: str | None = None,
+        weight_decay: float = 0.0,
+        set_weight_decay_on_bias_and_norm: bool = True,
+        fused_optimizer: bool = True,
+        max_grad_norm: float = 1.0,
+        checkpoint_path: str | None = None,
+        checkpoint_tag: str | None = None,
     ) -> None:
-        self._lr = learning_rate
         self._score_min = score_min
         self._score_max = score_max
         self._tp_size = tensor_parallel_size
-        self._max_prompt_tokens = max_prompt_tokens
+        self._max_sequence_tokens = max_sequence_tokens
+        self._temperature = temperature
+        self._tis_ratio_cap = truncated_importance_sampling_ratio_cap
+        self._tis_mask_lower = tis_mask_lower
+        self._tis_mask_upper = tis_mask_upper
         self._reinforce_coef = reinforce_coef
-        self._expected_producers = expected_producers
         self._step_count = 0
-        self._trained_producers_by_policy_step: dict[int, set[int]] = {}
-        self._latest_trained_policy_step = 0
+        torch.cuda.set_device(0)
+        if dist.is_initialized():
+            if dist.get_world_size() != 1:
+                raise RuntimeError(
+                    "The independent generative critic requires a private world-size-one process group, "
+                    f"but found world size {dist.get_world_size()}."
+                )
+        else:
+            master_address = "127.0.0.1"
+            master_port = utils.find_free_port()
+            os.environ.update(
+                {
+                    "LOCAL_RANK": "0",
+                    "RANK": "0",
+                    "WORLD_SIZE": "1",
+                    "MASTER_ADDR": master_address,
+                    "MASTER_PORT": str(master_port),
+                }
+            )
+            deepspeed.init_distributed(
+                dist_backend="nccl",
+                auto_mpi_discovery=False,
+                init_method=f"tcp://{master_address}:{master_port}",
+                rank=0,
+                world_size=1,
+            )
 
-        self._model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16).cuda()
-        self._model.config.use_cache = False
-        if hasattr(self._model, "gradient_checkpointing_enable"):
-            self._model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        self._model.train()
-        self._tokenizer = AutoTokenizer.from_pretrained(model_path)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, revision=model_revision, torch_dtype=torch.bfloat16
+        ).cuda()
+        disable_dropout_in_model(model)
+        model.config.use_cache = False
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.train()
+
+        optimizer_parameters = (
+            utils.get_optimizer_grouped_parameters(model, weight_decay)
+            if set_weight_decay_on_bias_and_norm
+            else model.parameters()
+        )
+        optimizer = torch.optim.AdamW(
+            optimizer_parameters, lr=learning_rate, weight_decay=weight_decay, fused=fused_optimizer
+        )
+        ds_config = utils.get_train_ds_config(
+            offload=False,
+            adam_offload=False,
+            stage=0,
+            bf16=True,
+            max_norm=max_grad_norm,
+            zpg=1,
+            grad_accum_dtype="fp32",
+        )
+        ds_config["train_micro_batch_size_per_gpu"] = 1
+        ds_config["gradient_accumulation_steps"] = 1
+        self._model, self._optimizer, _, _ = deepspeed.initialize(
+            model=model, optimizer=optimizer, config=ds_config, dist_init_required=False
+        )
+        optimizer_dtypes = {parameter.dtype for group in self._optimizer.param_groups for parameter in group["params"]}
+        if optimizer_dtypes != {torch.float32}:
+            raise RuntimeError(
+                "The generative critic requires DeepSpeed FP32 master parameters, "
+                f"but its optimizer owns {sorted(str(dtype) for dtype in optimizer_dtypes)}."
+            )
+
+        self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, revision=tokenizer_revision)
         if self._tokenizer.pad_token_id is None:
             self._tokenizer.pad_token_id = self._tokenizer.eos_token_id
-        self._optimizer = torch.optim.AdamW(self._model.parameters(), lr=learning_rate)
-        if checkpoint_file is not None:
-            self._load_checkpoint(checkpoint_file)
+        if checkpoint_path is not None:
+            self._load_checkpoint(checkpoint_path, checkpoint_tag)
 
         self._vllm_engines: list | None = None
         self._model_update_group: Any | None = None
@@ -146,154 +234,200 @@ class GenValueTrainerActor:
             return None
         return value_model_utils.rescale_gen_value_score(raw, self._score_min, self._score_max)
 
-    def _load_checkpoint(self, checkpoint_file: str) -> None:
-        state = torch.load(checkpoint_file, map_location="cpu", weights_only=False)
-        self._model.load_state_dict(state["model"])
-        self._optimizer.load_state_dict(state["optimizer"])
-        self._step_count = int(state.get("reinforce_steps", 0))
-        self._latest_trained_policy_step = int(state.get("latest_trained_policy_step", 0))
+    def _load_checkpoint(self, checkpoint_path: str, checkpoint_tag: str | None) -> None:
+        if checkpoint_tag is None:
+            raise ValueError("Generative-value DeepSpeed checkpoints require an explicit checkpoint tag.")
+        loaded_path, client_state = self._model.load_checkpoint(
+            checkpoint_path,
+            tag=checkpoint_tag,
+            load_module_strict=True,
+            load_optimizer_states=True,
+            load_lr_scheduler_states=False,
+            load_module_only=False,
+        )
+        if loaded_path is None:
+            raise ValueError(f"Failed to load generative-value DeepSpeed checkpoint from {checkpoint_path}.")
+        self._step_count = int(client_state.get("gen_value_version", client_state.get("reinforce_steps", 0)))
         logger.info(
-            "[GenValue] Restored trainer checkpoint %s at policy step %d (%d REINFORCE updates).",
-            checkpoint_file,
-            self._latest_trained_policy_step,
+            "[GenValue] Restored trainer checkpoint %s/%s at critic version %d.",
+            checkpoint_path,
+            checkpoint_tag,
             self._step_count,
         )
 
     def save_checkpoint(self, checkpoint_state_dir: str, policy_step: int) -> dict[str, Any]:
-        checkpoint_dir = pathlib.Path(checkpoint_state_dir) / "gen_value_model"
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"trainer_step_{policy_step}.pt"
-        checkpoint_file = checkpoint_dir / filename
-        temporary_file = checkpoint_file.with_suffix(".tmp")
-        state = {
-            "model": {name: tensor.detach().cpu() for name, tensor in self._model.state_dict().items()},
-            "optimizer": self._optimizer.state_dict(),
-            "reinforce_steps": self._step_count,
-            "latest_trained_policy_step": self._latest_trained_policy_step,
-        }
-        torch.save(state, temporary_file)
-        os.replace(temporary_file, checkpoint_file)
+        checkpoint_dir = pathlib.Path(checkpoint_state_dir) / "gen_value_model" / "deepspeed"
+        checkpoint_tag = f"global_step{policy_step}"
+        client_state = {"gen_value_version": self._step_count, "reinforce_steps": self._step_count}
+        saved = self._model.save_checkpoint(
+            str(checkpoint_dir), tag=checkpoint_tag, client_state=client_state, save_latest=False
+        )
+        if saved is False:
+            raise RuntimeError(f"Failed to save generative-value DeepSpeed checkpoint to {checkpoint_dir}.")
         return {
             "gen_value_trainer_saved": True,
-            "gen_value_trainer_checkpoint": str(checkpoint_file.relative_to(checkpoint_state_dir)),
-            "gen_value_latest_trained_policy_step": self._latest_trained_policy_step,
+            "gen_value_trainer_checkpoint": str(checkpoint_dir.relative_to(checkpoint_state_dir)),
+            "gen_value_trainer_checkpoint_tag": checkpoint_tag,
+            "gen_value_version": self._step_count,
         }
 
     def save_model(self, output_dir: str) -> None:
         gen_value_output_dir = pathlib.Path(output_dir) / "gen_value_model"
         gen_value_output_dir.mkdir(parents=True, exist_ok=True)
-        self._model.save_pretrained(gen_value_output_dir, safe_serialization=True)
+        self._model.module.save_pretrained(gen_value_output_dir, safe_serialization=True)
         self._tokenizer.save_pretrained(gen_value_output_dir)
 
-    def _mark_policy_batch_trained(self, policy_step: int | None, producer_rank: int | None) -> None:
-        if policy_step is None or producer_rank is None:
-            return
-        producers = self._trained_producers_by_policy_step.setdefault(int(policy_step), set())
-        producers.add(int(producer_rank))
-        if len(producers) >= self._expected_producers:
-            self._latest_trained_policy_step = max(self._latest_trained_policy_step, int(policy_step))
-            self._trained_producers_by_policy_step.pop(int(policy_step), None)
-
-    def reinforce_step(
-        self, training_pairs: list[dict], policy_step: int | None = None, producer_rank: int | None = None
-    ) -> dict:
+    def reinforce_step(self, training_pairs: list[dict]) -> dict:
         """Apply one REINFORCE gradient step with the MSE-shaped critic reward.
 
         For each pair we compute ``R_v = 1 - (r - v_hat)^2``, with both ``r`` and
-        ``v_hat`` clipped to [0, 1]. Parse failures are treated as the critic
-        predicting ``v_hat = 0`` (rather than assigning a reward of 0), so the
-        critic still receives a consistent gradient signal on malformed outputs.
+        ``v_hat`` clipped to [0, 1]. Parse failures receive reward zero.
         """
         if not training_pairs:
-            self._mark_policy_batch_trained(policy_step, producer_rank)
-            return {
-                "gen_value/reinforce_steps": self._step_count,
-                "gen_value/latest_trained_policy_step": self._latest_trained_policy_step,
-            }
+            return {"gen_value/version": self._step_count, "gen_value/reinforce_steps": self._step_count}
 
-        self._optimizer.zero_grad()
-        total_loss = 0.0
-        rewards: list[float] = []
-        outcomes: list[float] = []
-        mses: list[float] = []  # (r - v_hat)^2 with parse-failure → v_hat=0.
-        parsed_v_hats: list[float] = []  # only for pairs where parsing succeeded.
-        parsed_count = 0
+        validated_pairs: list[tuple[Any, list[int], float]] = []
         skipped_empty_generation = 0
-
         for pair in training_pairs:
             if pair["outcome"] is None:
                 continue
-            prompt_ids = self._tokenizer(pair["prompt"], add_special_tokens=False).input_ids
-            generated_ids = self._tokenizer(pair["generated"], add_special_tokens=False).input_ids
+            request_output = pair["request_output"]
+            if len(request_output.outputs) != 1 or request_output.outputs[0].text is None:
+                raise ValueError("Gen-value REINFORCE requires exactly one completion with generated text.")
+            completion = request_output.outputs[0]
+            prompt_ids = request_output.prompt_token_ids
+            generated_ids = completion.token_ids
+            if len(completion.logprobs) != len(generated_ids):
+                raise ValueError(
+                    "Gen-value completion token IDs and rollout log-probabilities must have the same length "
+                    f"({len(generated_ids)} != {len(completion.logprobs)})."
+                )
+            sequence_ids = prompt_ids + generated_ids
+            if len(sequence_ids) > self._max_sequence_tokens:
+                raise ValueError(
+                    "Gen-value REINFORCE sequence exceeds the vLLM critic context "
+                    f"({len(sequence_ids)} > {self._max_sequence_tokens} tokens)."
+                )
             if not generated_ids:
                 skipped_empty_generation += 1
                 continue
-            if len(prompt_ids) > self._max_prompt_tokens:
-                prompt_ids = prompt_ids[-self._max_prompt_tokens :]
             outcome = max(0.0, min(1.0, float(pair["outcome"])))
-            generated = pair["generated"]
+            validated_pairs.append((completion, sequence_ids, outcome))
+
+        if not validated_pairs:
+            return {"gen_value/version": self._step_count, "gen_value/reinforce_steps": self._step_count}
+
+        # DeepSpeed's BF16 optimizer owns the FP32 accumulation buffers, so clear
+        # it directly rather than only clearing the BF16 module gradients.
+        self._optimizer.zero_grad()
+        reinforce_token_denominator = sum(len(completion.token_ids) for completion, _, _ in validated_pairs)
+        gradient_scale = self._reinforce_coef / max(reinforce_token_denominator, 1)
+        total_loss = 0.0
+        rewards: list[float] = []
+        outcomes: list[float] = []
+        mses: list[float] = []  # Parsed generations only; parse failures have no numeric prediction.
+        parsed_v_hats: list[float] = []  # only for pairs where parsing succeeded.
+        parsed_count = 0
+        has_effective_training_signal = False
+        reinforce_token_count = 0
+        tis_ratio_sum = 0.0
+        tis_token_count = 0
+        tis_clipped_tokens = 0
+        tis_mask_kept_tokens = 0
+        tis_mask_total_tokens = 0
+
+        for pair_idx, (completion, sequence_ids, outcome) in enumerate(validated_pairs):
+            generated_ids = completion.token_ids
+            generated = completion.text
 
             v_hat = self._score_from_text(generated)
-            if v_hat is None:
-                # Parse failure: treat the critic's prediction as 0.
-                effective_v_hat = 0.0
-            else:
-                effective_v_hat = v_hat
+            if v_hat is not None:
                 parsed_count += 1
                 parsed_v_hats.append(v_hat)
-            squared_error = (outcome - effective_v_hat) ** 2
-            reward = 1.0 - squared_error
+            reward, squared_error = value_model_utils.generative_value_reinforce_reward(outcome, v_hat)
+            if squared_error is not None:
+                mses.append(squared_error)
 
-            input_ids = torch.tensor([prompt_ids + generated_ids], dtype=torch.long, device="cuda")
+            input_ids = torch.tensor([sequence_ids], dtype=torch.long, device="cuda")
             attention_mask = torch.ones_like(input_ids)
             target_ids = input_ids[:, -len(generated_ids) :]
 
             # Only materialize logits needed to score the generated answer tokens.
             # Full-sequence logits for 8k-token prompts can allocate several extra GiB.
+            # The critic batch is accumulated as one DeepSpeed step. Mark only
+            # its final sequence as the reduction/update boundary, as the policy does.
+            self._model.set_gradient_accumulation_boundary(pair_idx == len(validated_pairs) - 1)
             outputs = self._model(
                 input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=len(generated_ids) + 1
             )
-            logits = outputs.logits[:, :-1, :]
-            lm_loss = torch.nn.functional.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]).float(), target_ids.reshape(-1), reduction="mean"
+            logits = outputs.logits[:, :-1, :].float() / self._temperature
+            token_logprobs = -torch.nn.functional.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]), target_ids.reshape(-1), reduction="none"
             )
-            log_prob = -lm_loss  # mean log-prob of generated tokens
+            rollout_logprobs = torch.tensor(completion.logprobs, dtype=torch.float32, device="cuda")
+            response_mask = torch.ones_like(token_logprobs, dtype=torch.bool)
+            rollout_logprobs = grpo_utils.mask_logprobs(rollout_logprobs, response_mask)
+            tis_clamped, tis_unclamped = grpo_utils.compute_tis_weights(
+                token_logprobs.detach(), rollout_logprobs, response_mask, self._tis_ratio_cap
+            )
+            tis_mask = grpo_utils.compute_tis_mask(
+                token_logprobs, rollout_logprobs, response_mask, self._tis_mask_lower, self._tis_mask_upper
+            )
+            tis_weights = grpo_utils.combine_tis_terms(tis_clamped, tis_mask)
+            if tis_clamped is not None and tis_unclamped is not None:
+                tis_ratio_sum += float(tis_clamped.sum())
+                tis_token_count += tis_clamped.numel()
+                tis_clipped_tokens += int((tis_clamped < tis_unclamped).sum())
+            if tis_mask is not None:
+                tis_mask_kept_tokens += int(tis_mask.sum())
+                tis_mask_total_tokens += tis_mask.numel()
 
-            loss = -log_prob * reward
-            loss.backward()
+            per_token_loss = -token_logprobs * reward
+            if tis_weights is not None:
+                per_token_loss = per_token_loss * tis_weights
+            loss = per_token_loss.sum() * gradient_scale
+            self._model.backward(loss)
             total_loss += float(loss.detach())
+            reinforce_token_count += per_token_loss.numel()
             outcomes.append(outcome)
             rewards.append(reward)
-            mses.append(squared_error)
+            if reward > 0.0 and (tis_weights is None or bool((tis_weights > 0).any())):
+                has_effective_training_signal = True
 
-        if not rewards:
-            self._mark_policy_batch_trained(policy_step, producer_rank)
-            return {
-                "gen_value/reinforce_steps": self._step_count,
-                "gen_value/latest_trained_policy_step": self._latest_trained_policy_step,
-            }
-
-        gradient_scale = self._reinforce_coef / len(rewards)
-        for parameter in self._model.parameters():
-            if parameter.grad is not None:
-                parameter.grad.mul_(gradient_scale)
-        total_loss *= gradient_scale
-        torch.nn.utils.clip_grad_norm_(self._model.parameters(), 1.0)
-        self._optimizer.step()
-        self._step_count += 1
-        self._mark_policy_batch_trained(policy_step, producer_rank)
+        grad_norm: float | None = None
+        if self._reinforce_coef > 0.0 and has_effective_training_signal:
+            self._model.step()
+            global_grad_norm = self._model.get_global_grad_norm()
+            if global_grad_norm is not None and math.isfinite(float(global_grad_norm)):
+                grad_norm = float(global_grad_norm)
+            self._step_count += 1
 
         metrics = {
             "gen_value/reinforce_loss": total_loss,
             "gen_value/reward_mean": sum(rewards) / len(rewards),
             "gen_value/outcome_mean": sum(outcomes) / len(outcomes),
-            "gen_value/mse": sum(mses) / len(mses),
+            "gen_value/mse": sum(mses) / len(mses) if mses else float("nan"),
             "gen_value/parse_rate": parsed_count / len(rewards),
+            "gen_value/version": self._step_count,
             "gen_value/reinforce_steps": self._step_count,
-            "gen_value/latest_trained_policy_step": self._latest_trained_policy_step,
+            "gen_value/train_tokens": reinforce_token_count,
+            "gen_value/train_examples": len(rewards),
+            "gen_value/parsed_examples": parsed_count,
+            "gen_value/lr": self._optimizer.param_groups[0]["lr"],
         }
+        if grad_norm is not None:
+            metrics["gen_value/grad_norm"] = grad_norm
         if skipped_empty_generation:
             metrics["gen_value/skipped_empty_generation"] = skipped_empty_generation
+        if self._reinforce_coef <= 0.0 or not has_effective_training_signal:
+            metrics["gen_value/update_skipped"] = 1.0
+        if tis_token_count:
+            metrics["gen_value/tis_tokens"] = tis_token_count
+            metrics["gen_value/tis_ratio"] = tis_ratio_sum / tis_token_count
+            metrics["gen_value/tis_clipfrac"] = tis_clipped_tokens / tis_token_count
+        if tis_mask_total_tokens:
+            metrics["gen_value/tis_mask_tokens"] = tis_mask_total_tokens
+            metrics["gen_value/tis_mask_frac_kept"] = tis_mask_kept_tokens / tis_mask_total_tokens
         if parsed_v_hats:
             # Mean of parsed predictions -- tells us whether the critic is biased high/low
             # vs. ``outcome_mean`` and whether it's moving over training. Undefined when
@@ -328,34 +462,26 @@ class GenValueTrainerActor:
         self._model_update_group = NCCLWeightTransferEngine.trainer_init(master_info)
         utils.ray_get_with_progress(refs, desc="Initializing gen-value vLLM weight transfer engines", timeout=600)
 
-    def broadcast_to_vllm(self, model_step: int) -> dict[str, Any]:
+    def broadcast_to_vllm(self) -> dict[str, Any]:
         """Push current PyTorch weights to the gen-value vLLM pool over NCCL.
 
         Returns engine-side ``update_weights`` ObjectRefs together with the exact
         critic update watermarks represented by the broadcast.
         """
         if not self._vllm_engines or self._model_update_group is None:
-            return {
-                "engine_refs": [],
-                "latest_trained_policy_step": self._latest_trained_policy_step,
-                "reinforce_steps": self._step_count,
-            }
+            return {"engine_refs": [], "version": self._step_count}
         torch.cuda.empty_cache()
         torch.cuda.set_device(0)
         engine_refs = vllm_utils.broadcast_weights_to_vllm(
-            model=self._model,
+            model=self._model.module,
             vllm_engines=self._vllm_engines,
             model_update_group=self._model_update_group,
-            model_step=model_step,
+            model_step=self._step_count,
             gather_whole_model=True,
         )
-        return {
-            "engine_refs": engine_refs,
-            "latest_trained_policy_step": self._latest_trained_policy_step,
-            "reinforce_steps": self._step_count,
-        }
+        return {"engine_refs": engine_refs, "version": self._step_count}
 
-    def get_step_count(self) -> int:
+    def get_version(self) -> int:
         return self._step_count
 
     def ready(self) -> bool:
@@ -370,33 +496,43 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
     use_generative_value_model: bool = False
     # Generative value model: its own weights + its own vLLM pool.
     gen_value_model_name_or_path: str | None = None
+    gen_value_model_revision: str | None = None
+    # Defaults to the policy tokenizer and revision, but can be overridden for an
+    # independently initialized critic.
+    gen_value_tokenizer_name_or_path: str | None = None
+    gen_value_tokenizer_revision: str | None = None
     gen_value_vllm_num_engines: int = 1
     gen_value_vllm_tensor_parallel_size: int = 1
     # Segmentation: 'sae' uses the policy-logprob-based SAE boundaries (requires --use_sae);
     # 'fixed' queries the gen value model every `gen_value_chunk_size` response tokens.
     gen_value_segmentation: str = "sae"
     gen_value_chunk_size: int = 512
-    # Cap on the number of gen-value queries per rollout (evenly downsampled when exceeded).
+    # Cap on SAE/fixed boundaries before mandatory tool-observation boundaries are added.
+    # Tool transitions may exceed this limit because merging states across an observation
+    # would make the following value non-causal.
     gen_value_max_segments: int = 16
     # Generation params for the gen value model's vLLM engine.
     # Default matches GenAC's "Maximum Critic Response Length" (Table 5): the critic
     # needs enough budget to actually do CoT reasoning before emitting the score.
     gen_value_max_new_tokens: int = 1024
     gen_value_temperature: float = 1.0
+    # vLLM/trainer context length for the generative critic. When unset, use the
+    # critic model's declared maximum. Requests must fit the full prompt and full
+    # gen_value_max_new_tokens budget; neither side is silently shortened.
+    gen_value_max_model_len: int | None = None
     # Score schema.
     gen_value_score_min: float = 0.0
     gen_value_score_max: float = 10.0
     # Training coefficients.
     gen_value_learning_rate: float | None = None
     gen_value_reinforce_coef: float = 0.1
-    gen_value_reinforce_max_prompt_tokens: int = 8192
-    """Maximum prompt tokens kept for gen-value REINFORCE; generated score tokens are always kept."""
+    # Independent critic update cadence. The default critic batch contains the same
+    # number of complete rollouts as one global policy batch, irrespective of policy world size.
+    gen_value_batch_size: int | None = None
     # Conditioning for the gen-value prompt: one of none, gt, correct_demo, rollout_context.
     gen_value_conditioning: str = "none"
-    # How often (in policy steps) to sync REINFORCE-trained gen-value weights back to vLLM.
-    # Default=1 keeps the critic tracking the evolving actor every step (paper's joint-
-    # training regime). Set to 0 to disable sync entirely -- weights stay frozen in vLLM
-    # while REINFORCE gradients are still computed (useful for debugging).
+    # How often (in critic optimizer updates) to publish gen-value weights to vLLM.
+    # Set to 0 to keep the serving critic frozen while its trainer continues updating.
     gen_value_sync_freq: int = 1
 
     def __post_init__(self):
@@ -410,6 +546,10 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
             raise ValueError("--use_generative_value_model requires --use_value_model.")
         if self.gen_value_vllm_num_engines <= 0:
             raise ValueError("--gen_value_vllm_num_engines must be > 0 for generative-value training.")
+        if self.gen_value_vllm_tensor_parallel_size <= 0:
+            raise ValueError(
+                f"--gen_value_vllm_tensor_parallel_size must be > 0, got {self.gen_value_vllm_tensor_parallel_size}."
+            )
         if self.gen_value_segmentation not in {"sae", "fixed"}:
             raise ValueError(
                 f"--gen_value_segmentation must be 'sae' or 'fixed', got {self.gen_value_segmentation!r}."
@@ -420,15 +560,25 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
             )
         if self.gen_value_chunk_size <= 0:
             raise ValueError(f"--gen_value_chunk_size must be > 0, got {self.gen_value_chunk_size}.")
+        if self.gen_value_max_segments <= 0:
+            raise ValueError(f"--gen_value_max_segments must be > 0, got {self.gen_value_max_segments}.")
+        if self.gen_value_max_new_tokens <= 0:
+            raise ValueError(f"--gen_value_max_new_tokens must be > 0, got {self.gen_value_max_new_tokens}.")
+        if self.gen_value_temperature <= 0.0:
+            raise ValueError(f"--gen_value_temperature must be > 0, got {self.gen_value_temperature}.")
+        if self.gen_value_max_model_len is not None and self.gen_value_max_model_len <= self.gen_value_max_new_tokens:
+            raise ValueError(
+                "--gen_value_max_model_len must be greater than --gen_value_max_new_tokens "
+                f"({self.gen_value_max_model_len} <= {self.gen_value_max_new_tokens})."
+            )
         if self.gen_value_score_max <= self.gen_value_score_min:
             raise ValueError("--gen_value_score_max must be greater than --gen_value_score_min.")
-        if self.gen_value_reinforce_max_prompt_tokens <= 0:
-            raise ValueError(
-                "--gen_value_reinforce_max_prompt_tokens must be > 0, "
-                f"got {self.gen_value_reinforce_max_prompt_tokens}."
-            )
         if self.gen_value_reinforce_coef < 0:
             raise ValueError(f"--gen_value_reinforce_coef must be >= 0, got {self.gen_value_reinforce_coef}.")
+        if self.gen_value_learning_rate is not None and self.gen_value_learning_rate <= 0.0:
+            raise ValueError(f"--gen_value_learning_rate must be > 0, got {self.gen_value_learning_rate}.")
+        if self.gen_value_batch_size is not None and self.gen_value_batch_size <= 0:
+            raise ValueError(f"--gen_value_batch_size must be > 0, got {self.gen_value_batch_size}.")
         if self.gen_value_sync_freq < 0:
             raise ValueError(f"--gen_value_sync_freq must be >= 0, got {self.gen_value_sync_freq}.")
         if self.gen_value_conditioning not in value_model_utils.GEN_VALUE_CONDITIONING_TYPES:
@@ -439,22 +589,42 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
             )
 
 
+def _resolve_gen_value_tokenizer(args: GenValueExperimentConfig, tc: TokenizerConfig) -> tuple[str, str | None]:
+    """Default to the policy tokenizer, or use a fully independent tokenizer override."""
+    tokenizer_path = args.gen_value_tokenizer_name_or_path or tc.tokenizer_name_or_path
+    if tokenizer_path is None:
+        raise ValueError("The policy or generative critic tokenizer path must be configured.")
+    if args.gen_value_tokenizer_name_or_path is None:
+        tokenizer_revision = args.gen_value_tokenizer_revision or tc.tokenizer_revision
+    else:
+        # A different repository must not inherit a revision belonging to the
+        # policy tokenizer. None intentionally means that repository's default.
+        tokenizer_revision = args.gen_value_tokenizer_revision
+    return tokenizer_path, tokenizer_revision
+
+
+def _resolve_gen_value_model(args: GenValueExperimentConfig, model_config: ModelConfig) -> tuple[str, str | None]:
+    """Default to the policy model and revision, or use an independent critic override."""
+    model_path = args.gen_value_model_name_or_path or model_config.model_name_or_path
+    if args.gen_value_model_revision is not None:
+        model_revision = args.gen_value_model_revision
+    elif args.gen_value_model_name_or_path is None:
+        model_revision = model_config.model_revision
+    else:
+        # A different repository must not inherit a revision belonging to the policy model.
+        model_revision = None
+    return model_path, model_revision
+
+
 def score_partial_rollout_batch(
-    vllm_engines,
-    tokenizer,
-    prompts: list[str],
-    *,
-    max_new_tokens: int,
-    temperature: float,
-    score_min: float,
-    score_max: float,
+    vllm_engines, prompts: list[str], *, max_new_tokens: int, temperature: float, score_min: float, score_max: float
 ) -> tuple[list[float | None], list[str]]:
     """Send a batch of partial-rollout scoring prompts to the gen-value vLLM pool.
 
     Returns (parsed_scores_in_0_1, raw_generations). Parse failures are reported as ``None`` in
-    the returned list so callers can track ``parse_rate`` as a metric; downstream consumers that
-    need a numeric value should substitute ``0.0`` to match the in-graph gen-value scorer and the
-    REINFORCE trainer's handling of parse failures.
+    the returned list so callers can track ``parse_rate`` as a metric. The in-graph value scorer
+    substitutes ``0.0`` because GAE needs a numeric value, while REINFORCE assigns malformed
+    generations reward zero.
     """
     n_eng = len(vllm_engines)
     buckets: list[list[tuple[int, str]]] = [[] for _ in range(n_eng)]
@@ -462,21 +632,30 @@ def score_partial_rollout_batch(
         buckets[k % n_eng].append((k, prompt))
     non_empty = [(e, b) for e, b in enumerate(buckets) if b]
     refs = [
-        vllm_engines[e].generate_completions.remote(
+        vllm_engines[e].generate_request_outputs.remote(
             [p for _, p in bucket],
             temperature=temperature,
             max_tokens=max_new_tokens,
             top_p=1.0,
             stop=["</answer>"],
             include_stop_str_in_output=True,
+            allow_prompt_truncation=False,
         )
         for e, bucket in non_empty
     ]
-    engine_results = ray.get(refs)
+    engine_results, _ = utils.ray_get_with_progress(
+        refs,
+        desc="Scoring generative critic diagnostics",
+        enable=False,
+        timeout=_GEN_VALUE_OPERATION_TIMEOUT_S,
+        health_check_fn=lambda: _check_gen_value_engines(vllm_engines),
+    )
     raw: list[str] = [""] * len(prompts)
-    for (_, bucket), bucket_texts in zip(non_empty, engine_results):
-        for (k, _), text in zip(bucket, bucket_texts):
-            raw[k] = text
+    for (_, bucket), bucket_outputs in zip(non_empty, engine_results):
+        for (k, _), request_output in zip(bucket, bucket_outputs):
+            if len(request_output.outputs) != 1 or request_output.outputs[0].text is None:
+                raise RuntimeError("Generative-value scoring requires exactly one completion with generated text.")
+            raw[k] = request_output.outputs[0].text
 
     scores: list[float | None] = []
     for text in raw:
@@ -486,11 +665,6 @@ def score_partial_rollout_batch(
         else:
             scores.append(value_model_utils.rescale_gen_value_score(parsed, score_min, score_max))
     return scores, raw
-
-
-def _get_gen_value_max_model_len(streaming_config: Any, args: Any) -> int:
-    """Reserve context for gen-value scoring prompts plus the critic's answer."""
-    return streaming_config.pack_length * 4 + args.gen_value_max_new_tokens
 
 
 def _build_sample_scoring_prompts(
@@ -522,10 +696,96 @@ def _build_sample_scoring_prompts(
 
 def _put_gen_value_metrics(metrics_Q: Queue, metrics: dict[str, Any], source: str) -> None:
     """Send background-thread metrics through the main training step for aligned W&B logging."""
-    try:
-        metrics_Q.put_nowait(metrics)
-    except Full:
-        logger.warning("[GenValue] metrics queue full, dropping %s metrics", source)
+    metrics_Q.put_nowait({"_gen_value_metric_source": source, **metrics})
+
+
+def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
+    """Drain and aggregate every critic update emitted since the previous policy log.
+
+    State metrics keep their latest value. Batch counters are summed, ranges span all
+    updates, and means use their true example/token denominators.
+    """
+    emitted: list[dict[str, Any]] = []
+    while True:
+        try:
+            emitted.append(metrics_Q.get_nowait())
+        except queue_lib.Empty:
+            break
+    if not emitted:
+        return {}
+
+    merged: dict[str, Any] = {}
+    reinforce_updates: list[dict[str, Any]] = []
+    for item in emitted:
+        item = dict(item)
+        source = item.pop("_gen_value_metric_source", None)
+        merged.update(item)
+        if source == "REINFORCE":
+            reinforce_updates.append(item)
+
+    if not reinforce_updates:
+        return merged
+
+    def weighted_mean(metric: str, weight: str) -> float | None:
+        numerator = 0.0
+        denominator = 0.0
+        for update in reinforce_updates:
+            value = update.get(metric)
+            count = float(update.get(weight, 0.0))
+            if isinstance(value, int | float) and math.isfinite(float(value)) and count > 0.0:
+                numerator += float(value) * count
+                denominator += count
+        return numerator / denominator if denominator > 0.0 else None
+
+    weighted_metrics = {
+        "gen_value/reinforce_loss": "gen_value/train_tokens",
+        "gen_value/grad_norm": "gen_value/train_tokens",
+        "gen_value/reward_mean": "gen_value/train_examples",
+        "gen_value/outcome_mean": "gen_value/train_examples",
+        "gen_value/parse_rate": "gen_value/train_examples",
+        "gen_value/mse": "gen_value/parsed_examples",
+        "gen_value/v_hat_mean": "gen_value/parsed_examples",
+        "gen_value/tis_ratio": "gen_value/tis_tokens",
+        "gen_value/tis_clipfrac": "gen_value/tis_tokens",
+        "gen_value/tis_mask_frac_kept": "gen_value/tis_mask_tokens",
+    }
+    for metric, weight in weighted_metrics.items():
+        mean = weighted_mean(metric, weight)
+        if mean is not None:
+            merged[metric] = mean
+
+    summed_metrics = {
+        "gen_value/batch_rollouts",
+        "gen_value/batch_pairs",
+        "gen_value/batch_tokens",
+        "gen_value/batch_sequence_tokens",
+        "gen_value/train_tokens",
+        "gen_value/train_examples",
+        "gen_value/parsed_examples",
+        "gen_value/tis_tokens",
+        "gen_value/tis_mask_tokens",
+        "gen_value/skipped_empty_generation",
+        "gen_value/update_skipped",
+    }
+    for metric in summed_metrics:
+        values = [float(update[metric]) for update in reinforce_updates if metric in update]
+        if values:
+            merged[metric] = sum(values)
+
+    for prefix in ("gen_value/source_policy_training_step", "gen_value/source_value_version"):
+        minima = [float(update[f"{prefix}_min"]) for update in reinforce_updates if f"{prefix}_min" in update]
+        maxima = [float(update[f"{prefix}_max"]) for update in reinforce_updates if f"{prefix}_max" in update]
+        if minima and maxima:
+            merged[f"{prefix}_min"] = min(minima)
+            merged[f"{prefix}_max"] = max(maxima)
+            merged[f"{prefix}_spread"] = max(maxima) - min(minima)
+
+    for suffix, reducer in (("min", min), ("max", max)):
+        metric = f"gen_value/source_value_lag_{suffix}"
+        values = [float(update[metric]) for update in reinforce_updates if metric in update]
+        if values:
+            merged[metric] = reducer(values)
+    return merged
 
 
 def _gen_value_scoring_loop(
@@ -537,14 +797,15 @@ def _gen_value_scoring_loop(
     stop_event: threading.Event,
     engines_lock: threading.Lock,
     metrics_Q: Queue,
+    progress_state: dict[str, Any],
+    progress_lock: threading.Lock,
     ground_truths_key: str = "ground_truth",
 ) -> None:
     """Background thread: after each policy training step, score sample prompts with the gen-value
     pool and log ``gen_value/score_mean`` and ``gen_value/parse_rate`` to W&B.
 
-    ``engines_lock`` serialises engine use with ``_sync_gen_value_weights`` so a weight sync
-    can't put an engine to sleep while this thread has a ``generate_completions`` in flight
-    (the resulting deadlock is visible as a hang in ``engine.wake_up``).
+    The local engine lock serializes this optional diagnostic with weight publication.
+    Policy scoring itself is complete before publication is considered.
     """
     logger.info("[GenValue] Scoring thread started.")
     while not stop_event.is_set():
@@ -559,9 +820,10 @@ def _gen_value_scoring_loop(
                 args, tokenizer, train_dataset, _GEN_VALUE_SAMPLE_SIZE, ground_truths_key
             )
             with engines_lock:
+                with progress_lock:
+                    critic_version = progress_state["synced_version"]
                 scores, _ = score_partial_rollout_batch(
                     gen_value_vllm_engines,
-                    tokenizer,
                     prompts,
                     max_new_tokens=args.gen_value_max_new_tokens,
                     temperature=args.gen_value_temperature,
@@ -572,6 +834,7 @@ def _gen_value_scoring_loop(
             score_metrics = {
                 "gen_value/score_mean": sum(valid) / len(valid) if valid else float("nan"),
                 "gen_value/score_parse_rate": len(valid) / len(scores) if scores else 0.0,
+                "gen_value/score_version": critic_version,
             }
             _put_gen_value_metrics(metrics_Q, score_metrics, "scoring")
             logger.debug(
@@ -581,61 +844,112 @@ def _gen_value_scoring_loop(
                 score_metrics["gen_value/score_parse_rate"],
             )
         except Exception:
-            logger.exception("[GenValue] scoring failed for this step, continuing")
+            logger.exception("[GenValue] scoring failed")
+            raise
     logger.info("[GenValue] Scoring thread stopped.")
 
 
 def _gen_value_reinforce_loop(
     trainer_actor: Any,
-    training_queue: Any,
+    training_queue: ray_queue.Queue,
+    batch_size: int,
     stop_event: threading.Event,
     metrics_Q: Queue,
-    progress_state: dict[str, int],
+    progress_state: dict[str, Any],
     progress_lock: threading.Lock,
 ) -> None:
-    """Background thread: drain the training-pairs queue and call ``GenValueTrainerActor.reinforce_step``.
+    """Pipe queued rollouts into fixed-size critic batches and update asynchronously."""
+    logger.info("[GenValue] asynchronous critic trainer started.")
+    pending_rollouts: deque[dict[str, Any]] = deque()
+    admitted_rollouts = 0
+    trained_rollouts = 0
 
-    Training pairs are produced by ``PolicyTrainerRayProcess.step()`` during injection; each pair
-    contains a gen-value scoring prompt, the text generated by the gen-value vLLM, and the actual
-    rollout outcome.  The REINFORCE gradient update runs on a dedicated GPU inside
-    ``GenValueTrainerActor``.
-    """
-    logger.info("[GenValue] REINFORCE thread started.")
-    while not stop_event.is_set():
+    while True:
         try:
-            # ray.util.queue.Queue.get is a regular sync method that blocks up
-            # to `timeout` seconds and raises queue.Empty on timeout. The
-            # previous `training_queue.get.remote(timeout=1.0)` raised
-            # AttributeError (no .remote on a bound method) and was swallowed
-            # by the bare `except Exception`, so this thread was spinning
-            # without ever consuming a pair.
-            batch = training_queue.get(timeout=1.0)
+            published_rollouts = training_queue.get(timeout=0.1)
         except queue_lib.Empty:
+            if stop_event.is_set():
+                break
+            with progress_lock:
+                progress_state["training_queue_size"] = training_queue.qsize()
+                progress_state["pending_rollouts"] = len(pending_rollouts)
             continue
-        if batch is None:
-            continue
-        if isinstance(batch, dict):
-            pairs = batch.get("pairs", [])
-            policy_step = batch.get("policy_step")
-            producer_rank = batch.get("producer_rank")
-        else:
-            pairs = batch
-            policy_step = None
-            producer_rank = None
-        metrics = ray.get(
-            trainer_actor.reinforce_step.remote(pairs, policy_step=policy_step, producer_rank=producer_rank)
-        )
-        with progress_lock:
-            progress_state["reinforce_steps"] = int(metrics.get("gen_value/reinforce_steps", 0))
-            progress_state["latest_trained_policy_step"] = int(metrics.get("gen_value/latest_trained_policy_step", 0))
-        if metrics:
+        pending_rollouts.extend(published_rollouts)
+        admitted_rollouts += len(published_rollouts)
+
+        while len(pending_rollouts) >= batch_size:
+            rollouts = [pending_rollouts.popleft() for _ in range(batch_size)]
+            trained_rollouts += len(rollouts)
+
+            pairs = [pair for rollout in rollouts for pair in rollout["pairs"]]
+            policy_training_steps = [int(rollout["policy_training_step"]) for rollout in rollouts]
+            source_versions = [int(rollout["critic_version"]) for rollout in rollouts]
+            batch_sequence_tokens = sum(
+                len(pair["request_output"].prompt_token_ids)
+                + sum(len(completion.token_ids) for completion in pair["request_output"].outputs)
+                for pair in pairs
+            )
+            batch_response_tokens = sum(
+                sum(len(completion.token_ids) for completion in pair["request_output"].outputs) for pair in pairs
+            )
+            metrics, _ = utils.ray_get_with_progress(
+                [trainer_actor.reinforce_step.remote(pairs)],
+                desc="Training generative critic",
+                enable=False,
+                timeout=_GEN_VALUE_OPERATION_TIMEOUT_S,
+            )
+            metrics = metrics[0]
+            critic_version = int(metrics["gen_value/version"])
+            with progress_lock:
+                synced_version = progress_state["synced_version"]
+                progress_state["version"] = critic_version
+                latest_source_step = progress_state["latest_source_policy_training_step"]
+                progress_state["latest_source_policy_training_step"] = (
+                    max(policy_training_steps)
+                    if latest_source_step is None
+                    else max(latest_source_step, max(policy_training_steps))
+                )
+                progress_state["training_queue_size"] = training_queue.qsize()
+                progress_state["pending_rollouts"] = len(pending_rollouts)
+                progress_state["admitted_rollouts"] = admitted_rollouts
+                progress_state["trained_rollouts"] = trained_rollouts
+            metrics.update(
+                {
+                    "gen_value/source_policy_training_step_min": min(policy_training_steps),
+                    "gen_value/source_policy_training_step_max": max(policy_training_steps),
+                    "gen_value/source_policy_training_step_spread": max(policy_training_steps)
+                    - min(policy_training_steps),
+                    "gen_value/source_value_version_min": min(source_versions),
+                    "gen_value/source_value_version_max": max(source_versions),
+                    "gen_value/source_value_version_spread": max(source_versions) - min(source_versions),
+                    "gen_value/source_value_lag_min": max(critic_version - max(source_versions), 0),
+                    "gen_value/source_value_lag_max": max(critic_version - min(source_versions), 0),
+                    "gen_value/batch_rollouts": len(rollouts),
+                    "gen_value/batch_pairs": len(pairs),
+                    "gen_value/batch_tokens": batch_response_tokens,
+                    "gen_value/batch_sequence_tokens": batch_sequence_tokens,
+                    "gen_value/training_queue_size": training_queue.qsize(),
+                    "gen_value/pending_rollouts": len(pending_rollouts),
+                    "gen_value/admitted_rollouts": admitted_rollouts,
+                    "gen_value/trained_rollouts": trained_rollouts,
+                    "gen_value/synced_version": synced_version,
+                    "gen_value/serving_version_lag": max(critic_version - synced_version, 0),
+                }
+            )
             _put_gen_value_metrics(metrics_Q, metrics, "REINFORCE")
-        logger.debug("[GenValue] REINFORCE step: %s", metrics)
-    logger.info("[GenValue] REINFORCE thread stopped.")
+            logger.debug("[GenValue] REINFORCE step: %s", metrics)
+
+    with progress_lock:
+        progress_state["training_queue_size"] = training_queue.qsize()
+        progress_state["pending_rollouts"] = len(pending_rollouts)
+    logger.info("[GenValue] asynchronous critic trainer stopped.")
 
 
 def _sync_gen_value_weights(
-    gen_value_trainer: Any, gen_value_vllm_engines: list, model_step: int, engines_lock: threading.Lock
+    gen_value_trainer: Any,
+    gen_value_vllm_engines: list,
+    engines_lock: threading.Lock,
+    health_check_fn: Callable[[], None] | None = None,
 ) -> dict[str, float]:
     """Push updated gen-value weights to the gen-value vLLM pool over NCCL.
 
@@ -644,33 +958,72 @@ def _sync_gen_value_weights(
     trainer streams parameters over the NCCL group established at startup,
     and the engines are woken back up here.
 
-    ``engines_lock`` is held for the duration of the sync so the diagnostic
-    scoring thread cannot have a ``generate_completions`` in flight against
-    a sleeping engine -- otherwise ``engine.wake_up()`` deadlocks behind the
-    in-flight request on vLLM's single asyncio loop.
+    Callers invoke this only between distributed policy steps. The local lock
+    additionally keeps diagnostic scoring from overlapping the publication.
     """
     if not gen_value_vllm_engines:
         return {}
-    logger.debug("[GenValue] Syncing weights at model_step=%d.", model_step)
+    started_at = time.perf_counter()
 
-    with engines_lock:
-        sync_result = ray.get(gen_value_trainer.broadcast_to_vllm.remote(model_step))
-        engine_refs = sync_result["engine_refs"]
-        if engine_refs:
-            ray.get(engine_refs)
-        ray.get([engine.wake_up.remote() for engine in gen_value_vllm_engines])
+    def check_health() -> None:
+        _check_gen_value_engines(gen_value_vllm_engines)
+        if health_check_fn is not None:
+            health_check_fn()
 
-    latest_trained_step = int(sync_result["latest_trained_policy_step"])
+    lock_deadline = started_at + _GEN_VALUE_OPERATION_TIMEOUT_S
+    while not engines_lock.acquire(timeout=1.0):
+        check_health()
+        if time.perf_counter() >= lock_deadline:
+            raise TimeoutError("Timed out waiting for generative critic scoring before weight sync.")
+
+    try:
+        transfer_error: BaseException | None = None
+        try:
+            sync_results, _ = utils.ray_get_with_progress(
+                [gen_value_trainer.broadcast_to_vllm.remote()],
+                desc="Broadcasting generative critic weights",
+                enable=False,
+                timeout=_GEN_VALUE_OPERATION_TIMEOUT_S,
+                health_check_fn=check_health,
+            )
+            sync_result = sync_results[0]
+            engine_refs = sync_result["engine_refs"]
+            if engine_refs:
+                utils.ray_get_with_progress(
+                    engine_refs,
+                    desc="Loading generative critic weights",
+                    enable=False,
+                    timeout=_GEN_VALUE_OPERATION_TIMEOUT_S,
+                    health_check_fn=check_health,
+                )
+            synced_version = int(sync_result["version"])
+        except BaseException as error:
+            transfer_error = error
+            raise
+        finally:
+            try:
+                utils.ray_get_with_progress(
+                    [engine.wake_up.remote() for engine in gen_value_vllm_engines],
+                    desc="Waking generative critic vLLM engines",
+                    enable=False,
+                    timeout=_GEN_VALUE_HEALTH_TIMEOUT_S,
+                )
+            except Exception:
+                if transfer_error is None:
+                    raise
+                logger.exception("[GenValue] Failed to wake critic vLLM engines after a failed weight transfer.")
+    finally:
+        engines_lock.release()
+
     logger.debug(
-        "[GenValue] Weight sync complete (%d engine(s), latest trained policy step=%d).",
+        "[GenValue] Weight sync complete (%d engine(s), critic version=%d).",
         len(gen_value_vllm_engines),
-        latest_trained_step,
+        synced_version,
     )
     return {
-        "gen_value/latest_synced_policy_step": latest_trained_step,
-        "gen_value/training_lag": float(max(0, model_step - latest_trained_step)),
-        "gen_value/serving_lag": float(max(0, model_step - latest_trained_step)),
-        "gen_value/synced_reinforce_steps": float(sync_result["reinforce_steps"]),
+        "gen_value/synced_version": synced_version,
+        "gen_value/evaluator_version": synced_version,
+        "gen_value/weight_sync_seconds": time.perf_counter() - started_at,
     }
 
 
@@ -728,15 +1081,23 @@ def main():
 
     # ── Step 1: mirror grpo_fast.main() pre-ray setup ─────────────────────────
     tokenizer = _grpo_fast.make_tokenizer(tc, model_config)
+    gen_value_model_path, gen_value_model_revision = _resolve_gen_value_model(args, model_config)
+    gen_value_tokenizer_path, gen_value_tokenizer_revision = _resolve_gen_value_tokenizer(args, tc)
     args = _grpo_fast.setup_runtime_variables(args, streaming_config, tools_config)
     _grpo_fast.validate_configs(
         streaming_config, vllm_config, tuple(args.num_learners_per_node), args.sequence_parallel_size
     )
+    default_gen_value_batch_size = (
+        streaming_config.num_unique_prompts_rollout * streaming_config.num_samples_per_prompt_rollout
+    )
+    gen_value_batch_size = args.gen_value_batch_size or default_gen_value_batch_size
+    args.gen_value_batch_size = gen_value_batch_size
 
     if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-        for handler in logging.getLogger().handlers:
-            handler.setLevel(logging.DEBUG)
+        root_logger = logger_utils.setup_logger()
+        root_logger.setLevel("DEBUG")
+        for handler in root_logger.handlers:
+            handler.setLevel("DEBUG")
 
     beaker_config, wandb_url = _grpo_fast.setup_experiment_tracking(
         args, tc, model_config, streaming_config, vllm_config
@@ -789,8 +1150,13 @@ def main():
     utils.ensure_hf_repo_cached(model_config.model_name_or_path, revision=model_config.model_revision)
     if tc.tokenizer_name_or_path and tc.tokenizer_name_or_path != model_config.model_name_or_path:
         utils.ensure_hf_repo_cached(tc.tokenizer_name_or_path, revision=tc.tokenizer_revision)
-    if args.gen_value_model_name_or_path:
-        utils.ensure_hf_repo_cached(args.gen_value_model_name_or_path)
+    if (
+        gen_value_model_path != model_config.model_name_or_path
+        or gen_value_model_revision != model_config.model_revision
+    ):
+        utils.ensure_hf_repo_cached(gen_value_model_path, revision=gen_value_model_revision)
+    if gen_value_tokenizer_path != tc.tokenizer_name_or_path or gen_value_tokenizer_revision != tc.tokenizer_revision:
+        utils.ensure_hf_repo_cached(gen_value_tokenizer_path, revision=gen_value_tokenizer_revision)
 
     # ── Step 3: create policy model, optimizer, and policy vLLM pool ──────────
     num_eval_prompts = len(eval_dataset) if eval_dataset is not None else 0
@@ -860,13 +1226,11 @@ def main():
 
     # ── Step 4: create gen-value vLLM pool ────────────────────────────────────
     gen_value_vllm_engines: list = []
-    gen_value_model_path = args.gen_value_model_name_or_path or model_config.model_name_or_path
 
     if args.gen_value_vllm_num_engines > 0:
         # The gen-value engines are queried directly via score_partial_rollout_batch(); they do
         # not participate in the queue-driven rollout loop.  We pass sentinel Ray queues so the
         # LLMRayActor's internal prefetch thread doesn't crash (it blocks on an empty queue).
-        gen_value_max_model_len = _get_gen_value_max_model_len(streaming_config, args)
         gen_value_prompt_Q: ray_queue.Queue = ray_queue.Queue()
         gen_value_results_Q: ray_queue.Queue = ray_queue.Queue()
         gen_value_eval_Q: ray_queue.Queue = ray_queue.Queue()
@@ -875,13 +1239,12 @@ def main():
             args.gen_value_vllm_num_engines,
             args.gen_value_vllm_tensor_parallel_size,
             vllm_config.vllm_enforce_eager,
-            tc.tokenizer_name_or_path or gen_value_model_path,
+            gen_value_tokenizer_path,
             gen_value_model_path,
-            # Reuse policy model revision only when gen_value_model_name_or_path is unset.
-            model_config.model_revision if not args.gen_value_model_name_or_path else None,
+            gen_value_model_revision,
             args.seed,
             False,  # no prefix caching for value scoring
-            gen_value_max_model_len,
+            args.gen_value_max_model_len,
             vllm_config.vllm_gpu_memory_utilization,
             False,  # gen-value pool never shares GPU with learners
             pg=None,
@@ -902,11 +1265,34 @@ def main():
             eval_dataset=None,
             vllm_attention_backend=vllm_config.vllm_attention_backend,
             vllm_gdn_prefill_backend=vllm_config.vllm_gdn_prefill_backend,
+            tokenizer_revision=gen_value_tokenizer_revision,
         )
+        utils.ray_get_with_progress(
+            [engine.ready.remote() for engine in gen_value_vllm_engines],
+            desc="Waiting for generative critic vLLM engines",
+            timeout=300,
+        )
+        context_limits, _ = utils.ray_get_with_progress(
+            [engine.get_max_model_len.remote() for engine in gen_value_vllm_engines],
+            desc="Reading generative critic context limits",
+            enable=False,
+            timeout=_GEN_VALUE_HEALTH_TIMEOUT_S,
+        )
+        context_limits = [int(limit) for limit in context_limits]
+        if len(set(context_limits)) != 1:
+            raise RuntimeError(f"Generative critic vLLM engines disagree on context limits: {context_limits}.")
+        gen_value_max_model_len = context_limits[0]
+        if gen_value_max_model_len <= args.gen_value_max_new_tokens:
+            raise ValueError(
+                "The effective generative critic context must be greater than its completion budget "
+                f"({gen_value_max_model_len} <= {args.gen_value_max_new_tokens})."
+            )
+        _check_gen_value_engines(gen_value_vllm_engines)
         logger.info(
-            "======== ✅ Gen-value vLLM pool ready (%d engine(s), model=%s) =========",
+            "======== ✅ Gen-value vLLM pool ready (%d engine(s), model=%s, max_model_len=%d) =========",
             len(gen_value_vllm_engines),
             gen_value_model_path,
+            gen_value_max_model_len,
         )
     else:
         logger.warning(
@@ -916,34 +1302,68 @@ def main():
 
     # ── Step 4a: gen-value trainer actor + injection wiring ───────────────────
     # When gen-value vLLM engines are available we also spin up a GenValueTrainerActor that
-    # holds a PyTorch copy of the gen-value model for REINFORCE gradient updates.  The training
-    # pairs are produced by PolicyTrainerRayProcess.step() (injection path) and pushed into
-    # gen_value_training_queue; a background REINFORCE thread drains that queue and calls
-    # GenValueTrainerActor.reinforce_step().
+    # holds a DeepSpeed-wrapped copy of the gen-value model for REINFORCE gradient updates. Complete
+    # rollouts flow through one bounded queue; the critic consumes fixed batches independently
+    # of policy steps and policy world size.
     gen_value_trainer: Any = None
-    gen_value_training_queue: Any = None
-    gen_value_checkpoint_file: str | None = None
+    gen_value_training_queue: ray_queue.Queue | None = None
+    gen_value_checkpoint_path: str | None = None
+    gen_value_checkpoint_tag: str | None = None
+    initial_gen_value_version = 0
+    initial_synced_version = 0
+    gen_value_engines_lock = threading.Lock()
 
     if gen_value_vllm_engines:
         gv_lr = args.gen_value_learning_rate or 1e-6
-        if checkpoint_state and checkpoint_state.get("gen_value_trainer_saved", False):
-            gen_value_checkpoint_file = checkpoint_state.get("gen_value_trainer_checkpoint")
-            if not gen_value_checkpoint_file:
-                raise ValueError("Checkpoint says the generative-value trainer was saved, but no path was recorded.")
-            if not os.path.isabs(gen_value_checkpoint_file):
-                gen_value_checkpoint_file = os.path.join(args.checkpoint_state_dir, gen_value_checkpoint_file)
+        if checkpoint_state:
+            if not checkpoint_state.get("gen_value_trainer_saved", False):
+                raise ValueError(
+                    "Cannot resume generative-value training because the policy checkpoint does not contain a "
+                    "generative-value trainer checkpoint. Start a new run from the policy weights instead of "
+                    "resuming partial optimizer state."
+                )
+            gen_value_checkpoint_path = checkpoint_state.get("gen_value_trainer_checkpoint")
+            gen_value_checkpoint_tag = checkpoint_state.get("gen_value_trainer_checkpoint_tag")
+            if not gen_value_checkpoint_path or not gen_value_checkpoint_tag:
+                raise ValueError(
+                    "Checkpoint says the generative-value trainer was saved, but its DeepSpeed path or tag "
+                    "was not recorded."
+                )
+            if not os.path.isabs(gen_value_checkpoint_path):
+                gen_value_checkpoint_path = os.path.join(args.checkpoint_state_dir, gen_value_checkpoint_path)
+            if not os.path.isdir(os.path.join(gen_value_checkpoint_path, gen_value_checkpoint_tag)):
+                raise ValueError(
+                    "Generative-value trainer checkpoint is missing: "
+                    f"{gen_value_checkpoint_path}/{gen_value_checkpoint_tag}"
+                )
         gen_value_trainer = GenValueTrainerActor.remote(
             gen_value_model_path,
+            gen_value_model_revision,
+            gen_value_tokenizer_path,
+            gen_value_tokenizer_revision,
             gv_lr,
             args.gen_value_score_min,
             args.gen_value_score_max,
             tensor_parallel_size=args.gen_value_vllm_tensor_parallel_size,
-            max_prompt_tokens=args.gen_value_reinforce_max_prompt_tokens,
+            max_sequence_tokens=gen_value_max_model_len,
+            temperature=args.gen_value_temperature,
+            truncated_importance_sampling_ratio_cap=args.truncated_importance_sampling_ratio_cap,
+            tis_mask_lower=args.tis_mask_lower,
+            tis_mask_upper=args.tis_mask_upper,
             reinforce_coef=args.gen_value_reinforce_coef,
-            expected_producers=args.world_size,
-            checkpoint_file=gen_value_checkpoint_file,
+            weight_decay=args.weight_decay,
+            set_weight_decay_on_bias_and_norm=args.set_weight_decay_on_bias_and_norm,
+            fused_optimizer=args.fused_optimizer,
+            max_grad_norm=args.max_grad_norm if args.max_grad_norm is not None else 0.0,
+            checkpoint_path=gen_value_checkpoint_path,
+            checkpoint_tag=gen_value_checkpoint_tag,
         )
-        ray.get(gen_value_trainer.ready.remote())
+        ready_results, _ = utils.ray_get_with_progress(
+            [gen_value_trainer.ready.remote(), gen_value_trainer.get_version.remote()],
+            desc="Starting generative critic trainer",
+            timeout=_GEN_VALUE_OPERATION_TIMEOUT_S,
+        )
+        initial_gen_value_version = int(ready_results[1])
         logger.info("======== ✅ Gen-value trainer actor ready (lr=%.2e) =========", gv_lr)
 
         # Establish the NCCL weight-transfer group between the trainer actor and the
@@ -951,147 +1371,230 @@ def main():
         # side (see grpo_fast.PolicyTrainerRayProcess) so we can push weights
         # in-place instead of killing and recreating engines.
         if args.gen_value_sync_freq > 0:
-            ray.get(gen_value_trainer.setup_model_update_group.remote(gen_value_vllm_engines))
+            utils.ray_get_with_progress(
+                [gen_value_trainer.setup_model_update_group.remote(gen_value_vllm_engines)],
+                desc="Setting up generative critic weight transfer",
+                timeout=_GEN_VALUE_OPERATION_TIMEOUT_S,
+                health_check_fn=lambda: _check_gen_value_engines(gen_value_vllm_engines),
+            )
             logger.info("======== ✅ Gen-value NCCL weight-transfer group initialised =========")
-            if gen_value_checkpoint_file is not None:
-                restored_step = int(checkpoint_state.get("gen_value_latest_trained_policy_step", 0))
-                sync_result = ray.get(gen_value_trainer.broadcast_to_vllm.remote(restored_step))
-                if sync_result["engine_refs"]:
-                    ray.get(sync_result["engine_refs"])
-                ray.get([engine.wake_up.remote() for engine in gen_value_vllm_engines])
+            if gen_value_checkpoint_path is not None:
+                sync_metrics = _sync_gen_value_weights(
+                    gen_value_trainer, gen_value_vllm_engines, gen_value_engines_lock
+                )
+                initial_synced_version = int(sync_metrics["gen_value/synced_version"])
                 logger.info(
-                    "======== ✅ Restored gen-value weights published at policy step %d =========", restored_step
+                    "======== ✅ Restored gen-value weights published at critic version %d =========",
+                    initial_synced_version,
                 )
 
-        gen_value_training_queue = ray_queue.Queue(maxsize=200)
+        queue_capacity = max(args.world_size * max(streaming_config.async_steps, 1), args.world_size)
+        gen_value_training_queue = ray_queue.Queue(maxsize=queue_capacity)
 
-        # Wire gen-value engines and the training queue into each policy actor.
-        ray.get([a.set_gen_value_engines.remote(gen_value_vllm_engines) for a in policy_group.models])
-        ray.get([a.set_gen_value_training_queue.remote(gen_value_training_queue) for a in policy_group.models])
+        utils.ray_get_with_progress(
+            [a.set_gen_value_engines.remote(gen_value_vllm_engines) for a in policy_group.models],
+            desc="Wiring generative critic engines to policy trainers",
+            timeout=_GEN_VALUE_OPERATION_TIMEOUT_S,
+            health_check_fn=lambda: _check_gen_value_engines(gen_value_vllm_engines),
+        )
+        utils.ray_get_with_progress(
+            [a.set_gen_value_training_queue.remote(gen_value_training_queue) for a in policy_group.models]
+            + [a.set_gen_value_version.remote(initial_synced_version) for a in policy_group.models],
+            desc="Wiring generative critic training state",
+            timeout=_GEN_VALUE_OPERATION_TIMEOUT_S,
+            health_check_fn=lambda: _check_gen_value_engines(gen_value_vllm_engines),
+        )
         logger.info(
-            "Gen-value injection wired: %d engine(s) → %d policy actor(s).",
+            "Gen-value injection wired: %d engine(s), critic batch=%d, queue capacity=%d → %d policy actor(s).",
             len(gen_value_vllm_engines),
+            gen_value_batch_size,
+            queue_capacity,
             len(policy_group.models),
         )
 
     # ── Step 5: background threads (scoring + REINFORCE) ──────────────────────
     gen_value_step_trigger = threading.Event()
     gen_value_stop_event = threading.Event()
-    # Serialises gen-value vLLM engine use between the diagnostic scoring thread
-    # and weight sync (see _sync_gen_value_weights docstring).
-    gen_value_engines_lock = threading.Lock()
     # Cross-thread metrics shuttle: background threads put() per-step metric
     # dicts here; _one_training_step_with_genvalue drains them and merges into
     # data_thread_metrics so they land in the main pretty-print + wandb log.
-    gen_value_metrics_Q: Queue = Queue(maxsize=64)
+    gen_value_metrics_Q: Queue = Queue()
     gen_value_progress_lock = threading.Lock()
-    gen_value_progress_state = {
-        "reinforce_steps": 0,
-        "latest_trained_policy_step": int((checkpoint_state or {}).get("gen_value_latest_trained_policy_step", 0)),
+    gen_value_progress_state: dict[str, Any] = {
+        "version": initial_gen_value_version,
+        "synced_version": initial_synced_version,
+        "latest_source_policy_training_step": None,
+        "training_queue_size": 0,
+        "pending_rollouts": 0,
+        "admitted_rollouts": 0,
+        "trained_rollouts": 0,
     }
-    gen_value_thread: threading.Thread | None = None
+    gen_value_scoring_future: futures.Future | None = None
     gen_value_reinforce_future: futures.Future | None = None
 
-    # Shared executor for training support threads; the REINFORCE future must be
-    # observable from the main loop so trainer failures abort the whole run.
+    # Shared executor for training support threads; both critic futures remain
+    # observable from the main loop so any background failure aborts the run.
     weight_sync_metrics_Q: Queue = Queue(maxsize=streaming_config.async_steps)
     stop_event = threading.Event()
     executor = futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="grpo_genvalue")
 
     if gen_value_vllm_engines:
-        gen_value_thread = threading.Thread(
-            target=_gen_value_scoring_loop,
-            args=(
-                args,
-                tokenizer,
-                train_dataset,
-                gen_value_vllm_engines,
-                gen_value_step_trigger,
-                gen_value_stop_event,
-                gen_value_engines_lock,
-                gen_value_metrics_Q,
-                tc.ground_truths_key,
-            ),
-            daemon=True,
-            name="genvalue-scoring",
+        gen_value_scoring_future = executor.submit(
+            _gen_value_scoring_loop,
+            args,
+            tokenizer,
+            train_dataset,
+            gen_value_vllm_engines,
+            gen_value_step_trigger,
+            gen_value_stop_event,
+            gen_value_engines_lock,
+            gen_value_metrics_Q,
+            gen_value_progress_state,
+            gen_value_progress_lock,
+            tc.ground_truths_key,
         )
-        gen_value_thread.start()
 
         assert gen_value_trainer is not None
         gen_value_reinforce_future = executor.submit(
             _gen_value_reinforce_loop,
             gen_value_trainer,
             gen_value_training_queue,
+            gen_value_batch_size,
             gen_value_stop_event,
             gen_value_metrics_Q,
             gen_value_progress_state,
             gen_value_progress_lock,
         )
 
-    # Wrap one_training_step to fire the scoring trigger and (periodically) sync gen-value weights.
+    # Wrap one_training_step to expose asynchronous critic progress and trigger diagnostics.
     _original_one_training_step = _grpo_fast.one_training_step
-    restored_synced_step = (
-        int((checkpoint_state or {}).get("gen_value_latest_trained_policy_step", 0))
-        if gen_value_checkpoint_file is not None and args.gen_value_sync_freq > 0
-        else 0
-    )
-    _latest_synced_policy_step = [restored_synced_step]
 
-    def _raise_if_gen_value_reinforce_failed() -> None:
-        if gen_value_reinforce_future is not None and gen_value_reinforce_future.done():
-            gen_value_reinforce_future.result()
+    def _raise_if_gen_value_background_failed() -> None:
+        for background_future in (gen_value_scoring_future, gen_value_reinforce_future):
+            if background_future is not None and background_future.done():
+                background_future.result()
+
+    def _wait_for_gen_value_background() -> None:
+        deadline = time.monotonic() + _GEN_VALUE_OPERATION_TIMEOUT_S
+        while any(
+            background_future is not None and not background_future.done()
+            for background_future in (gen_value_scoring_future, gen_value_reinforce_future)
+        ):
+            _raise_if_gen_value_background_failed()
+            _check_gen_value_engines(gen_value_vllm_engines)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Timed out waiting for generative critic background work to stop.")
+            time.sleep(1.0)
+        _raise_if_gen_value_background_failed()
+
+    last_gen_value_engine_health_check = 0.0
 
     def _one_training_step_with_genvalue(*step_args, **step_kwargs):
-        _raise_if_gen_value_reinforce_failed()
+        _raise_if_gen_value_background_failed()
 
-        # Drain any gen-value metrics emitted by the background threads since
-        # the previous step and merge them into data_thread_metrics (positional
-        # arg 4 of grpo_fast.one_training_step, a mutable dict). Main thread
-        # then includes them in the pretty-print and wandb.log(step=training_step).
-        data_thread_metrics = step_args[4] if len(step_args) > 4 else step_kwargs.get("data_thread_metrics")
-        if isinstance(data_thread_metrics, dict):
-            while True:
-                try:
-                    data_thread_metrics.update(gen_value_metrics_Q.get_nowait())
-                except queue_lib.Empty:
-                    break
+        existing_health_check = step_kwargs.get("background_health_check")
 
-        result = _original_one_training_step(*step_args, **step_kwargs)
+        def _combined_health_check() -> None:
+            nonlocal last_gen_value_engine_health_check
+            if existing_health_check is not None:
+                existing_health_check()
+            _raise_if_gen_value_background_failed()
+            now = time.monotonic()
+            if now - last_gen_value_engine_health_check >= 5.0:
+                _check_gen_value_engines(gen_value_vllm_engines)
+                last_gen_value_engine_health_check = now
+
+        step_kwargs["background_health_check"] = _combined_health_check
+        existing_metrics_callback = step_kwargs.get("background_metrics_callback")
+
+        def _combined_metrics_callback() -> dict[str, Any]:
+            metrics = existing_metrics_callback() if existing_metrics_callback is not None else {}
+            metrics.update(_drain_gen_value_metrics(gen_value_metrics_Q))
+            return metrics
+
+        step_kwargs["background_metrics_callback"] = _combined_metrics_callback
         policy_step = int(step_args[6] if len(step_args) > 6 else step_kwargs["training_step"])
-        progress_metrics: dict[str, Any] = {
-            "gen_value/latest_enqueued_policy_step": policy_step,
-            "gen_value/training_queue_size": gen_value_training_queue.qsize()
-            if gen_value_training_queue is not None
-            else 0,
-        }
-        if gen_value_trainer is not None:
-            with gen_value_progress_lock:
-                trainer_progress = dict(gen_value_progress_state)
-            latest_trained_step = int(trainer_progress["latest_trained_policy_step"])
-            progress_metrics.update(
-                {
-                    "gen_value/latest_trained_policy_step": latest_trained_step,
-                    "gen_value/training_lag": float(max(0, policy_step - latest_trained_step)),
-                    "gen_value/reinforce_steps": trainer_progress["reinforce_steps"],
-                }
+
+        existing_post_training_metrics_callback = step_kwargs.get("post_training_metrics_callback")
+
+        def _critic_post_training_metrics_callback() -> dict[str, Any]:
+            progress_metrics = (
+                existing_post_training_metrics_callback()
+                if existing_post_training_metrics_callback is not None
+                else {}
             )
-        # Sync FIRST, then fire the scoring trigger. Scoring needs to run on the
-        # latest weights, and firing before sync risks a generate_completions
-        # in flight when broadcast_weights_to_vllm calls engine.sleep() -- that
-        # deadlocks engine.wake_up() on vLLM's asyncio loop.
-        sync_freq = args.gen_value_sync_freq
-        if sync_freq > 0 and gen_value_trainer is not None and policy_step % sync_freq == 0:
-            sync_metrics = _sync_gen_value_weights(
-                gen_value_trainer, gen_value_vllm_engines, policy_step, gen_value_engines_lock
-            )
-            progress_metrics.update(sync_metrics)
-            _latest_synced_policy_step[0] = int(sync_metrics["gen_value/latest_synced_policy_step"])
-        progress_metrics["gen_value/latest_synced_policy_step"] = _latest_synced_policy_step[0]
-        progress_metrics["gen_value/serving_lag"] = float(max(0, policy_step - _latest_synced_policy_step[0]))
-        _put_gen_value_metrics(gen_value_metrics_Q, progress_metrics, "progress")
-        if gen_value_vllm_engines:
+            if gen_value_trainer is not None:
+                if policy_step >= args.num_training_steps:
+                    # Finish every complete final critic batch before taking the
+                    # final progress snapshot and writing the policy-step metrics.
+                    gen_value_stop_event.set()
+                    gen_value_step_trigger.set()
+                    _wait_for_gen_value_background()
+                with gen_value_progress_lock:
+                    trainer_progress = dict(gen_value_progress_state)
+                critic_version = int(trainer_progress["version"])
+                synced_version = int(trainer_progress["synced_version"])
+
+                # Publish only between policy steps. All learners have completed
+                # critic scoring, so one simple boundary replaces a distributed gate.
+                sync_freq = args.gen_value_sync_freq
+                next_sync_version = (synced_version // sync_freq + 1) * sync_freq if sync_freq > 0 else None
+                if next_sync_version is not None and critic_version >= next_sync_version:
+                    sync_metrics = _sync_gen_value_weights(
+                        gen_value_trainer,
+                        gen_value_vllm_engines,
+                        gen_value_engines_lock,
+                        health_check_fn=_raise_if_gen_value_background_failed,
+                    )
+                    progress_metrics.update(sync_metrics)
+                    synced_version = int(sync_metrics["gen_value/synced_version"])
+                    utils.ray_get_with_progress(
+                        [a.set_gen_value_version.remote(synced_version) for a in policy_group.models],
+                        desc="Publishing generative critic version",
+                        enable=False,
+                        timeout=_GEN_VALUE_OPERATION_TIMEOUT_S,
+                        health_check_fn=_combined_health_check,
+                    )
+                    with gen_value_progress_lock:
+                        gen_value_progress_state["version"] = max(gen_value_progress_state["version"], synced_version)
+                        gen_value_progress_state["synced_version"] = synced_version
+                with gen_value_progress_lock:
+                    trainer_progress = dict(gen_value_progress_state)
+                synced_version = int(trainer_progress["synced_version"])
+
+                progress_metrics.update(
+                    {
+                        "gen_value/version": trainer_progress["version"],
+                        "gen_value/reinforce_steps": trainer_progress["version"],
+                        "gen_value/synced_version": synced_version,
+                        "gen_value/evaluator_version": synced_version,
+                        "gen_value/serving_version_lag": max(trainer_progress["version"] - synced_version, 0),
+                        "gen_value/training_queue_size": gen_value_training_queue.qsize(),
+                        "gen_value/pending_rollouts": trainer_progress["pending_rollouts"],
+                        "gen_value/admitted_rollouts": trainer_progress["admitted_rollouts"],
+                        "gen_value/trained_rollouts": trainer_progress["trained_rollouts"],
+                    }
+                )
+                latest_sampled_policy_training_step = trainer_progress["latest_source_policy_training_step"]
+                if latest_sampled_policy_training_step is not None:
+                    latest_sampled_policy_training_step = int(latest_sampled_policy_training_step)
+                    progress_metrics.update(
+                        {
+                            "gen_value/latest_trained_policy_training_step": latest_sampled_policy_training_step,
+                            "gen_value/policy_training_to_sample_lag": max(
+                                policy_step - latest_sampled_policy_training_step, 0
+                            ),
+                        }
+                    )
+            critic_metrics = _drain_gen_value_metrics(gen_value_metrics_Q)
+            critic_metrics.update(progress_metrics)
+            return critic_metrics
+
+        step_kwargs["post_training_metrics_callback"] = _critic_post_training_metrics_callback
+        result = _original_one_training_step(*step_args, **step_kwargs)
+        if gen_value_vllm_engines and not gen_value_stop_event.is_set():
             gen_value_step_trigger.set()
-        _raise_if_gen_value_reinforce_failed()
+        _raise_if_gen_value_background_failed()
         return result
 
     _grpo_fast.one_training_step = _one_training_step_with_genvalue
@@ -1099,12 +1602,37 @@ def main():
     def _save_gen_value_checkpoint(checkpoint_state_dir: str, training_step: int) -> dict[str, Any]:
         if gen_value_trainer is None:
             return {}
-        return ray.get(gen_value_trainer.save_checkpoint.remote(checkpoint_state_dir, training_step))
+        results, _ = utils.ray_get_with_progress(
+            [gen_value_trainer.save_checkpoint.remote(checkpoint_state_dir, training_step)],
+            desc="Saving generative critic checkpoint",
+            timeout=_GEN_VALUE_OPERATION_TIMEOUT_S,
+        )
+        return results[0]
+
+    def _commit_gen_value_checkpoint(checkpoint_state_dir: str, training_step: int) -> None:
+        del training_step
+        if gen_value_trainer is None or args.keep_last_n_checkpoints < 0:
+            return
+        utils.clean_last_n_checkpoints_deepspeed(
+            os.path.join(checkpoint_state_dir, "gen_value_model", "deepspeed"), args.keep_last_n_checkpoints
+        )
 
     def _save_gen_value_model(output_dir: str, training_step: int) -> None:
         if gen_value_trainer is None:
             return
-        ray.get(gen_value_trainer.save_model.remote(output_dir))
+        _raise_if_gen_value_background_failed()
+        if training_step >= args.num_training_steps:
+            # Drain every complete queued batch before writing the final critic.
+            # A final partial batch remains untrained rather than changing batch size.
+            gen_value_stop_event.set()
+            gen_value_step_trigger.set()
+            _wait_for_gen_value_background()
+        utils.ray_get_with_progress(
+            [gen_value_trainer.save_model.remote(output_dir)],
+            desc="Saving generative critic model",
+            timeout=_GEN_VALUE_OPERATION_TIMEOUT_S,
+        )
+        _raise_if_gen_value_background_failed()
         logger.info("Saved generative-value model at policy step %d to %s", training_step, output_dir)
 
     # ── Step 6: run policy training loop ─────────────────────────────────────
@@ -1135,6 +1663,7 @@ def main():
             checkpoint_state=checkpoint_state,
             base_env_config=base_env_config,
             checkpoint_callback=_save_gen_value_checkpoint,
+            checkpoint_commit_callback=_commit_gen_value_checkpoint,
             model_save_callback=_save_gen_value_model,
         )
 
@@ -1148,14 +1677,12 @@ def main():
     finally:
         _grpo_fast.one_training_step = _original_one_training_step
         gen_value_stop_event.set()
-        if gen_value_thread is not None:
-            gen_value_step_trigger.set()
-            gen_value_thread.join(timeout=30)
+        gen_value_step_trigger.set()
         _grpo_fast.cleanup_training_resources(
             stop_event, executor, [inference_results_Q, prompt_Q, evaluation_inference_results_Q], actor_manager
         )
         if primary_exception is None:
-            _raise_if_gen_value_reinforce_failed()
+            _raise_if_gen_value_background_failed()
 
     logger.info("finished gen-value training")
     utils.check_runtime_leaks()

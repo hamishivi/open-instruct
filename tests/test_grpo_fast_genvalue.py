@@ -1,17 +1,24 @@
 # ruff: noqa: E402, I001
 """Unit tests for grpo_fast_genvalue helpers (no GPU required)."""
 
+from queue import Queue
+import threading
 from unittest.mock import MagicMock
 
 import pytest
 
 pytest.importorskip("vllm")
 
-from open_instruct.dataset_transformation import INPUT_IDS_PROMPT_KEY
+from open_instruct.dataset_transformation import INPUT_IDS_PROMPT_KEY, TokenizerConfig
 from open_instruct.grpo_fast_genvalue import (
     GenValueExperimentConfig,
     _build_sample_scoring_prompts,
-    _get_gen_value_max_model_len,
+    _drain_gen_value_metrics,
+    _gen_value_scoring_loop,
+    _put_gen_value_metrics,
+    _resolve_gen_value_model,
+    _resolve_gen_value_tokenizer,
+    _sync_gen_value_weights,
 )
 from open_instruct.value_model_utils import segment_rollout
 
@@ -22,14 +29,14 @@ from open_instruct.value_model_utils import segment_rollout
 def test_segment_rollout_fixed_basic():
     tokens = list(range(10))
     result = segment_rollout(tokens, None, mode="fixed", fixed_chunk_size=3)
-    # boundaries at 3, 6, and the final token (9)
-    assert result == [3, 6, 9]
+    # Inclusive ends for 3-token chunks, plus the one-token final chunk.
+    assert result == [2, 5, 8, 9]
 
 
 def test_segment_rollout_fixed_exact_multiple():
     tokens = list(range(6))
     result = segment_rollout(tokens, None, mode="fixed", fixed_chunk_size=3)
-    assert result == [3, 5]
+    assert result == [2, 5]
 
 
 def test_segment_rollout_fixed_terminal_appended():
@@ -103,6 +110,46 @@ def test_genvalue_config_valid():
     assert cfg.gen_value_segmentation == "fixed"
 
 
+def test_genvalue_tokenizer_defaults_to_policy_and_allows_independent_override():
+    policy_tokenizer = TokenizerConfig(tokenizer_name_or_path="policy-tokenizer", tokenizer_revision="policy-rev")
+    default_cfg = GenValueExperimentConfig(**_base_kwargs())
+    assert _resolve_gen_value_tokenizer(default_cfg, policy_tokenizer) == ("policy-tokenizer", "policy-rev")
+
+    override_cfg = GenValueExperimentConfig(
+        **_base_kwargs(),
+        gen_value_tokenizer_name_or_path="critic-tokenizer",
+        gen_value_tokenizer_revision="critic-rev",
+    )
+    assert _resolve_gen_value_tokenizer(override_cfg, policy_tokenizer) == ("critic-tokenizer", "critic-rev")
+
+    override_without_revision = GenValueExperimentConfig(
+        **_base_kwargs(), gen_value_tokenizer_name_or_path="critic-tokenizer"
+    )
+    assert _resolve_gen_value_tokenizer(override_without_revision, policy_tokenizer) == ("critic-tokenizer", None)
+
+
+def test_genvalue_model_defaults_to_policy_and_allows_independent_revision():
+    policy_model = MagicMock(model_name_or_path="policy-model", model_revision="policy-rev")
+    policy_model.model_name_or_path = "policy-model"
+    policy_model.model_revision = "policy-rev"
+
+    default_cfg = GenValueExperimentConfig(**_base_kwargs())
+    assert _resolve_gen_value_model(default_cfg, policy_model) == ("policy-model", "policy-rev")
+
+    independent_cfg = GenValueExperimentConfig(
+        **_base_kwargs(), gen_value_model_name_or_path="critic-model", gen_value_model_revision="critic-rev"
+    )
+    assert _resolve_gen_value_model(independent_cfg, policy_model) == ("critic-model", "critic-rev")
+
+    independent_default_revision_cfg = GenValueExperimentConfig(
+        **_base_kwargs(), gen_value_model_name_or_path="critic-model"
+    )
+    assert _resolve_gen_value_model(independent_default_revision_cfg, policy_model) == ("critic-model", None)
+
+    policy_repo_other_revision_cfg = GenValueExperimentConfig(**_base_kwargs(), gen_value_model_revision="critic-rev")
+    assert _resolve_gen_value_model(policy_repo_other_revision_cfg, policy_model) == ("policy-model", "critic-rev")
+
+
 def test_genvalue_config_requires_flag():
     kwargs = _base_kwargs()
     kwargs["use_generative_value_model"] = False
@@ -128,6 +175,23 @@ def test_genvalue_config_rejects_negative_reinforce_coef():
     kwargs = _base_kwargs()
     kwargs["gen_value_reinforce_coef"] = -0.1
     with pytest.raises(ValueError, match="gen_value_reinforce_coef must be >= 0"):
+        GenValueExperimentConfig(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("gen_value_batch_size", 0),
+        ("gen_value_vllm_tensor_parallel_size", 0),
+        ("gen_value_max_segments", 0),
+        ("gen_value_max_new_tokens", 0),
+        ("gen_value_learning_rate", 0.0),
+    ],
+)
+def test_genvalue_config_rejects_nonpositive_settings(field: str, value: int):
+    kwargs = _base_kwargs()
+    kwargs[field] = value
+    with pytest.raises(ValueError, match=field):
         GenValueExperimentConfig(**kwargs)
 
 
@@ -162,6 +226,13 @@ def test_genvalue_config_bad_chunk_size():
         GenValueExperimentConfig(**kwargs)
 
 
+def test_genvalue_config_requires_positive_temperature():
+    kwargs = _base_kwargs()
+    kwargs["gen_value_temperature"] = 0.0
+    with pytest.raises(ValueError, match="gen_value_temperature must be > 0"):
+        GenValueExperimentConfig(**kwargs)
+
+
 def test_genvalue_config_bad_score_range():
     kwargs = _base_kwargs()
     kwargs["gen_value_score_max"] = kwargs["gen_value_score_min"]
@@ -184,15 +255,133 @@ def test_genvalue_config_valid_conditionings():
         assert cfg.gen_value_conditioning == cond
 
 
-def test_get_gen_value_max_model_len_includes_generation_budget():
+def test_genvalue_config_rejects_context_without_prompt_room():
     kwargs = _base_kwargs()
     kwargs["gen_value_max_new_tokens"] = 1024
-    cfg = GenValueExperimentConfig(**kwargs)
+    kwargs["gen_value_max_model_len"] = 1024
+    with pytest.raises(ValueError, match="must be greater than --gen_value_max_new_tokens"):
+        GenValueExperimentConfig(**kwargs)
 
-    class StreamingConfig:
-        pack_length = 10_240
 
-    assert _get_gen_value_max_model_len(StreamingConfig, cfg) == 41_984
+def test_diagnostic_scoring_exception_propagates(monkeypatch):
+    trigger = threading.Event()
+    trigger.set()
+    stop = threading.Event()
+    cfg = GenValueExperimentConfig(**_base_kwargs())
+
+    def fail_prompt_build(*_args, **_kwargs):
+        raise RuntimeError("diagnostic failed")
+
+    monkeypatch.setattr("open_instruct.grpo_fast_genvalue._build_sample_scoring_prompts", fail_prompt_build)
+    with pytest.raises(RuntimeError, match="diagnostic failed"):
+        _gen_value_scoring_loop(
+            cfg,
+            MagicMock(),
+            [],
+            [MagicMock()],
+            trigger,
+            stop,
+            threading.Lock(),
+            Queue(),
+            {"synced_version": 0},
+            threading.Lock(),
+        )
+
+
+def test_multiple_critic_updates_are_token_and_example_weighted():
+    metrics_q = Queue()
+    _put_gen_value_metrics(
+        metrics_q,
+        {
+            "gen_value/reinforce_loss": 1.0,
+            "gen_value/reward_mean": 0.0,
+            "gen_value/mse": 0.25,
+            "gen_value/train_tokens": 2,
+            "gen_value/train_examples": 1,
+            "gen_value/parsed_examples": 1,
+            "gen_value/batch_rollouts": 1,
+            "gen_value/source_value_version_min": 4,
+            "gen_value/source_value_version_max": 4,
+        },
+        "REINFORCE",
+    )
+    _put_gen_value_metrics(
+        metrics_q,
+        {
+            "gen_value/reinforce_loss": 3.0,
+            "gen_value/reward_mean": 1.0,
+            "gen_value/mse": 0.5,
+            "gen_value/train_tokens": 6,
+            "gen_value/train_examples": 3,
+            "gen_value/parsed_examples": 2,
+            "gen_value/batch_rollouts": 2,
+            "gen_value/source_value_version_min": 5,
+            "gen_value/source_value_version_max": 7,
+        },
+        "REINFORCE",
+    )
+
+    metrics = _drain_gen_value_metrics(metrics_q)
+
+    assert metrics["gen_value/reinforce_loss"] == pytest.approx(2.5)
+    assert metrics["gen_value/reward_mean"] == pytest.approx(0.75)
+    assert metrics["gen_value/mse"] == pytest.approx((0.25 + 2 * 0.5) / 3)
+    assert metrics["gen_value/train_tokens"] == 8
+    assert metrics["gen_value/batch_rollouts"] == 3
+    assert metrics["gen_value/source_value_version_min"] == 4
+    assert metrics["gen_value/source_value_version_max"] == 7
+    assert metrics["gen_value/source_value_version_spread"] == 3
+
+
+def test_failed_weight_transfer_still_wakes_critic_engines(monkeypatch):
+    trainer = MagicMock()
+    engine = MagicMock()
+    wait_calls = 0
+
+    def fake_wait(*_args, **_kwargs):
+        nonlocal wait_calls
+        wait_calls += 1
+        if wait_calls == 1:
+            raise RuntimeError("transfer failed")
+        return [None], [0.0]
+
+    monkeypatch.setattr("open_instruct.grpo_fast_genvalue.utils.ray_get_with_progress", fake_wait)
+
+    with pytest.raises(RuntimeError, match="transfer failed"):
+        _sync_gen_value_weights(trainer, [engine], threading.Lock())
+
+    engine.wake_up.remote.assert_called_once_with()
+
+
+def test_weight_sync_health_checks_while_waiting_for_scoring(monkeypatch):
+    trainer = MagicMock()
+    engine = MagicMock()
+    engines_lock = threading.Lock()
+    engines_lock.acquire()
+    health_checks = 0
+
+    def health_check():
+        nonlocal health_checks
+        health_checks += 1
+        engines_lock.release()
+
+    wait_calls = 0
+
+    def fake_wait(*_args, **_kwargs):
+        nonlocal wait_calls
+        wait_calls += 1
+        if wait_calls == 1:
+            return [{"engine_refs": [], "version": 3}], [0.0]
+        return [None], [0.0]
+
+    monkeypatch.setattr("open_instruct.grpo_fast_genvalue._check_gen_value_engines", lambda _engines: None)
+    monkeypatch.setattr("open_instruct.grpo_fast_genvalue.utils.ray_get_with_progress", fake_wait)
+
+    metrics = _sync_gen_value_weights(trainer, [engine], engines_lock, health_check_fn=health_check)
+
+    assert health_checks == 1
+    assert metrics["gen_value/synced_version"] == 3
+    assert not engines_lock.locked()
 
 
 # ── _build_sample_scoring_prompts (pure-Python, no GPU) ───────────────────────
