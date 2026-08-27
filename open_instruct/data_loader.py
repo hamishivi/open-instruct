@@ -1242,12 +1242,12 @@ def prepare_collated_data_for_workers(
     assert packed_sequences.advantages is not None
     assert packed_sequences.vllm_logprobs is not None
 
-    has_rewards = packed_sequences.rewards is not None
-    has_dones = packed_sequences.dones is not None
-    has_segments = packed_sequences.segment_boundaries is not None
-    has_gt = packed_sequences.ground_truths is not None
-    has_siblings = packed_sequences.sibling_rollouts is not None
-    has_hints = packed_sequences.hints is not None
+    packed_rewards = packed_sequences.rewards
+    packed_dones = packed_sequences.dones
+    packed_segments = packed_sequences.segment_boundaries
+    packed_gt = packed_sequences.ground_truths
+    packed_siblings = packed_sequences.sibling_rollouts
+    packed_hints = packed_sequences.hints
 
     for i in range(dp_world_size):
         per_device_packed_query_responses = packed_sequences.query_responses[B * i : B * (i + 1)]
@@ -1256,12 +1256,12 @@ def prepare_collated_data_for_workers(
         per_device_packed_advantages = packed_sequences.advantages[B * i : B * (i + 1)]
         per_device_packed_response_masks = packed_sequences.response_masks[B * i : B * (i + 1)]
         per_device_packed_vllm_logprobs = packed_sequences.vllm_logprobs[B * i : B * (i + 1)]
-        per_device_packed_rewards = packed_sequences.rewards[B * i : B * (i + 1)] if has_rewards else None
-        per_device_packed_dones = packed_sequences.dones[B * i : B * (i + 1)] if has_dones else None
-        per_device_packed_segments = packed_sequences.segment_boundaries[B * i : B * (i + 1)] if has_segments else None
-        per_device_packed_gt = packed_sequences.ground_truths[B * i : B * (i + 1)] if has_gt else None
-        per_device_packed_siblings = packed_sequences.sibling_rollouts[B * i : B * (i + 1)] if has_siblings else None
-        per_device_packed_hints = packed_sequences.hints[B * i : B * (i + 1)] if has_hints else None
+        per_device_packed_rewards = packed_rewards[B * i : B * (i + 1)] if packed_rewards is not None else None
+        per_device_packed_dones = packed_dones[B * i : B * (i + 1)] if packed_dones is not None else None
+        per_device_packed_segments = packed_segments[B * i : B * (i + 1)] if packed_segments is not None else None
+        per_device_packed_gt = packed_gt[B * i : B * (i + 1)] if packed_gt is not None else None
+        per_device_packed_siblings = packed_siblings[B * i : B * (i + 1)] if packed_siblings is not None else None
+        per_device_packed_hints = packed_hints[B * i : B * (i + 1)] if packed_hints is not None else None
 
         # Shuffle the batch and collate the data
         b_inds = np.random.permutation(len(per_device_packed_query_responses))
@@ -1271,12 +1271,12 @@ def prepare_collated_data_for_workers(
         collated_response_masks = []
         collated_advantages = []
         collated_vllm_logprobs = []
-        collated_rewards: list[torch.Tensor] | None = [] if has_rewards else None
-        collated_dones: list[torch.Tensor] | None = [] if has_dones else None
-        collated_segments: list[torch.Tensor] | None = [] if has_segments else None
-        collated_gt: list[list[str]] | None = [] if has_gt else None
-        collated_siblings: list[list[list[dict]]] | None = [] if has_siblings else None
-        collated_hints: list[list[str | None]] | None = [] if has_hints else None
+        collated_rewards: list[torch.Tensor] | None = [] if packed_rewards is not None else None
+        collated_dones: list[torch.Tensor] | None = [] if packed_dones is not None else None
+        collated_segments: list[torch.Tensor] | None = [] if packed_segments is not None else None
+        collated_gt: list[list[list[str]]] | None = [] if packed_gt is not None else None
+        collated_siblings: list[list[list[list[dict]]]] | None = [] if packed_siblings is not None else None
+        collated_hints: list[list[list[str | None]]] | None = [] if packed_hints is not None else None
         for j in range(0, len(per_device_packed_query_responses), per_device_train_batch_size):
             micro_range = b_inds[j : j + per_device_train_batch_size]
             collated_query_responses.append(

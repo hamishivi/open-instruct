@@ -32,7 +32,9 @@ class TestIFEvalVerifier(unittest.TestCase):
     def test_scores_only_answer_payload_after_thinking_trace(self):
         verifier = IFEvalVerifier()
         label = "[{'instruction_id': ['last_word:last_word_answer'], 'kwargs': [{'last_word': 'brief'}]}]"
-        prediction = "<think>I should end the response with brief.</think><answer>A concise answer ending in brief</answer>"
+        prediction = (
+            "<think>I should end the response with brief.</think><answer>A concise answer ending in brief</answer>"
+        )
 
         self.assertEqual(verifier([], prediction, label).score, 1.0)
 

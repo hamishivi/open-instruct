@@ -218,7 +218,7 @@ class TestComputeGRPOLoss(unittest.TestCase):
         expected_clamped = torch.clamp(ratio, 0.8, 1.2)
         torch.testing.assert_close(pg_losses2, -advantages * expected_clamped)
 
-    def test_dppo_masks_absolute_probability_change(self):
+    def test_dppo_bounds_absolute_probability_change(self):
         config = _make_grpo_config(loss_fn=grpo_utils.GRPOLossType.dppo, dppo_clip=0.02)
         old_prob = torch.tensor([[0.1, 0.01]])
         ratio = torch.tensor([[1.3, 2.0]])
@@ -235,9 +235,10 @@ class TestComputeGRPOLoss(unittest.TestCase):
             config=config,
         )
 
-        # For pi_old=0.1, epsilon=0.02 blocks the increase to 0.13. For
-        # pi_old=0.01, the increase to 0.02 remains in the TV trust region.
-        torch.testing.assert_close(pg_loss, torch.tensor([[0.0, -2.0]]))
+        # For pi_old=0.1, epsilon=0.02 bounds the surrogate at the 0.12
+        # probability boundary. For pi_old=0.01, the increase to 0.02 remains
+        # in the TV trust region.
+        torch.testing.assert_close(pg_loss, torch.tensor([[-1.2, -2.0]]))
 
     def test_dppo_requires_old_policy_logprobs(self):
         config = _make_grpo_config(loss_fn=grpo_utils.GRPOLossType.dppo, dppo_clip=0.02)
@@ -288,9 +289,10 @@ class TestComputeGRPOLoss(unittest.TestCase):
             config=config,
         )
 
-        # The common token falls by 0.03 and is blocked; the rare token falls
-        # by only 0.005 and retains its REINFORCE loss.
-        torch.testing.assert_close(pg_loss, torch.tensor([[0.0, 0.5]]))
+        # The common token's surrogate is bounded at the 0.08 probability
+        # boundary; the rare token falls by only 0.005 and retains its
+        # REINFORCE loss.
+        torch.testing.assert_close(pg_loss, torch.tensor([[0.8, 0.5]]))
 
     def test_cispo_uses_detached_ratio(self):
         config = _make_grpo_config(loss_fn=grpo_utils.GRPOLossType.cispo, clip_higher=0.2)

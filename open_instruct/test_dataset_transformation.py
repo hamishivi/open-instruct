@@ -68,15 +68,13 @@ class TestRLVRTokenize(unittest.TestCase):
             "constraint": "Include a title.",
         }
 
-        result = open_instruct.dataset_transformation.rlvr_tokenize_v3(
-            row,
-            tokenizer,
-            sft_messages_key="prompt",
-        )
+        result = open_instruct.dataset_transformation.rlvr_tokenize_v3(row, tokenizer, sft_messages_key="prompt")
 
         self.assertEqual(result[open_instruct.dataset_transformation.GROUND_TRUTHS_KEY], [ground_truth])
         self.assertEqual(result[open_instruct.dataset_transformation.VERIFIER_SOURCE_KEY], ["ifeval"])
-        self.assertEqual(result[open_instruct.dataset_transformation.RAW_PROMPT_KEY], "user: Explain the result. Include a title.")
+        self.assertEqual(
+            result[open_instruct.dataset_transformation.RAW_PROMPT_KEY], "user: Explain the result. Include a title."
+        )
         tokenizer.apply_chat_template.assert_called_once_with(
             [{"role": "user", "content": "Explain the result. Include a title."}],
             add_generation_prompt=True,

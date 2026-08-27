@@ -221,9 +221,7 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
             )
         logger.info(f"Applying chat template {cfg.chat_template_name!r} ({source})")
         prompts = [
-            tokenizer.apply_chat_template(
-                [{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True
-            )
+            tokenizer.apply_chat_template([{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True)
             for p in prompts
         ]
 
@@ -280,9 +278,7 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
                     sae_threshold=cfg.sae_threshold,
                     max_segments=cfg.max_probes,
                 )
-                probe_positions = [
-                    t for t in raw_boundaries if (length - t) >= cfg.min_probe_remaining_tokens
-                ]
+                probe_positions = [t for t in raw_boundaries if (length - t) >= cfg.min_probe_remaining_tokens]
             else:
                 probe_positions = [
                     t
@@ -471,10 +467,9 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
 def _score_with_scalar_value(df, cfg: ScoreDatasetConfig) -> list[list[float]]:
     """Score probes using a scalar value model loaded via HF."""
     import torch  # noqa: PLC0415
-    from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: PLC0415
-
     import torch.nn as nn  # noqa: PLC0415
     from safetensors.torch import load_file as _load_sf  # noqa: PLC0415
+    from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: PLC0415
 
     tok_path = cfg.tokenizer_name_or_path or cfg.value_model_path
     tokenizer = AutoTokenizer.from_pretrained(tok_path)

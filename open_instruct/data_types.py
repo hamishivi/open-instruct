@@ -119,16 +119,16 @@ class CollatedBatchData:
     dones: list[torch.Tensor] | None = None
     """Per-token done mask (float) aligned with query_responses (same shape). 1 at the terminal
     token of each sub-sequence, 0 elsewhere."""
-    ground_truths: list[list[str]] | None = None
-    """Per-pack list of per-sub-sequence ground-truth answer strings (used for value-model
-    conditioning; one entry per packed sub-sequence)."""
-    sibling_rollouts: list[list[list[dict]]] | None = None
-    """Per-pack list of per-sub-sequence list of sibling rollouts
+    ground_truths: list[list[list[str]]] | None = None
+    """Per-microbatch list of packs containing per-sub-sequence ground-truth answer strings
+    (used for value-model conditioning)."""
+    sibling_rollouts: list[list[list[list[dict]]]] | None = None
+    """Per-microbatch list of packs containing per-sub-sequence lists of sibling rollouts
     (each sibling is a dict: ``{"text": str, "is_correct": bool}``). Used by the
     rollout_context / correct_demo value conditioning templates."""
-    hints: list[list[str | None]] | None = None
-    """Per-pack list of per-sub-sequence hint strings from the dataset's hint column. Used by
-    the answer_prefix conditioning template when the dataset provides hints."""
+    hints: list[list[list[str | None]]] | None = None
+    """Per-microbatch list of packs containing per-sub-sequence hint strings from the dataset's
+    hint column. Used by answer-prefix conditioning when the dataset provides hints."""
     segment_boundaries: list[torch.Tensor] | None = None
     """Per-token boolean mask (1 where a SAE segment starts, 0 elsewhere). None when SAE is off."""
 
@@ -145,11 +145,12 @@ class CollatedBatchData:
     )
 
     def __getitem__(self, idx: int | slice) -> "CollatedBatchData":
-        return CollatedBatchData(
+        return dataclasses.replace(
+            self,
             **{
                 f.name: (getattr(self, f.name)[idx] if getattr(self, f.name) is not None else None)
                 for f in dataclasses.fields(self)
-            }
+            },
         )
 
     def __len__(self) -> int:
