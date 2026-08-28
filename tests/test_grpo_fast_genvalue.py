@@ -299,6 +299,11 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
             "gen_value/train_tokens": 2,
             "gen_value/train_examples": 1,
             "gen_value/parsed_examples": 1,
+            "gen_value/train_packs": 1,
+            "gen_value/train_pack_tokens": 100,
+            "gen_value/train_examples_per_pack": 1.0,
+            "gen_value/train_mean_pack_tokens": 100.0,
+            "gen_value/train_max_pack_tokens": 100,
             "gen_value/batch_rollouts": 1,
             "gen_value/source_value_version_min": 4,
             "gen_value/source_value_version_max": 4,
@@ -314,6 +319,11 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
             "gen_value/train_tokens": 6,
             "gen_value/train_examples": 3,
             "gen_value/parsed_examples": 2,
+            "gen_value/train_packs": 2,
+            "gen_value/train_pack_tokens": 300,
+            "gen_value/train_examples_per_pack": 1.5,
+            "gen_value/train_mean_pack_tokens": 150.0,
+            "gen_value/train_max_pack_tokens": 180,
             "gen_value/batch_rollouts": 2,
             "gen_value/source_value_version_min": 5,
             "gen_value/source_value_version_max": 7,
@@ -327,6 +337,11 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
     assert metrics["gen_value/reward_mean"] == pytest.approx(0.75)
     assert metrics["gen_value/mse"] == pytest.approx((0.25 + 2 * 0.5) / 3)
     assert metrics["gen_value/train_tokens"] == 8
+    assert metrics["gen_value/train_packs"] == 3
+    assert metrics["gen_value/train_pack_tokens"] == 400
+    assert metrics["gen_value/train_examples_per_pack"] == pytest.approx(4 / 3)
+    assert metrics["gen_value/train_mean_pack_tokens"] == pytest.approx(400 / 3)
+    assert metrics["gen_value/train_max_pack_tokens"] == 180
     assert metrics["gen_value/batch_rollouts"] == 3
     assert metrics["gen_value/source_value_version_min"] == 4
     assert metrics["gen_value/source_value_version_max"] == 7

@@ -80,7 +80,7 @@ from open_instruct import grpo_fast_resource_plan, grpo_utils, logger_utils, uti
 from open_instruct.dataset_transformation import INPUT_IDS_PROMPT_KEY, TokenizerConfig
 from open_instruct.environments.tools.utils import EnvsConfig
 from open_instruct.ground_truth_utils import RewardConfig, build_all_verifiers
-from open_instruct.model_utils import ModelConfig, disable_dropout_in_model
+from open_instruct.model_utils import ModelConfig, disable_dropout_in_model, olmo_core_attn_to_hf
 from open_instruct.utils import ArgumentParserPlus
 
 logger = logger_utils.setup_logger(__name__)
@@ -131,6 +131,9 @@ class GenValueTrainerActor:
         score_min: float,
         score_max: float,
         max_sequence_tokens: int,
+        pack_length: int,
+        attn_implementation: str,
+        gradient_checkpointing: bool,
         temperature: float = 1.0,
         truncated_importance_sampling_ratio_cap: float = 2.0,
         tis_mask_lower: float = 0.0,
@@ -148,12 +151,20 @@ class GenValueTrainerActor:
         self._score_max = score_max
         self._tp_size = tensor_parallel_size
         self._max_sequence_tokens = max_sequence_tokens
+        self._pack_length = pack_length
         self._temperature = temperature
         self._tis_ratio_cap = truncated_importance_sampling_ratio_cap
         self._tis_mask_lower = tis_mask_lower
         self._tis_mask_upper = tis_mask_upper
         self._reinforce_coef = reinforce_coef
         self._step_count = 0
+        if self._pack_length <= 0:
+            raise ValueError(f"Generative critic pack length must be > 0, got {self._pack_length}.")
+        if self._pack_length > self._max_sequence_tokens:
+            raise ValueError(
+                "The policy pack length cannot exceed the generative critic context limit "
+                f"({self._pack_length} > {self._max_sequence_tokens})."
+            )
         torch.cuda.set_device(0)
         if dist.is_initialized():
             if dist.get_world_size() != 1:
@@ -182,11 +193,11 @@ class GenValueTrainerActor:
             )
 
         model = AutoModelForCausalLM.from_pretrained(
-            model_path, revision=model_revision, torch_dtype=torch.bfloat16
+            model_path, revision=model_revision, dtype=torch.bfloat16, attn_implementation=attn_implementation
         ).cuda()
         disable_dropout_in_model(model)
         model.config.use_cache = False
-        if hasattr(model, "gradient_checkpointing_enable"):
+        if gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.train()
 
@@ -286,8 +297,10 @@ class GenValueTrainerActor:
         if not training_pairs:
             return {"gen_value/version": self._step_count, "gen_value/reinforce_steps": self._step_count}
 
-        validated_pairs: list[tuple[Any, list[int], float]] = []
+        validated_examples: list[dict[str, Any]] = []
         skipped_empty_generation = 0
+        mses: list[float] = []  # Parsed generations only; parse failures have no numeric prediction.
+        parsed_v_hats: list[float] = []  # Only for pairs where parsing succeeded.
         for pair in training_pairs:
             if pair["outcome"] is None:
                 continue
@@ -312,22 +325,35 @@ class GenValueTrainerActor:
                 skipped_empty_generation += 1
                 continue
             outcome = max(0.0, min(1.0, float(pair["outcome"])))
-            validated_pairs.append((completion, sequence_ids, outcome))
+            v_hat = self._score_from_text(completion.text)
+            if v_hat is not None:
+                parsed_v_hats.append(v_hat)
+            reward, squared_error = value_model_utils.generative_value_reinforce_reward(outcome, v_hat)
+            if squared_error is not None:
+                mses.append(squared_error)
+            validated_examples.append(
+                {
+                    "sequence_ids": sequence_ids,
+                    "generated_ids": generated_ids,
+                    "rollout_logprobs": completion.logprobs,
+                    "outcome": outcome,
+                    "reward": reward,
+                }
+            )
 
-        if not validated_pairs:
+        if not validated_examples:
             return {"gen_value/version": self._step_count, "gen_value/reinforce_steps": self._step_count}
 
+        packs = value_model_utils.pack_gen_value_examples(validated_examples, self._pack_length)
         # DeepSpeed's BF16 optimizer owns the FP32 accumulation buffers, so clear
         # it directly rather than only clearing the BF16 module gradients.
         self._optimizer.zero_grad()
-        reinforce_token_denominator = sum(len(completion.token_ids) for completion, _, _ in validated_pairs)
+        reinforce_token_denominator = sum(len(example["generated_ids"]) for example in validated_examples)
         gradient_scale = self._reinforce_coef / max(reinforce_token_denominator, 1)
         total_loss = 0.0
-        rewards: list[float] = []
-        outcomes: list[float] = []
-        mses: list[float] = []  # Parsed generations only; parse failures have no numeric prediction.
-        parsed_v_hats: list[float] = []  # only for pairs where parsing succeeded.
-        parsed_count = 0
+        rewards = [example["reward"] for example in validated_examples]
+        outcomes = [example["outcome"] for example in validated_examples]
+        parsed_count = len(parsed_v_hats)
         has_effective_training_signal = False
         reinforce_token_count = 0
         tis_ratio_sum = 0.0
@@ -336,35 +362,36 @@ class GenValueTrainerActor:
         tis_mask_kept_tokens = 0
         tis_mask_total_tokens = 0
 
-        for pair_idx, (completion, sequence_ids, outcome) in enumerate(validated_pairs):
-            generated_ids = completion.token_ids
-            generated = completion.text
+        pack_token_counts: list[int] = []
+        for pack_idx, pack in enumerate(packs):
+            flattened = value_model_utils.flatten_gen_value_pack(pack)
+            (
+                input_ids_list,
+                position_ids_list,
+                logit_positions_list,
+                target_ids_list,
+                rollout_logprobs_list,
+                rewards_list,
+            ) = flattened
+            pack_token_counts.append(len(input_ids_list))
+            input_ids = torch.tensor([input_ids_list], dtype=torch.long, device="cuda")
+            position_ids = torch.tensor([position_ids_list], dtype=torch.long, device="cuda")
+            logit_positions = torch.tensor(logit_positions_list, dtype=torch.long, device="cuda")
+            target_ids = torch.tensor(target_ids_list, dtype=torch.long, device="cuda")
 
-            v_hat = self._score_from_text(generated)
-            if v_hat is not None:
-                parsed_count += 1
-                parsed_v_hats.append(v_hat)
-            reward, squared_error = value_model_utils.generative_value_reinforce_reward(outcome, v_hat)
-            if squared_error is not None:
-                mses.append(squared_error)
-
-            input_ids = torch.tensor([sequence_ids], dtype=torch.long, device="cuda")
-            attention_mask = torch.ones_like(input_ids)
-            target_ids = input_ids[:, -len(generated_ids) :]
-
-            # Only materialize logits needed to score the generated answer tokens.
-            # Full-sequence logits for 8k-token prompts can allocate several extra GiB.
-            # The critic batch is accumulated as one DeepSpeed step. Mark only
-            # its final sequence as the reduction/update boundary, as the policy does.
-            self._model.set_gradient_accumulation_boundary(pair_idx == len(validated_pairs) - 1)
+            # Reset position IDs at each example boundary, exactly as policy packing does.
+            # Transformers uses these resets to select isolated variable-length FlashAttention,
+            # so examples in one pack cannot attend to each other. Selecting the prediction
+            # positions directly also avoids materializing prompt-token logits.
+            self._model.set_gradient_accumulation_boundary(pack_idx == len(packs) - 1)
             outputs = self._model(
-                input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=len(generated_ids) + 1
+                input_ids=input_ids, attention_mask=None, position_ids=position_ids, logits_to_keep=logit_positions
             )
-            logits = outputs.logits[:, :-1, :].float() / self._temperature
+            logits = outputs.logits.float() / self._temperature
             token_logprobs = -torch.nn.functional.cross_entropy(
                 logits.reshape(-1, logits.shape[-1]), target_ids.reshape(-1), reduction="none"
             )
-            rollout_logprobs = torch.tensor(completion.logprobs, dtype=torch.float32, device="cuda")
+            rollout_logprobs = torch.tensor(rollout_logprobs_list, dtype=torch.float32, device="cuda")
             response_mask = torch.ones_like(token_logprobs, dtype=torch.bool)
             rollout_logprobs = grpo_utils.mask_logprobs(rollout_logprobs, response_mask)
             tis_clamped, tis_unclamped = grpo_utils.compute_tis_weights(
@@ -382,16 +409,18 @@ class GenValueTrainerActor:
                 tis_mask_kept_tokens += int(tis_mask.sum())
                 tis_mask_total_tokens += tis_mask.numel()
 
-            per_token_loss = -token_logprobs * reward
+            token_rewards = torch.tensor(rewards_list, dtype=torch.float32, device="cuda")
+            per_token_loss = -token_logprobs * token_rewards
             if tis_weights is not None:
                 per_token_loss = per_token_loss * tis_weights
             loss = per_token_loss.sum() * gradient_scale
             self._model.backward(loss)
             total_loss += float(loss.detach())
             reinforce_token_count += per_token_loss.numel()
-            outcomes.append(outcome)
-            rewards.append(reward)
-            if reward > 0.0 and (tis_weights is None or bool((tis_weights > 0).any())):
+            effective_weights = token_rewards > 0.0
+            if tis_weights is not None:
+                effective_weights &= tis_weights > 0.0
+            if bool(effective_weights.any()):
                 has_effective_training_signal = True
 
         grad_norm: float | None = None
@@ -413,6 +442,11 @@ class GenValueTrainerActor:
             "gen_value/train_tokens": reinforce_token_count,
             "gen_value/train_examples": len(rewards),
             "gen_value/parsed_examples": parsed_count,
+            "gen_value/train_packs": len(packs),
+            "gen_value/train_pack_tokens": sum(pack_token_counts),
+            "gen_value/train_examples_per_pack": len(rewards) / len(packs),
+            "gen_value/train_mean_pack_tokens": sum(pack_token_counts) / len(packs),
+            "gen_value/train_max_pack_tokens": max(pack_token_counts),
             "gen_value/lr": self._optimizer.param_groups[0]["lr"],
         }
         if grad_norm is not None:
@@ -748,6 +782,8 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
         "gen_value/tis_ratio": "gen_value/tis_tokens",
         "gen_value/tis_clipfrac": "gen_value/tis_tokens",
         "gen_value/tis_mask_frac_kept": "gen_value/tis_mask_tokens",
+        "gen_value/train_examples_per_pack": "gen_value/train_packs",
+        "gen_value/train_mean_pack_tokens": "gen_value/train_packs",
     }
     for metric, weight in weighted_metrics.items():
         mean = weighted_mean(metric, weight)
@@ -762,6 +798,8 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
         "gen_value/train_tokens",
         "gen_value/train_examples",
         "gen_value/parsed_examples",
+        "gen_value/train_packs",
+        "gen_value/train_pack_tokens",
         "gen_value/tis_tokens",
         "gen_value/tis_mask_tokens",
         "gen_value/skipped_empty_generation",
@@ -785,6 +823,13 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
         values = [float(update[metric]) for update in reinforce_updates if metric in update]
         if values:
             merged[metric] = reducer(values)
+    max_pack_tokens = [
+        float(update["gen_value/train_max_pack_tokens"])
+        for update in reinforce_updates
+        if "gen_value/train_max_pack_tokens" in update
+    ]
+    if max_pack_tokens:
+        merged["gen_value/train_max_pack_tokens"] = max(max_pack_tokens)
     return merged
 
 
@@ -1346,6 +1391,9 @@ def main():
             args.gen_value_score_max,
             tensor_parallel_size=args.gen_value_vllm_tensor_parallel_size,
             max_sequence_tokens=gen_value_max_model_len,
+            pack_length=streaming_config.pack_length,
+            attn_implementation=olmo_core_attn_to_hf(model_config.attn_implementation),
+            gradient_checkpointing=model_config.gradient_checkpointing,
             temperature=args.gen_value_temperature,
             truncated_importance_sampling_ratio_cap=args.truncated_importance_sampling_ratio_cap,
             tis_mask_lower=args.tis_mask_lower,
@@ -1364,7 +1412,14 @@ def main():
             timeout=_GEN_VALUE_OPERATION_TIMEOUT_S,
         )
         initial_gen_value_version = int(ready_results[1])
-        logger.info("======== ✅ Gen-value trainer actor ready (lr=%.2e) =========", gv_lr)
+        logger.info(
+            "======== ✅ Gen-value trainer actor ready "
+            "(lr=%.2e, pack_length=%d, attention=%s, gradient_checkpointing=%s) =========",
+            gv_lr,
+            streaming_config.pack_length,
+            olmo_core_attn_to_hf(model_config.attn_implementation),
+            model_config.gradient_checkpointing,
+        )
 
         # Establish the NCCL weight-transfer group between the trainer actor and the
         # gen-value vLLM engines. Mirrors `setup_model_update_group` on the policy

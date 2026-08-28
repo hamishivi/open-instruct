@@ -21,7 +21,7 @@ import json
 import math
 import re
 from collections.abc import Sequence
-from typing import overload
+from typing import Any, overload
 
 import torch
 import torch.nn.functional as F
@@ -305,6 +305,61 @@ def generative_value_reinforce_reward(outcome: float, prediction: float | None) 
         return 0.0, None
     squared_error = (outcome - prediction) ** 2
     return 1.0 - squared_error, squared_error
+
+
+def pack_gen_value_examples(examples: list[dict[str, Any]], target_tokens: int) -> list[list[dict[str, Any]]]:
+    """Pack critic examples in order up to the policy's token budget.
+
+    An example longer than the target remains intact in its own pack. The critic's
+    actual context limit is validated separately, so packing never truncates data.
+    """
+    if target_tokens <= 0:
+        raise ValueError(f"Generative critic pack target must be > 0, got {target_tokens}.")
+
+    packs: list[list[dict[str, Any]]] = []
+    current_pack: list[dict[str, Any]] = []
+    current_tokens = 0
+    for example in examples:
+        sequence_tokens = len(example["sequence_ids"])
+        if current_pack and current_tokens + sequence_tokens > target_tokens:
+            packs.append(current_pack)
+            current_pack = []
+            current_tokens = 0
+        current_pack.append(example)
+        current_tokens += sequence_tokens
+    if current_pack:
+        packs.append(current_pack)
+    return packs
+
+
+def flatten_gen_value_pack(
+    examples: list[dict[str, Any]],
+) -> tuple[list[int], list[int], list[int], list[int], list[float], list[float]]:
+    """Flatten one critic pack and identify exactly the generated-token logits."""
+    input_ids: list[int] = []
+    position_ids: list[int] = []
+    logit_positions: list[int] = []
+    target_ids: list[int] = []
+    rollout_logprobs: list[float] = []
+    token_rewards: list[float] = []
+
+    for example in examples:
+        sequence_ids = example["sequence_ids"]
+        generated_ids = example["generated_ids"]
+        prompt_length = len(sequence_ids) - len(generated_ids)
+        if prompt_length <= 0:
+            raise ValueError("Gen-value REINFORCE requires at least one prompt token per completion.")
+
+        sequence_offset = len(input_ids)
+        input_ids.extend(sequence_ids)
+        position_ids.extend(range(len(sequence_ids)))
+        # The hidden state immediately before each generated token predicts that token.
+        logit_positions.extend(range(sequence_offset + prompt_length - 1, sequence_offset + len(sequence_ids) - 1))
+        target_ids.extend(generated_ids)
+        rollout_logprobs.extend(example["rollout_logprobs"])
+        token_rewards.extend([example["reward"]] * len(generated_ids))
+
+    return input_ids, position_ids, logit_positions, target_ids, rollout_logprobs, token_rewards
 
 
 logger = logger_utils.setup_logger(__name__)

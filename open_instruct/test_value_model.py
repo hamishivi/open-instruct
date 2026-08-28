@@ -23,6 +23,7 @@ import unittest
 
 import numpy as np
 import torch
+from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from open_instruct import grpo_utils
 from open_instruct.rl_utils import (
@@ -43,11 +44,13 @@ from open_instruct.value_model_utils import (
     causal_segment_start_prefix_token_ids,
     causal_value_mask,
     compute_value_loss,
+    flatten_gen_value_pack,
     generative_value_reinforce_reward,
     grouped_token_counts,
     is_postfix_template,
     missing_value_fallback,
     normalize_value_loss,
+    pack_gen_value_examples,
     parse_generative_value_score,
     predict_values,
     regression_metric_sums,
@@ -61,6 +64,89 @@ from open_instruct.value_model_utils import (
     value_metric_sums,
     value_metrics_from_sums,
 )
+
+
+def _packing_example(sequence_ids, generated_ids, rollout_logprobs, reward):
+    return {
+        "sequence_ids": sequence_ids,
+        "generated_ids": generated_ids,
+        "rollout_logprobs": rollout_logprobs,
+        "reward": reward,
+    }
+
+
+class TestGenValuePacking(unittest.TestCase):
+    def test_uses_policy_token_budget_without_truncation(self):
+        examples = [
+            _packing_example([1, 2, 3, 4], [4], [-0.1], 0.2),
+            _packing_example([5, 6], [6], [-0.2], 0.4),
+            _packing_example(list(range(7, 15)), [14], [-0.3], 0.6),
+        ]
+
+        packs = pack_gen_value_examples(examples, target_tokens=6)
+
+        self.assertEqual([[len(example["sequence_ids"]) for example in pack] for pack in packs], [[4, 2], [8]])
+        self.assertEqual(packs[1][0]["sequence_ids"], list(range(7, 15)))
+
+    def test_resets_positions_and_selects_unequal_generated_tokens(self):
+        examples = [
+            _packing_example([10, 11, 12, 13, 14], [13, 14], [-0.1, -0.2], 0.25),
+            _packing_example([20, 21, 22, 23, 24], [22, 23, 24], [-0.3, -0.4, -0.5], 0.75),
+        ]
+
+        flattened = flatten_gen_value_pack(examples)
+
+        input_ids, position_ids, logit_positions, target_ids, rollout_logprobs, token_rewards = flattened
+        self.assertEqual(input_ids, [10, 11, 12, 13, 14, 20, 21, 22, 23, 24])
+        self.assertEqual(position_ids, [0, 1, 2, 3, 4, 0, 1, 2, 3, 4])
+        self.assertEqual(logit_positions, [2, 3, 6, 7, 8])
+        self.assertEqual(target_ids, [13, 14, 22, 23, 24])
+        self.assertEqual(rollout_logprobs, [-0.1, -0.2, -0.3, -0.4, -0.5])
+        self.assertEqual(token_rewards, [0.25, 0.25, 0.75, 0.75, 0.75])
+
+    def test_packed_logits_match_isolated_sequences_with_unequal_token_counts(self):
+        torch.manual_seed(1)
+        config = Qwen3Config(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=64,
+            use_cache=False,
+        )
+        model = Qwen3ForCausalLM(config).eval()
+        examples = [
+            _packing_example([1, 2, 3, 4, 5], [4, 5], [-0.1, -0.2], 0.25),
+            _packing_example([6, 7, 8, 9, 10, 11], [9, 10, 11], [-0.3, -0.4, -0.5], 0.75),
+        ]
+
+        serial_logits = []
+        for example in examples:
+            sequence_ids = torch.tensor([example["sequence_ids"]])
+            generated_length = len(example["generated_ids"])
+            prompt_length = sequence_ids.shape[1] - generated_length
+            logit_positions = torch.arange(prompt_length - 1, sequence_ids.shape[1] - 1)
+            serial_logits.append(
+                model(
+                    input_ids=sequence_ids,
+                    attention_mask=None,
+                    position_ids=torch.arange(sequence_ids.shape[1]).unsqueeze(0),
+                    logits_to_keep=logit_positions,
+                ).logits
+            )
+
+        input_ids, position_ids, logit_positions, *_ = flatten_gen_value_pack(examples)
+        packed_logits = model(
+            input_ids=torch.tensor([input_ids]),
+            attention_mask=None,
+            position_ids=torch.tensor([position_ids]),
+            logits_to_keep=torch.tensor(logit_positions),
+        ).logits
+
+        torch.testing.assert_close(packed_logits, torch.cat(serial_logits, dim=1), rtol=1e-5, atol=1e-5)
 
 
 class TestCausalGenValuePrefixes(unittest.TestCase):
