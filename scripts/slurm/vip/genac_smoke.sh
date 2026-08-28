@@ -88,4 +88,9 @@ else
     fi
 fi
 
-srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash scripts/train/debug/genac_smoke.sh "$@"
+GENAC_LAUNCH_SCRIPT="${GENAC_LAUNCH_SCRIPT:-scripts/train/debug/genac_smoke.sh}"
+if [[ ! -f "${GENAC_LAUNCH_SCRIPT}" ]]; then
+    echo "ERROR: GENAC_LAUNCH_SCRIPT does not exist: ${GENAC_LAUNCH_SCRIPT}" >&2
+    exit 1
+fi
+srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash "${GENAC_LAUNCH_SCRIPT}" "$@"
