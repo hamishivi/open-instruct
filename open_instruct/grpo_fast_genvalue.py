@@ -1560,19 +1560,14 @@ def main():
                 last_gen_value_engine_health_check = now
 
         step_kwargs["background_health_check"] = _combined_health_check
-        existing_metrics_callback = step_kwargs.get("background_metrics_callback")
-
-        def _combined_metrics_callback() -> dict[str, Any]:
-            metrics = existing_metrics_callback() if existing_metrics_callback is not None else {}
-            metrics.update(_drain_gen_value_metrics(gen_value_metrics_Q))
-            return metrics
-
-        step_kwargs["background_metrics_callback"] = _combined_metrics_callback
         policy_step = int(step_args[6] if len(step_args) > 6 else step_kwargs["training_step"])
 
         existing_post_training_metrics_callback = step_kwargs.get("post_training_metrics_callback")
 
         def _critic_post_training_metrics_callback() -> dict[str, Any]:
+            # Drain critic updates exactly once per policy step. A second earlier drain
+            # can split two updates across dictionaries and let the later one overwrite
+            # the first when one_training_step merges its callback results.
             progress_metrics = (
                 existing_post_training_metrics_callback()
                 if existing_post_training_metrics_callback is not None
