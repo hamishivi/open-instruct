@@ -966,7 +966,13 @@ class LLMRayActor:
                     request_id=f"simple_{request_index}_0", prompt_token_ids=prompt_token_ids, outputs=[completion]
                 )
 
-            results = list(await asyncio.gather(*[_one(i, prompt) for i, prompt in enumerate(prompts)]))
+            semaphore = asyncio.Semaphore(self.inference_batch_size)
+
+            async def _bounded_one(request_index: int, prompt: str) -> RequestOutput:
+                async with semaphore:
+                    return await _one(request_index, prompt)
+
+            results = list(await asyncio.gather(*[_bounded_one(i, prompt) for i, prompt in enumerate(prompts)]))
             if adjusted_requests:
                 logger.warning(
                     "Adjusted %d/%d completion request(s) to fit max_model_len=%d.",

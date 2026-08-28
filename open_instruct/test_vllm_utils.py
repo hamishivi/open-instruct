@@ -88,6 +88,7 @@ class TestGenerateRequestOutputs(unittest.TestCase):
         tokenizer = FakeCompletionTokenizer()
         actor.llm_engine = SimpleNamespace(model_config=SimpleNamespace(max_model_len=16), tokenizer=tokenizer)
         actor.model_name = "critic"
+        actor.inference_batch_size = 1
         token_logprobs = [-0.1, -0.2, -0.3]
         output = SimpleNamespace(
             text="<answer>7</answer>",
@@ -130,6 +131,43 @@ class TestGenerateRequestOutputs(unittest.TestCase):
         self.assertEqual(kwargs["temperature"], 0.5)
         self.assertEqual(kwargs["logprobs"], 1)
         self.assertEqual(kwargs["extra_body"], {"return_token_ids": True, "include_stop_str_in_output": True})
+
+    def test_limits_inflight_requests_to_policy_inference_batch_size(self):
+        actor = object.__new__(vllm_utils.LLMRayActor)
+        tokenizer = FakeCompletionTokenizer()
+        actor.llm_engine = SimpleNamespace(model_config=SimpleNamespace(max_model_len=16), tokenizer=tokenizer)
+        actor.model_name = "critic"
+        actor.inference_batch_size = 2
+        active_requests = 0
+        max_active_requests = 0
+
+        async def create_completion(**kwargs):
+            nonlocal active_requests, max_active_requests
+            active_requests += 1
+            max_active_requests = max(max_active_requests, active_requests)
+            try:
+                await asyncio.sleep(0.01)
+                completion_token_id = len(kwargs["prompt"])
+                output = SimpleNamespace(
+                    text=str(completion_token_id),
+                    token_ids=[completion_token_id],
+                    logprobs=SimpleNamespace(token_logprobs=[-0.1]),
+                    finish_reason="stop",
+                )
+                return SimpleNamespace(choices=[output])
+            finally:
+                active_requests -= 1
+
+        actor.client = SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(side_effect=create_completion)))
+        actor._run_async = lambda coroutine: asyncio.run(coroutine)
+
+        request_outputs = actor.generate_request_outputs(
+            ["1", "2", "3", "4", "5"], max_tokens=1, allow_prompt_truncation=False
+        )
+
+        self.assertEqual(max_active_requests, actor.inference_batch_size)
+        self.assertEqual([len(output.prompt_token_ids) for output in request_outputs], [1, 2, 3, 4, 5])
+        self.assertEqual([output.outputs[0].token_ids for output in request_outputs], [[1], [2], [3], [4], [5]])
 
 
 class TestProcessFromQueue(unittest.TestCase):
