@@ -309,6 +309,26 @@ def generative_value_reinforce_reward(outcome: float, prediction: float | None) 
     return 1.0 - squared_error, squared_error
 
 
+def generative_value_reinforce_weights(rewards: Sequence[float], baseline: str) -> list[float]:
+    """Convert raw GenAC rewards into policy-gradient weights.
+
+    ``leave_one_out`` subtracts the mean reward of the other critic samples in the
+    batch.  That baseline is independent of the current sample's generation, so it
+    preserves the expected policy gradient while turning malformed and inaccurate
+    generations into an explicit negative signal.  The one-sample case falls back
+    to the raw reward because no independent baseline is available.
+    """
+    raw_rewards = [float(reward) for reward in rewards]
+    if baseline == "none" or len(raw_rewards) <= 1:
+        return raw_rewards
+    if baseline != "leave_one_out":
+        raise ValueError(f"Unknown generative-value REINFORCE baseline: {baseline!r}.")
+
+    reward_sum = sum(raw_rewards)
+    denominator = len(raw_rewards) - 1
+    return [reward - (reward_sum - reward) / denominator for reward in raw_rewards]
+
+
 def build_gen_value_validation_holdout(
     rollouts: list[dict[str, Any]], max_examples: int, seed: int = 0, prompt_holdout_fraction: float = 0.125
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:

@@ -140,6 +140,7 @@ class GenValueTrainerActor:
         tis_mask_upper: float = 0.0,
         tensor_parallel_size: int = 1,
         reinforce_coef: float = 0.1,
+        reinforce_baseline: str = "none",
         weight_decay: float = 0.0,
         set_weight_decay_on_bias_and_norm: bool = True,
         fused_optimizer: bool = True,
@@ -159,11 +160,14 @@ class GenValueTrainerActor:
         self._tis_mask_lower = tis_mask_lower
         self._tis_mask_upper = tis_mask_upper
         self._reinforce_coef = reinforce_coef
+        self._reinforce_baseline = reinforce_baseline
         self._step_count = 0
         self._trace_reservoir_size = trace_reservoir_size
         self._trace_rng = random.Random(trace_seed)
         self._trace_reservoirs: dict[str, list[dict[str, Any]]] = {"correct": [], "incorrect": []}
         self._trace_seen_by_outcome = {"correct": 0, "incorrect": 0}
+        if self._reinforce_baseline not in {"none", "leave_one_out"}:
+            raise ValueError(f"Unknown generative-value REINFORCE baseline: {self._reinforce_baseline!r}.")
         if self._trace_reservoir_size < 0:
             raise ValueError(f"trace_reservoir_size must be nonnegative, got {self._trace_reservoir_size}.")
         if self._pack_length <= 0:
@@ -422,6 +426,11 @@ class GenValueTrainerActor:
         if not validated_examples:
             return {"gen_value/version": self._step_count, "gen_value/reinforce_steps": self._step_count}
 
+        raw_rewards = [float(example["reward"]) for example in validated_examples]
+        reinforce_weights = value_model_utils.generative_value_reinforce_weights(raw_rewards, self._reinforce_baseline)
+        for example, reinforce_weight in zip(validated_examples, reinforce_weights):
+            example["reward"] = reinforce_weight
+
         packs = value_model_utils.pack_gen_value_examples(validated_examples, self._pack_length)
         # DeepSpeed's BF16 optimizer owns the FP32 accumulation buffers, so clear
         # it directly rather than only clearing the BF16 module gradients.
@@ -429,7 +438,7 @@ class GenValueTrainerActor:
         reinforce_token_denominator = sum(len(example["generated_ids"]) for example in validated_examples)
         gradient_scale = self._reinforce_coef / max(reinforce_token_denominator, 1)
         total_loss = 0.0
-        rewards = [example["reward"] for example in validated_examples]
+        rewards = raw_rewards
         outcomes = [example["outcome"] for example in validated_examples]
         parsed_count = len(parsed_v_hats)
         has_effective_training_signal = False
@@ -495,7 +504,7 @@ class GenValueTrainerActor:
             self._model.backward(loss)
             total_loss += float(loss.detach())
             reinforce_token_count += per_token_loss.numel()
-            effective_weights = token_rewards > 0.0
+            effective_weights = token_rewards != 0.0
             if tis_weights is not None:
                 effective_weights &= tis_weights > 0.0
             if bool(effective_weights.any()):
@@ -512,6 +521,13 @@ class GenValueTrainerActor:
         metrics = {
             "gen_value/reinforce_loss": total_loss,
             "gen_value/reward_mean": sum(rewards) / len(rewards),
+            "gen_value/reinforce_weight_mean": sum(reinforce_weights) / len(reinforce_weights),
+            "gen_value/reinforce_weight_abs_mean": sum(abs(weight) for weight in reinforce_weights)
+            / len(reinforce_weights),
+            "gen_value/reinforce_weight_positive_frac": sum(weight > 0.0 for weight in reinforce_weights)
+            / len(reinforce_weights),
+            "gen_value/reinforce_weight_negative_frac": sum(weight < 0.0 for weight in reinforce_weights)
+            / len(reinforce_weights),
             "gen_value/outcome_mean": sum(outcomes) / len(outcomes),
             "gen_value/mse": sum(mses) / len(mses) if mses else float("nan"),
             "gen_value/parse_rate": parsed_count / len(rewards),
@@ -649,6 +665,9 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
     # Training coefficients.
     gen_value_learning_rate: float | None = None
     gen_value_reinforce_coef: float = 0.1
+    # Optional variance-reducing baseline for the raw GenAC reward. Leave-one-out
+    # centering also makes malformed/inaccurate generations receive negative weight.
+    gen_value_reinforce_baseline: str = "none"
     # Independent critic update cadence. The default critic batch contains the same
     # number of complete rollouts as one global policy batch, irrespective of policy world size.
     gen_value_batch_size: int | None = None
@@ -692,6 +711,11 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
         if self.gen_value_segmentation == "sae" and not self.use_sae:
             raise ValueError(
                 "--gen_value_segmentation=sae requires --use_sae (SAE boundaries come from the policy's vLLM logprobs)."
+            )
+        if self.gen_value_reinforce_baseline not in {"none", "leave_one_out"}:
+            raise ValueError(
+                "--gen_value_reinforce_baseline must be one of 'none' or 'leave_one_out', "
+                f"got {self.gen_value_reinforce_baseline!r}."
             )
         if self.gen_value_chunk_size <= 0:
             raise ValueError(f"--gen_value_chunk_size must be > 0, got {self.gen_value_chunk_size}.")
@@ -1558,6 +1582,7 @@ def main():
             tis_mask_lower=args.tis_mask_lower,
             tis_mask_upper=args.tis_mask_upper,
             reinforce_coef=args.gen_value_reinforce_coef,
+            reinforce_baseline=args.gen_value_reinforce_baseline,
             weight_decay=args.weight_decay,
             set_weight_decay_on_bias_and_norm=args.set_weight_decay_on_bias_and_norm,
             fused_optimizer=args.fused_optimizer,

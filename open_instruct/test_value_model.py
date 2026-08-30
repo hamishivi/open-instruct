@@ -53,6 +53,7 @@ from open_instruct.value_model_utils import (
     flatten_gen_value_pack,
     gen_value_validation_metrics,
     generative_value_reinforce_reward,
+    generative_value_reinforce_weights,
     grouped_token_counts,
     is_postfix_template,
     missing_value_fallback,
@@ -762,6 +763,19 @@ class TestValueLoss(unittest.TestCase):
 
         self.assertEqual(squared_error, 0.75**2)
         self.assertEqual(reward, 1.0 - 0.75**2)
+
+    def test_gen_value_leave_one_out_baseline_rewards_relative_accuracy(self):
+        weights = generative_value_reinforce_weights([1.0, 0.75, 0.0], baseline="leave_one_out")
+
+        np.testing.assert_allclose(weights, [0.625, 0.25, -0.875])
+        self.assertAlmostEqual(sum(weights), 0.0)
+
+    def test_gen_value_leave_one_out_baseline_keeps_single_sample_reward(self):
+        self.assertEqual(generative_value_reinforce_weights([0.4], baseline="leave_one_out"), [0.4])
+
+    def test_gen_value_reinforce_baseline_rejects_unknown_mode(self):
+        with self.assertRaisesRegex(ValueError, "Unknown generative-value REINFORCE baseline"):
+            generative_value_reinforce_weights([1.0, 0.0], baseline="centered")
 
     def test_gen_value_validation_holdout_averages_siblings_and_excludes_whole_trajectories(self):
         def pair(prompt_ids, outcome, used):
