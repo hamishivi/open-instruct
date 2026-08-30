@@ -504,6 +504,48 @@ def _optional_sequence_as_list(value: Any) -> list[Any]:
     return [value]
 
 
+def _prediction_group_metrics(
+    predictions: Sequence[float | None], targets: Sequence[float], *, prefix: str
+) -> dict[str, float]:
+    """Summarize one semantically meaningful value-estimation slice.
+
+    Parse failures count as unit error in ``penalized_mse``.  Parsed-only
+    statistics remain separate so a model cannot appear calibrated merely by
+    refusing to emit a valid value on difficult states.
+    """
+    if len(predictions) != len(targets):
+        raise ValueError(f"Predictions and targets differ in length ({len(predictions)} != {len(targets)}).")
+    if not predictions:
+        return {}
+
+    normalized_predictions = [
+        None if prediction is None or not np.isfinite(float(prediction)) else float(prediction)
+        for prediction in predictions
+    ]
+    parsed_indices = [index for index, prediction in enumerate(normalized_predictions) if prediction is not None]
+    metrics = {
+        f"{prefix}_examples": float(len(predictions)),
+        f"{prefix}_parse_rate": len(parsed_indices) / len(predictions),
+        f"{prefix}_penalized_mse": float(
+            np.mean(
+                [
+                    1.0 if prediction is None else (float(prediction) - float(target)) ** 2
+                    for prediction, target in zip(normalized_predictions, targets)
+                ]
+            )
+        ),
+    }
+    if parsed_indices:
+        parsed_predictions = [float(normalized_predictions[index]) for index in parsed_indices]
+        parsed_targets = [float(targets[index]) for index in parsed_indices]
+        metrics[f"{prefix}_pred_mean"] = float(np.mean(parsed_predictions))
+        metrics[f"{prefix}_mc_mean"] = float(np.mean(parsed_targets))
+        metrics[f"{prefix}_mse"] = float(
+            np.mean([(prediction - target) ** 2 for prediction, target in zip(parsed_predictions, parsed_targets)])
+        )
+    return metrics
+
+
 def score_dataset(cfg: ScoreDatasetConfig) -> str:
     import pandas as pd  # noqa: PLC0415
 
@@ -539,6 +581,13 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
     all_preds: list[float | None] = []
     all_mc: list[float] = []
     all_horizon_fractions: list[float] = []
+    grouped_predictions: dict[str, list[float | None]] = {
+        "final_action_correct": [],
+        "final_action_incorrect": [],
+        "intermediate_correct": [],
+        "intermediate_incorrect": [],
+    }
+    grouped_targets: dict[str, list[float]] = {group: [] for group in grouped_predictions}
 
     if cfg.value_model_type == "scalar":
         preds_per_row = _score_with_scalar_value(df, cfg)
@@ -552,11 +601,16 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
     probe_rows = []
     for i, row in df.iterrows():
         is_correct = bool(row.get("rollout_is_correct"))
+        rollout_length = len(row["rollout_tokens"])
         response_token_limit = int(row.get("response_token_limit", 8192))
         for pos, p, mc in zip(row["probe_positions"], preds_per_row[i], row["mc_values"]):
-            prediction = None if p is None else float(p)
+            prediction = None if p is None or not np.isfinite(float(p)) else float(p)
+            state_kind = "final_action" if int(pos) == rollout_length - 1 else "intermediate"
+            group = f"{state_kind}_{'correct' if is_correct else 'incorrect'}"
             all_preds.append(prediction)
             all_mc.append(float(mc))
+            grouped_predictions[group].append(prediction)
+            grouped_targets[group].append(float(mc))
             horizon_fraction = int(pos) / max(response_token_limit, 1)
             all_horizon_fractions.append(horizon_fraction)
             if prediction is not None:
@@ -569,6 +623,7 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
                     "run_name": cfg.run_name,
                     "rollout_idx": i,
                     "rollout_is_correct": is_correct,
+                    "state_kind": state_kind,
                     "probe_position": int(pos),
                     "response_tokens_remaining": response_token_limit - int(pos),
                     "horizon_fraction": horizon_fraction,
@@ -647,6 +702,8 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
         metrics["correct_pred_mean"] = float(np.mean(correct_preds))
     if incorrect_preds:
         metrics["incorrect_pred_mean"] = float(np.mean(incorrect_preds))
+    for group in grouped_predictions:
+        metrics.update(_prediction_group_metrics(grouped_predictions[group], grouped_targets[group], prefix=group))
 
     # Write output parquet.
     import pandas as pd  # noqa: PLC0415

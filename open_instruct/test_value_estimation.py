@@ -89,6 +89,22 @@ class TestValueEstimationStates(unittest.TestCase):
         self.assertEqual(value_estimation._optional_sequence_as_list(None), [])
         self.assertEqual(value_estimation._optional_sequence_as_list(float("nan")), [])
 
+    def test_prediction_group_metrics_penalize_parse_failures(self):
+        metrics = value_estimation._prediction_group_metrics(
+            [0.1, None, float("nan"), 0.9], [0.0, 1.0, 0.0, 1.0], prefix="final_action"
+        )
+
+        self.assertEqual(metrics["final_action_examples"], 4.0)
+        self.assertAlmostEqual(metrics["final_action_parse_rate"], 0.5)
+        self.assertAlmostEqual(metrics["final_action_penalized_mse"], (0.01 + 1.0 + 1.0 + 0.01) / 4)
+        self.assertAlmostEqual(metrics["final_action_pred_mean"], 0.5)
+        self.assertAlmostEqual(metrics["final_action_mc_mean"], 0.5)
+        self.assertAlmostEqual(metrics["final_action_mse"], 0.01)
+
+    def test_prediction_group_metrics_reject_length_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "differ in length"):
+            value_estimation._prediction_group_metrics([0.1], [], prefix="broken")
+
 
 if __name__ == "__main__":
     unittest.main()
