@@ -72,6 +72,7 @@ from open_instruct.value_model_utils import (
     select_gen_value_sft_traces,
     unique_replayed_gen_value_pairs,
     unit_value_to_reward,
+    update_gen_value_success_rate_ema,
     validate_terminal_rewards,
     value_clipped_mse_loss,
     value_metric_sums,
@@ -619,6 +620,21 @@ class TestScoreParsing(unittest.TestCase):
 
 
 class TestValueLoss(unittest.TestCase):
+    def test_gen_value_success_rate_ema_starts_from_first_observation(self):
+        first = update_gen_value_success_rate_ema(None, batch_success_rate=0.18, momentum=0.9)
+        second = update_gen_value_success_rate_ema(first, batch_success_rate=0.08, momentum=0.9)
+
+        self.assertEqual(first, 0.18)
+        self.assertAlmostEqual(second, 0.17)
+
+    def test_gen_value_success_rate_ema_validates_inputs(self):
+        with self.assertRaisesRegex(ValueError, "batch_success_rate"):
+            update_gen_value_success_rate_ema(None, batch_success_rate=-0.1, momentum=0.9)
+        with self.assertRaisesRegex(ValueError, "momentum"):
+            update_gen_value_success_rate_ema(None, batch_success_rate=0.1, momentum=1.0)
+        with self.assertRaisesRegex(ValueError, "previous_rate"):
+            update_gen_value_success_rate_ema(1.1, batch_success_rate=0.1, momentum=0.9)
+
     def test_gen_value_sampled_version_metrics(self):
         metrics = gen_value_sampled_version_metrics(
             [{"critic_version": 5}, {"critic_version": 5}, {"critic_version": 6}]

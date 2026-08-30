@@ -301,7 +301,7 @@ class PolicyTrainerRayProcess(RayProcess):
         self._gen_value_training_queue = None
         self._gen_value_version = 0
         self._gen_value_latest_enqueued_policy_training_step: int | None = None
-        self._gen_value_icc_success_rate = 0.0
+        self._gen_value_icc_success_rate: float | None = None
 
     def set_gen_value_engines(self, engines: list) -> None:
         self._gen_value_engines = engines
@@ -339,8 +339,8 @@ class PolicyTrainerRayProcess(RayProcess):
 
         batch_success_rate = float((stats[0] / stats[1]).item())
         momentum = float(getattr(self.args, "gen_value_icc_momentum", 0.9))
-        self._gen_value_icc_success_rate = (
-            momentum * self._gen_value_icc_success_rate + (1.0 - momentum) * batch_success_rate
+        self._gen_value_icc_success_rate = value_model_utils.update_gen_value_success_rate_ema(
+            self._gen_value_icc_success_rate, batch_success_rate, momentum
         )
         return batch_success_rate, self._gen_value_icc_success_rate
 
@@ -1008,7 +1008,7 @@ class PolicyTrainerRayProcess(RayProcess):
         actor_success_rate = None
         if use_icc:
             actor_model_name = getattr(getattr(self, "model_config", None), "model_name_or_path", None)
-            actor_success_rate = getattr(self, "_gen_value_icc_success_rate", 0.0)
+            actor_success_rate = getattr(self, "_gen_value_icc_success_rate", None)
         response_token_limit = getattr(self.streaming_config, "response_length", None)
 
         prompts: list[str] = []

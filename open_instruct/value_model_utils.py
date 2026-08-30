@@ -111,6 +111,28 @@ def gen_value_sampled_version_metrics(rollouts: list[dict]) -> dict[str, float]:
     }
 
 
+def update_gen_value_success_rate_ema(
+    previous_rate: float | None, batch_success_rate: float, momentum: float
+) -> float:
+    """Update policy-conditioning success rate without a synthetic zero prior.
+
+    The first critic batch is already an unbiased observation of the active
+    policy. Initializing an EMA accumulator at zero makes early prompts claim a
+    success rate smaller by ``1 - momentum`` and creates a train/serve mismatch
+    with offline MC traces. Initialize directly from the first observation, then
+    apply the configured EMA on later batches.
+    """
+    if not math.isfinite(batch_success_rate) or not 0.0 <= batch_success_rate <= 1.0:
+        raise ValueError(f"batch_success_rate must be finite and in [0, 1], got {batch_success_rate}.")
+    if not 0.0 <= momentum < 1.0:
+        raise ValueError(f"momentum must be in [0, 1), got {momentum}.")
+    if previous_rate is None:
+        return float(batch_success_rate)
+    if not math.isfinite(previous_rate) or not 0.0 <= previous_rate <= 1.0:
+        raise ValueError(f"previous_rate must be finite and in [0, 1], got {previous_rate}.")
+    return momentum * previous_rate + (1.0 - momentum) * batch_success_rate
+
+
 def missing_value_fallback(value_min: float, value_max: float) -> float:
     """Return the reward-support value closest to zero for a missing prediction."""
     validate_value_bounds(value_min, value_max)
