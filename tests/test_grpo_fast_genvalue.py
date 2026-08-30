@@ -3,12 +3,15 @@
 
 from queue import Queue
 import threading
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 pytest.importorskip("vllm")
 
+from open_instruct import grpo_fast
 from open_instruct.dataset_transformation import INPUT_IDS_PROMPT_KEY, TokenizerConfig
 from open_instruct.grpo_fast_genvalue import (
     GenValueExperimentConfig,
@@ -245,6 +248,67 @@ def test_genvalue_config_rejects_negative_inference_temperature():
     kwargs["gen_value_inference_temperature"] = -0.1
     with pytest.raises(ValueError, match="gen_value_inference_temperature must be >= 0"):
         GenValueExperimentConfig(**kwargs)
+
+
+def test_actor_values_and_reinforce_samples_use_independent_temperatures(monkeypatch):
+    trainer_cls = grpo_fast.PolicyTrainerRayProcess.__ray_metadata__.modified_class
+    trainer = object.__new__(trainer_cls)
+    trainer._gen_value_version = 7
+    trainer.args = SimpleNamespace(
+        gen_value_max_new_tokens=16,
+        gen_value_temperature=1.0,
+        gen_value_inference_temperature=0.0,
+    )
+
+    engine = MagicMock()
+    engine.generate_request_outputs.remote.side_effect = lambda prompts, **kwargs: [
+        {"temperature": kwargs["temperature"], "prompt": prompt} for prompt in prompts
+    ]
+    trainer._gen_value_engines = [engine]
+    monkeypatch.setattr(grpo_fast, "ray_get_with_progress", lambda refs, **_: (refs, None))
+
+    def finish(_, request, outputs):
+        temperature = float(outputs[0]["temperature"])
+        return torch.tensor([temperature]), [{"request_output": outputs[0], "request": request}]
+
+    trainer._finish_gen_value_scoring_request = MethodType(finish, trainer)
+    results = trainer._score_gen_value_requests([{"prompts": ["a", "b"]}])
+
+    assert [call.kwargs["temperature"] for call in engine.generate_request_outputs.remote.call_args_list] == [0.0, 1.0]
+    values, pairs = results[0]
+    assert values.tolist() == [0.0]
+    assert pairs[0]["request_output"]["temperature"] == 1.0
+    assert pairs[0]["critic_version"] == 7
+
+
+def test_matching_critic_temperatures_reuse_one_completion(monkeypatch):
+    trainer_cls = grpo_fast.PolicyTrainerRayProcess.__ray_metadata__.modified_class
+    trainer = object.__new__(trainer_cls)
+    trainer._gen_value_version = 3
+    trainer.args = SimpleNamespace(
+        gen_value_max_new_tokens=16,
+        gen_value_temperature=0.7,
+        gen_value_inference_temperature=None,
+    )
+
+    engine = MagicMock()
+    engine.generate_request_outputs.remote.side_effect = lambda prompts, **kwargs: [
+        {"temperature": kwargs["temperature"], "prompt": prompt} for prompt in prompts
+    ]
+    trainer._gen_value_engines = [engine]
+    monkeypatch.setattr(grpo_fast, "ray_get_with_progress", lambda refs, **_: (refs, None))
+
+    def finish(_, request, outputs):
+        temperature = float(outputs[0]["temperature"])
+        return torch.tensor([temperature]), [{"request_output": outputs[0], "request": request}]
+
+    trainer._finish_gen_value_scoring_request = MethodType(finish, trainer)
+    values, pairs = trainer._score_gen_value_requests([{"prompts": ["a"]}])[0]
+
+    assert engine.generate_request_outputs.remote.call_count == 1
+    assert values.tolist() == pytest.approx([0.7])
+    assert pairs[0]["request_output"]["temperature"] == pytest.approx(0.7)
+    assert pairs[0]["critic_version"] == 3
 
 
 def test_genvalue_config_bad_score_range():
