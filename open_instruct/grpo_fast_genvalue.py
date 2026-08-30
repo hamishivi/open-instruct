@@ -698,6 +698,12 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
     # Independent critic update cadence. The default critic batch contains the same
     # number of complete rollouts as one global policy batch, irrespective of policy world size.
     gen_value_batch_size: int | None = None
+    # Maximum number of complete policy batches that may wait for critic training.
+    # This is intentionally independent of the policy rollout pipeline's async_steps:
+    # actor generation can be usefully asynchronous without allowing critic training
+    # data to become equally stale. Enqueue blocks at this limit; unlike policy
+    # generation, no stale critic batch is discarded.
+    gen_value_max_async_steps: int = 1
     # Conditioning for the gen-value prompt: one of none, gt, correct_demo, rollout_context.
     gen_value_conditioning: str = "none"
     # Paper-style In-Context Conditioning: identify the active actor and provide an EMA of
@@ -787,6 +793,8 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
             raise ValueError(f"--gen_value_learning_rate must be > 0, got {self.gen_value_learning_rate}.")
         if self.gen_value_batch_size is not None and self.gen_value_batch_size <= 0:
             raise ValueError(f"--gen_value_batch_size must be > 0, got {self.gen_value_batch_size}.")
+        if self.gen_value_max_async_steps <= 0:
+            raise ValueError(f"--gen_value_max_async_steps must be > 0, got {self.gen_value_max_async_steps}.")
         if self.gen_value_sync_freq < 0:
             raise ValueError(f"--gen_value_sync_freq must be >= 0, got {self.gen_value_sync_freq}.")
         if self.gen_value_min_advantage_gap_for_policy_update is not None and (
@@ -1721,7 +1729,9 @@ def main():
                     initial_synced_version,
                 )
 
-        queue_capacity = max(args.world_size * max(streaming_config.async_steps, 1), args.world_size)
+        queue_capacity = value_model_utils.gen_value_training_queue_capacity(
+            args.world_size, args.gen_value_max_async_steps
+        )
         gen_value_training_queue = ray_queue.Queue(maxsize=queue_capacity)
 
         utils.ray_get_with_progress(
@@ -1738,10 +1748,12 @@ def main():
             health_check_fn=lambda: _check_gen_value_engines(gen_value_vllm_engines),
         )
         logger.info(
-            "Gen-value injection wired: %d engine(s), critic batch=%d, queue capacity=%d → %d policy actor(s).",
+            "Gen-value injection wired: %d engine(s), critic batch=%d, queue capacity=%d "
+            "(max async critic steps=%d; stale batches retained) → %d policy actor(s).",
             len(gen_value_vllm_engines),
             gen_value_batch_size,
             queue_capacity,
+            args.gen_value_max_async_steps,
             len(policy_group.models),
         )
 
@@ -1878,8 +1890,9 @@ def main():
                 # Publish only between policy steps. All learners have completed
                 # critic scoring, so one simple boundary replaces a distributed gate.
                 sync_freq = args.gen_value_sync_freq
-                next_sync_version = (synced_version // sync_freq + 1) * sync_freq if sync_freq > 0 else None
-                if next_sync_version is not None and critic_version >= next_sync_version:
+                if value_model_utils.should_publish_gen_value_weights(
+                    critic_version, synced_version, sync_freq, args.gen_value_max_async_steps
+                ):
                     sync_metrics = _sync_gen_value_weights(
                         gen_value_trainer,
                         gen_value_vllm_engines,

@@ -54,7 +54,11 @@ GEN_VALUE_CONDITIONING="${GEN_VALUE_CONDITIONING:-none}"
 GEN_VALUE_REINFORCE_BASELINE="${GEN_VALUE_REINFORCE_BASELINE:-leave_one_out_by_outcome}"
 GEN_VALUE_LEARNING_RATE="${GEN_VALUE_LEARNING_RATE:-1e-6}"
 GEN_VALUE_SYNC_FREQ="${GEN_VALUE_SYNC_FREQ:-5}"
-GEN_VALUE_MIN_ADVANTAGE_GAP="${GEN_VALUE_MIN_ADVANTAGE_GAP:-0.20}"
+GEN_VALUE_MAX_ASYNC_STEPS="${GEN_VALUE_MAX_ASYNC_STEPS:-1}"
+# A small/positive advantage gap remains useful signal. Keep only a hard guard
+# against reversed separation; use the continuous gap to drive critic diagnostics
+# and subsequent critic-compute decisions instead of freezing at 0.20.
+GEN_VALUE_MIN_ADVANTAGE_GAP="${GEN_VALUE_MIN_ADVANTAGE_GAP:-0.0}"
 GEN_VALUE_MODEL_SNAPSHOT_FREQ="${GEN_VALUE_MODEL_SNAPSHOT_FREQ:-25}"
 JOINT_TRAINING_STEPS="${JOINT_TRAINING_STEPS:-300}"
 VALUE_WARMUP_STEPS="${VALUE_WARMUP_STEPS:-0}"
@@ -154,6 +158,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --gen_value_reinforce_baseline "${GEN_VALUE_REINFORCE_BASELINE}" \
     --gen_value_final_action_replay_weight 4 \
     --gen_value_sync_freq "${GEN_VALUE_SYNC_FREQ}" \
+    --gen_value_max_async_steps "${GEN_VALUE_MAX_ASYNC_STEPS}" \
     --gen_value_min_advantage_gap_for_policy_update "${GEN_VALUE_MIN_ADVANTAGE_GAP}" \
     --gen_value_diagnostic_scoring_freq 0 \
     --gen_value_validation_freq 25 \

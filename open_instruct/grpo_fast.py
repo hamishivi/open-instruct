@@ -2528,7 +2528,12 @@ class PolicyTrainerRayProcess(RayProcess):
                 sae_step_metrics.update(
                     value_model_utils.gen_value_sampled_version_metrics(_gen_value_training_rollouts)
                 )
+                critic_enqueue_started_at = time.perf_counter()
                 self._gen_value_training_queue.put(_gen_value_training_rollouts)
+                sae_step_metrics["gen_value/training_queue_backpressure_seconds"] = (
+                    time.perf_counter() - critic_enqueue_started_at
+                )
+                sae_step_metrics["gen_value/max_async_steps"] = float(self.args.gen_value_max_async_steps)
                 self._gen_value_latest_enqueued_policy_training_step = training_step
                 sae_step_metrics["gen_value/enqueued_rollouts"] = float(len(_gen_value_training_rollouts))
                 sae_step_metrics["gen_value/training_queue_size"] = float(self._gen_value_training_queue.qsize())
