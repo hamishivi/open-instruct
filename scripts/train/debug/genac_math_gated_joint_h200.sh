@@ -19,7 +19,10 @@ if [[ ! -s "${WARMUP_GATE_SUMMARY}" ]]; then
     exit 1
 fi
 
-mapfile -t warmup_candidates < <(
+warmup_candidates=()
+while IFS= read -r candidate; do
+    warmup_candidates+=("${candidate}")
+done < <(
     find "${WARMUP_OUTPUT_ROOT}" \
         -type d \
         -path '*/gen_value_model_checkpoints/version_000025/gen_value_model' \
@@ -111,4 +114,4 @@ else
 fi
 
 export GEN_VALUE_MODEL_PATH
-exec bash "${JOINT_LAUNCH_SCRIPT}" "$@"
+exec "${JOINT_LAUNCH_SCRIPT}" "$@"
