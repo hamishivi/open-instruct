@@ -98,3 +98,18 @@ def test_near_horizon_detection_requires_incorrect_outcome_and_little_budget():
     assert value_model_utils.is_gen_value_near_horizon_incorrect(near_horizon)
     assert not value_model_utils.is_gen_value_near_horizon_incorrect({**near_horizon, "outcome": 1.0})
     assert not value_model_utils.is_gen_value_near_horizon_incorrect({**near_horizon, "response_tokens_used": 6000})
+
+
+def test_gen_value_validation_reports_early_to_late_value_deltas():
+    examples = [
+        {"kind": "segment_start", "target": 1.0, "trajectory_fraction": 0.25},
+        {"kind": "segment_start", "target": 1.0, "trajectory_fraction": 0.75},
+        {"kind": "segment_start", "target": 0.0, "trajectory_fraction": 0.25},
+        {"kind": "segment_start", "target": 0.0, "trajectory_fraction": 0.75},
+    ]
+
+    metrics = value_model_utils.gen_value_validation_metrics(examples, [0.2, 0.8, 0.5, 0.1])
+
+    assert metrics["gen_value/validation_prefix_correct_early_to_late_delta"] == pytest.approx(0.6)
+    assert metrics["gen_value/validation_prefix_incorrect_early_to_late_delta"] == pytest.approx(-0.4)
+    assert metrics["gen_value/validation_prefix_value_gap_early_to_late_delta"] == pytest.approx(1.0)

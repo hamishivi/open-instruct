@@ -2456,6 +2456,27 @@ class PolicyTrainerRayProcess(RayProcess):
                 ("gen_value/terminal_vhat_correct_mean", _gen_value_terminal_vhat_correct),
                 ("gen_value/terminal_vhat_incorrect_mean", _gen_value_terminal_vhat_incorrect),
             ]
+            edge_bin_count = max(1, _NUM_PCT_BINS // 4)
+            diagnostic_series.extend(
+                (
+                    (
+                        "value/correct_early_mean",
+                        [value for bin_values in _vdiag_correct[:edge_bin_count] for value in bin_values],
+                    ),
+                    (
+                        "value/correct_late_mean",
+                        [value for bin_values in _vdiag_correct[-edge_bin_count:] for value in bin_values],
+                    ),
+                    (
+                        "value/incorrect_early_mean",
+                        [value for bin_values in _vdiag_incorrect[:edge_bin_count] for value in bin_values],
+                    ),
+                    (
+                        "value/incorrect_late_mean",
+                        [value for bin_values in _vdiag_incorrect[-edge_bin_count:] for value in bin_values],
+                    ),
+                )
+            )
             for bin_idx in range(_NUM_PCT_BINS):
                 tag = f"{bin_idx:03d}"
                 diagnostic_series.extend(
@@ -2481,6 +2502,17 @@ class PolicyTrainerRayProcess(RayProcess):
             incorrect_vhat = sae_step_metrics.get("gen_value/terminal_vhat_incorrect_mean")
             if correct_vhat is not None and incorrect_vhat is not None:
                 sae_step_metrics["gen_value/terminal_vhat_gap"] = correct_vhat - incorrect_vhat
+            progress_deltas: dict[str, float] = {}
+            for outcome in ("correct", "incorrect"):
+                early = sae_step_metrics.get(f"value/{outcome}_early_mean")
+                late = sae_step_metrics.get(f"value/{outcome}_late_mean")
+                if early is not None and late is not None:
+                    progress_deltas[outcome] = late - early
+                    sae_step_metrics[f"value/{outcome}_early_to_late_delta"] = progress_deltas[outcome]
+            if len(progress_deltas) == 2:
+                sae_step_metrics["value/separation_early_to_late_delta"] = (
+                    progress_deltas["correct"] - progress_deltas["incorrect"]
+                )
             # Pipe complete rollouts to the independent critic loop. The bounded
             # queue provides backpressure instead of silently dropping critic data.
             if _use_gen_value and self._gen_value_training_queue is not None and _gen_value_training_rollouts:

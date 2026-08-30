@@ -750,6 +750,15 @@ def gen_value_validation_metrics(
                 metrics[f"gen_value/validation_prefix_{band}_correct_v_hat_mean"]
                 - metrics[f"gen_value/validation_prefix_{band}_incorrect_v_hat_mean"]
             )
+    for outcome in ("correct", "incorrect"):
+        early = metrics.get(f"gen_value/validation_prefix_early_{outcome}_v_hat_mean")
+        late = metrics.get(f"gen_value/validation_prefix_late_{outcome}_v_hat_mean")
+        if early is not None and late is not None:
+            metrics[f"gen_value/validation_prefix_{outcome}_early_to_late_delta"] = late - early
+    early_gap = metrics.get("gen_value/validation_prefix_early_value_gap")
+    late_gap = metrics.get("gen_value/validation_prefix_late_value_gap")
+    if early_gap is not None and late_gap is not None:
+        metrics["gen_value/validation_prefix_value_gap_early_to_late_delta"] = late_gap - early_gap
     return metrics
 
 
