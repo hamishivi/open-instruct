@@ -680,6 +680,10 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
     # How often (in critic optimizer updates) to publish gen-value weights to vLLM.
     # Set to 0 to keep the serving critic frozen while its trainer continues updating.
     gen_value_sync_freq: int = 1
+    # Optional four-prompt qualitative diagnostic. Full-length critic generations
+    # monopolize the shared vLLM lock, so keep this disabled when fixed held-out
+    # validation already measures calibration.
+    gen_value_diagnostic_scoring_freq: int = 0
     # Fixed held-out states captured from the first on-policy batch and excluded from
     # its REINFORCE update. Rescore them at critic version 0 and each frequency multiple.
     gen_value_validation_freq: int = 0
@@ -740,6 +744,10 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
             raise ValueError(f"--gen_value_batch_size must be > 0, got {self.gen_value_batch_size}.")
         if self.gen_value_sync_freq < 0:
             raise ValueError(f"--gen_value_sync_freq must be >= 0, got {self.gen_value_sync_freq}.")
+        if self.gen_value_diagnostic_scoring_freq < 0:
+            raise ValueError(
+                f"--gen_value_diagnostic_scoring_freq must be >= 0, got {self.gen_value_diagnostic_scoring_freq}."
+            )
         if self.gen_value_validation_freq < 0:
             raise ValueError(f"--gen_value_validation_freq must be >= 0, got {self.gen_value_validation_freq}.")
         if self.gen_value_validation_max_examples < 0:
@@ -1685,7 +1693,7 @@ def main():
     stop_event = threading.Event()
     executor = futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="grpo_genvalue")
 
-    if gen_value_vllm_engines:
+    if gen_value_vllm_engines and args.gen_value_diagnostic_scoring_freq > 0:
         gen_value_scoring_future = executor.submit(
             _gen_value_scoring_loop,
             args,
@@ -1880,7 +1888,12 @@ def main():
 
         step_kwargs["post_training_metrics_callback"] = _critic_post_training_metrics_callback
         result = _original_one_training_step(*step_args, **step_kwargs)
-        if gen_value_vllm_engines and not gen_value_stop_event.is_set():
+        if (
+            gen_value_vllm_engines
+            and not gen_value_stop_event.is_set()
+            and args.gen_value_diagnostic_scoring_freq > 0
+            and policy_step % args.gen_value_diagnostic_scoring_freq == 0
+        ):
             gen_value_step_trigger.set()
         _raise_if_gen_value_background_failed()
         return result

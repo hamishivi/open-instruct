@@ -120,6 +120,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --gen_value_reinforce_coef 1.0 \
     --gen_value_reinforce_baseline leave_one_out \
     --gen_value_sync_freq 5 \
+    --gen_value_diagnostic_scoring_freq 0 \
     --gen_value_validation_freq 25 \
     --gen_value_validation_max_examples 128 \
     --gen_value_validation_prompt_holdout_fraction 0.125 \
