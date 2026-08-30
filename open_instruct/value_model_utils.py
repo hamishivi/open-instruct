@@ -1325,11 +1325,6 @@ def build_generative_value_prompt(
             f"The response has used {used} of its {response_token_limit} token budget; "
             f"{response_token_limit - used} tokens remain."
         )
-        state_context.append(
-            "The remaining budget is only a hard maximum, not evidence that the actor will continue. "
-            "The actor may stop at any point; if the response already presents a final answer or conclusion, "
-            "treat termination as likely and judge that answer rather than assuming a later correction."
-        )
 
     state_context_block = "\n".join(state_context)
     if state_context_block:

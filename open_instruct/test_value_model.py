@@ -609,8 +609,6 @@ class TestScoreParsing(unittest.TestCase):
         self.assertIn("The active actor is Qwen/Qwen3-4B-Base", p)
         self.assertIn("success rate on this task distribution is 12.5%", p)
         self.assertIn("used 7000 of its 8192 token budget; 1192 tokens remain", p)
-        self.assertIn("remaining budget is only a hard maximum, not evidence that the actor will continue", p)
-        self.assertIn("if the response already presents a final answer or conclusion, treat termination as likely", p)
 
     def test_prompt_rejects_invalid_remaining_budget_context(self):
         with self.assertRaisesRegex(ValueError, "response_tokens_used must be in"):
