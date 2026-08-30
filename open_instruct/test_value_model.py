@@ -68,6 +68,7 @@ from open_instruct.value_model_utils import (
     reward_to_unit_value,
     segment_rollout,
     select_gen_value_sft_traces,
+    unique_replayed_gen_value_pairs,
     unit_value_to_reward,
     validate_terminal_rewards,
     value_clipped_mse_loss,
@@ -794,6 +795,13 @@ class TestValueLoss(unittest.TestCase):
         replayed = replay_gen_value_final_actions([segment, final], replay_weight=4)
 
         self.assertEqual(replayed, [segment, final, final, final, final])
+
+    def test_gen_value_replay_deduplication_preserves_unique_state_order(self):
+        segment = {"state_kind": "segment_start", "id": 1}
+        final = {"state_kind": "final_action", "id": 2}
+        replayed = replay_gen_value_final_actions([segment, final], replay_weight=4)
+
+        self.assertEqual(unique_replayed_gen_value_pairs(replayed), [segment, final])
 
     def test_gen_value_reinforce_baseline_rejects_unknown_mode(self):
         with self.assertRaisesRegex(ValueError, "Unknown generative-value REINFORCE baseline"):

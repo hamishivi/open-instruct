@@ -374,6 +374,7 @@ class GenValueTrainerActor:
         parsed_v_hats: list[float] = []  # Only for pairs where parsing succeeded.
         near_horizon_incorrect_v_hats: list[float] = []
         near_horizon_incorrect_mses: list[float] = []
+        diagnostic_pair_ids = {id(pair) for pair in value_model_utils.unique_replayed_gen_value_pairs(training_pairs)}
         for pair in training_pairs:
             if pair["outcome"] is None:
                 continue
@@ -402,7 +403,12 @@ class GenValueTrainerActor:
             if v_hat is not None:
                 parsed_v_hats.append(v_hat)
             reward, squared_error = value_model_utils.generative_value_reinforce_reward(outcome, v_hat)
-            self._maybe_store_training_trace(pair, prompt_ids, completion.text, outcome, v_hat, squared_error, reward)
+            is_first_replay = id(pair) in diagnostic_pair_ids
+            if is_first_replay:
+                diagnostic_pair_ids.remove(id(pair))
+                self._maybe_store_training_trace(
+                    pair, prompt_ids, completion.text, outcome, v_hat, squared_error, reward
+                )
             if squared_error is not None:
                 mses.append(squared_error)
                 response_tokens_used = pair.get("response_tokens_used")
@@ -411,7 +417,7 @@ class GenValueTrainerActor:
                     response_token_limit = int(response_token_limit)
                     remaining_tokens = response_token_limit - int(response_tokens_used)
                     near_horizon_threshold = max(512, math.ceil(0.1 * response_token_limit))
-                    if outcome <= 0.5 and remaining_tokens <= near_horizon_threshold:
+                    if is_first_replay and outcome <= 0.5 and remaining_tokens <= near_horizon_threshold:
                         near_horizon_incorrect_v_hats.append(v_hat)
                         near_horizon_incorrect_mses.append(squared_error)
             validated_examples.append(

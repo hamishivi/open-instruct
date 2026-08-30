@@ -362,6 +362,19 @@ def replay_gen_value_final_actions(
     return replayed
 
 
+def unique_replayed_gen_value_pairs(training_pairs: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove identity-preserving replay copies while retaining original order."""
+    seen: set[int] = set()
+    unique: list[dict[str, Any]] = []
+    for pair in training_pairs:
+        identity = id(pair)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(pair)
+    return unique
+
+
 def build_gen_value_validation_holdout(
     rollouts: list[dict[str, Any]], max_examples: int, seed: int = 0, prompt_holdout_fraction: float = 0.125
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
