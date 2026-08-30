@@ -1,24 +1,20 @@
 #!/bin/bash
 set -euo pipefail
 
-: "${MODEL_PATH:?Set MODEL_PATH to the exported generative-critic model directory.}"
 : "${TRACE_JSONL:?Set TRACE_JSONL to a filtered raw-prompt trace JSONL file.}"
 
-if [[ ! -d "${MODEL_PATH}" ]]; then
-    echo "MODEL_PATH is not a directory: ${MODEL_PATH}" >&2
-    exit 1
-fi
 if [[ ! -f "${TRACE_JSONL}" ]]; then
     echo "TRACE_JSONL is not a file: ${TRACE_JSONL}" >&2
     exit 1
 fi
 
+MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-4B-Base}
 NUM_GPUS=${NUM_GPUS:-4}
 MAX_SEQ_LENGTH=${MAX_SEQ_LENGTH:-32768}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-4}
 LEARNING_RATE=${LEARNING_RATE:-1e-6}
 NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS:-2}
-EXP_NAME=${EXP_NAME:-genac-math-value-trace-sft}
+EXP_NAME=${EXP_NAME:-genac-math-value-teacher-sft}
 OUTPUT_DIR=${OUTPUT_DIR:-output/${EXP_NAME}}
 
 accelerate launch \
