@@ -89,6 +89,7 @@ class TestGenValueSFTSynthesis(unittest.TestCase):
         self.assertEqual(request["body"]["model"], "Qwen/Qwen3-8B")
         self.assertEqual(request["body"]["messages"][-1], {"role": "user", "content": "critic prompt"})
         self.assertIn("<answer>N</answer>", request["body"]["messages"][0]["content"])
+        self.assertEqual(request["body"]["chat_template_kwargs"], {"enable_thinking": False})
         self.assertFalse(request["body"]["stream"])
 
     def test_extract_response_text_supports_local_reasoning_content(self):

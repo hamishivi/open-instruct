@@ -112,6 +112,11 @@ def make_batch_request(
                     {"role": "system", "content": DEFAULT_TEACHER_INSTRUCTIONS},
                     {"role": "user", "content": prompt},
                 ],
+                # Qwen3's default hidden-thinking mode can consume the entire
+                # critic response budget before producing the required score.
+                # Disable it here; the visible answer is still explicitly
+                # prompted to contain concise value-focused reasoning.
+                "chat_template_kwargs": {"enable_thinking": False},
                 "max_tokens": max_output_tokens,
                 "temperature": 0.6,
                 "top_p": 0.95,
