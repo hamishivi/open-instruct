@@ -819,8 +819,8 @@ def get_wandb_tags() -> list[str]:
 # Check pointing utilities
 def get_last_checkpoint(folder: str, incomplete: bool = False) -> str | None:
     content = os.listdir(folder)
-    checkpoint_steps = [path for path in content if path.startswith("step_")]
-    checkpoint_epochs = [path for path in content if path.startswith("epoch_")]
+    checkpoint_steps = [path for path in content if re.fullmatch(r"step_\d+", path)]
+    checkpoint_epochs = [path for path in content if re.fullmatch(r"epoch_\d+", path)]
     if len(checkpoint_steps) > 0 and len(checkpoint_epochs) > 0:
         logger.info("Mixed step and epoch checkpoints found. Using step checkpoints.")
         checkpoints = checkpoint_steps
@@ -851,7 +851,7 @@ def get_last_checkpoint_path(args, incomplete: bool = False) -> str:
 
 
 def is_checkpoint_folder(dir: str, folder: str) -> bool:
-    return (folder.startswith("step_") or folder.startswith("epoch_")) and os.path.isdir(os.path.join(dir, folder))
+    return re.fullmatch(r"(?:step|epoch)_\d+", folder) is not None and os.path.isdir(os.path.join(dir, folder))
 
 
 def clean_last_n_checkpoints(output_dir: str, keep_last_n_checkpoints: int) -> None:
