@@ -29,8 +29,10 @@ export TOKENIZERS_PARALLELISM=false
 export HF_HOME="${HF_HOME:-/tmp/hf_home}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 
+RAY_PORT="${RAY_PORT:-$((8000 + ${SLURM_JOB_ID:-0} % 1000))}"
+RAY_TEMP_DIR="${RAY_TEMP_DIR:-/tmp/ray-${USER}-${SLURM_JOB_ID:-local}}"
 ray stop --force 2>/dev/null || true
-ray start --head --port=8888 --dashboard-host=0.0.0.0
+ray start --head --port="${RAY_PORT}" --temp-dir="${RAY_TEMP_DIR}" --dashboard-host=0.0.0.0
 trap 'ray stop --force' EXIT
 
 mkdir -p "${HOME}/.triton/autotune"

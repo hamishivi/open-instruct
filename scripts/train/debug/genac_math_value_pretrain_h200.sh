@@ -41,8 +41,10 @@ if [[ ! "${VALUE_PRETRAIN_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 TOTAL_EPISODES=$((VALUE_PRETRAIN_STEPS * NUM_UNIQUE_PROMPTS_ROLLOUT * NUM_SAMPLES_PER_PROMPT_ROLLOUT))
 
+RAY_PORT="${RAY_PORT:-$((8000 + ${SLURM_JOB_ID:-0} % 1000))}"
+RAY_TEMP_DIR="${RAY_TEMP_DIR:-/tmp/ray-${USER}-${SLURM_JOB_ID:-local}}"
 ray stop --force 2>/dev/null || true
-ray start --head --port=8888 --dashboard-host=0.0.0.0
+ray start --head --port="${RAY_PORT}" --temp-dir="${RAY_TEMP_DIR}" --dashboard-host=0.0.0.0
 trap 'ray stop --force' EXIT
 
 mkdir -p "${HOME}/.triton/autotune"
