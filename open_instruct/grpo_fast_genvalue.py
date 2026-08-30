@@ -1727,7 +1727,7 @@ def main():
             tc.ground_truths_key,
         )
 
-        assert gen_value_trainer is not None
+    if gen_value_trainer is not None:
         gen_value_reinforce_future = executor.submit(
             _gen_value_reinforce_loop,
             gen_value_trainer,
