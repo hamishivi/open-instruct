@@ -144,35 +144,3 @@ def test_gen_value_training_queue_capacity(world_size: int, max_async_steps: int
 def test_gen_value_training_queue_capacity_rejects_invalid_values(world_size: int, max_async_steps: int):
     with pytest.raises(ValueError):
         value_model_utils.gen_value_training_queue_capacity(world_size, max_async_steps)
-
-
-@pytest.mark.parametrize(
-    ("critic_version", "synced_version", "sync_freq", "max_async_steps", "expected"),
-    [
-        (0, 0, 5, 1, False),
-        (1, 0, 5, 1, True),
-        (1, 0, 5, 2, False),
-        (2, 0, 5, 2, True),
-        (5, 4, 5, 8, True),
-        (8, 5, 5, 8, False),
-        (8, 5, 0, 1, False),
-    ],
-)
-def test_should_publish_gen_value_weights(
-    critic_version: int, synced_version: int, sync_freq: int, max_async_steps: int, expected: bool
-):
-    assert (
-        value_model_utils.should_publish_gen_value_weights(critic_version, synced_version, sync_freq, max_async_steps)
-        is expected
-    )
-
-
-@pytest.mark.parametrize(
-    ("critic_version", "synced_version", "sync_freq", "max_async_steps"),
-    [(-1, 0, 1, 1), (0, -1, 1, 1), (0, 1, 1, 1), (0, 0, -1, 1), (0, 0, 1, 0)],
-)
-def test_should_publish_gen_value_weights_rejects_invalid_values(
-    critic_version: int, synced_version: int, sync_freq: int, max_async_steps: int
-):
-    with pytest.raises(ValueError):
-        value_model_utils.should_publish_gen_value_weights(critic_version, synced_version, sync_freq, max_async_steps)

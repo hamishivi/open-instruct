@@ -1890,9 +1890,8 @@ def main():
                 # Publish only between policy steps. All learners have completed
                 # critic scoring, so one simple boundary replaces a distributed gate.
                 sync_freq = args.gen_value_sync_freq
-                if value_model_utils.should_publish_gen_value_weights(
-                    critic_version, synced_version, sync_freq, args.gen_value_max_async_steps
-                ):
+                next_sync_version = (synced_version // sync_freq + 1) * sync_freq if sync_freq > 0 else None
+                if next_sync_version is not None and critic_version >= next_sync_version:
                     sync_metrics = _sync_gen_value_weights(
                         gen_value_trainer,
                         gen_value_vllm_engines,

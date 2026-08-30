@@ -140,28 +140,6 @@ def gen_value_training_queue_capacity(world_size: int, max_async_steps: int) -> 
     return world_size * max_async_steps
 
 
-def should_publish_gen_value_weights(
-    critic_version: int, synced_version: int, sync_freq: int, max_async_steps: int
-) -> bool:
-    """Publish on the requested cadence or before serving weights get too stale.
-
-    ``sync_freq=0`` remains an explicit frozen-serving mode. Otherwise the
-    asynchronous bound takes precedence over a slower periodic cadence.
-    """
-    if critic_version < 0 or synced_version < 0:
-        raise ValueError("critic and synced versions must be nonnegative.")
-    if critic_version < synced_version:
-        raise ValueError(f"critic_version {critic_version} cannot trail synced_version {synced_version}.")
-    if sync_freq < 0:
-        raise ValueError(f"sync_freq must be nonnegative, got {sync_freq}.")
-    if max_async_steps <= 0:
-        raise ValueError(f"max_async_steps must be positive, got {max_async_steps}.")
-    if sync_freq == 0 or critic_version == synced_version:
-        return False
-    next_periodic_version = (synced_version // sync_freq + 1) * sync_freq
-    return critic_version >= next_periodic_version or critic_version - synced_version >= max_async_steps
-
-
 def update_gen_value_success_rate_ema(
     previous_rate: float | None, batch_success_rate: float, momentum: float
 ) -> float:
