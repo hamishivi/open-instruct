@@ -37,7 +37,7 @@ from typing import Any
 
 import numpy as np
 
-from open_instruct import logger_utils
+from open_instruct import logger_utils, value_model_utils
 
 logger = logger_utils.setup_logger(__name__)
 
@@ -260,6 +260,43 @@ def _fixed_probe_positions(
     return [positions[index] for index in sorted(set(selected_indices.tolist()))]
 
 
+def _sae_probe_positions(
+    rollout_tokens: Sequence[int],
+    response_logprobs: Sequence[float],
+    sae_threshold: float,
+    max_segments: int,
+    include_final_action_probe: bool,
+) -> list[int]:
+    """Mirror the causal states queried by online GenAC SAE scoring.
+
+    ``segment_rollout`` returns inclusive segment *ends*. Online GenAC converts
+    those boundaries to segment starts, querying state zero and every state just
+    after a preceding boundary. It can additionally query the state immediately
+    before the sampled final action, so the total probe count may be
+    ``max_segments + 1``. Keeping that extra state is intentional and matches the
+    online critic rather than treating ``max_segments`` as a total-probe cap.
+    """
+    rollout_length = len(rollout_tokens)
+    if rollout_length == 0:
+        return []
+    if len(response_logprobs) != rollout_length:
+        raise ValueError(
+            "SAE response_logprobs must align one-to-one with rollout_tokens, got "
+            f"{len(response_logprobs)} and {rollout_length}."
+        )
+    boundaries = value_model_utils.segment_rollout(
+        response_tokens=list(rollout_tokens),
+        response_logprobs=list(response_logprobs),
+        mode="sae",
+        sae_threshold=sae_threshold,
+        max_segments=max_segments,
+    )
+    segment_starts = [0, *(boundary + 1 for boundary in boundaries[:-1])]
+    if include_final_action_probe and segment_starts[-1] != rollout_length - 1:
+        segment_starts.append(rollout_length - 1)
+    return segment_starts
+
+
 _VERIFIER_CACHE: dict[str, Any] = {}
 
 
@@ -405,30 +442,12 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
             tokens = main["token_ids"]
             length = len(tokens)
             if cfg.probe_mode == "sae":
-                from open_instruct import value_model_utils  # noqa: PLC0415
-
-                raw_boundaries = value_model_utils.segment_rollout(
-                    response_tokens=tokens,
-                    response_logprobs=main.get("logprobs"),
-                    mode="sae",
-                    sae_threshold=cfg.sae_threshold,
-                    max_segments=cfg.max_probes,
+                logprobs = main.get("logprobs")
+                if logprobs is None:
+                    raise RuntimeError("SAE probe selection requires rollout log probabilities.")
+                probe_positions = _sae_probe_positions(
+                    tokens, logprobs, cfg.sae_threshold, cfg.max_probes, cfg.include_final_action_probe
                 )
-                probe_positions = [
-                    t
-                    for t in raw_boundaries
-                    if 0 <= t < length and cfg.max_response_length - t >= cfg.min_probe_remaining_tokens
-                ]
-                if cfg.include_final_action_probe and length > 0:
-                    final_action_probe = length - 1
-                    # Always retain the causal state immediately before the
-                    # sampled final action. It has at least one token of budget,
-                    # even when ordinary probes require a larger continuation.
-                    probe_positions.append(final_action_probe)
-                probe_positions = sorted(set(probe_positions))
-                if len(probe_positions) > cfg.max_probes:
-                    selected_indices = np.linspace(0, len(probe_positions) - 1, num=cfg.max_probes, dtype=int)
-                    probe_positions = [probe_positions[index] for index in sorted(set(selected_indices.tolist()))]
             else:
                 if cfg.probe_mode != "fixed":
                     raise ValueError(f"Unknown probe_mode: {cfg.probe_mode!r}; expected 'fixed' or 'sae'.")
@@ -456,6 +475,12 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
                 "response_token_limit": cfg.max_response_length,
                 "actor_model_name": cfg.model_name_or_path,
                 "actor_success_rate": observed_actor_success_rate,
+                "probe_mode": cfg.probe_mode,
+                "probe_semantics": (
+                    "online_segment_starts_plus_final_action"
+                    if cfg.probe_mode == "sae"
+                    else "fixed_intervals_plus_final_action"
+                ),
             }
             row_idx = len(rows)
             rows.append(row)

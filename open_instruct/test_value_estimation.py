@@ -19,6 +19,42 @@ class _FakeTokenizer:
 
 
 class TestValueEstimationStates(unittest.TestCase):
+    def test_sae_mc_probes_match_online_segment_starts_and_final_action(self):
+        logprobs = [math.log(0.9), math.log(0.1), math.log(0.9), math.log(0.1), math.log(0.9), math.log(0.9)]
+
+        positions = value_estimation._sae_probe_positions(
+            rollout_tokens=[10, 11, 12, 13, 14, 15],
+            response_logprobs=logprobs,
+            sae_threshold=0.2,
+            max_segments=16,
+            include_final_action_probe=True,
+        )
+
+        # Boundaries are [1, 3, 5], so online GenAC queries segment starts
+        # [0, 2, 4], followed by the causal final-action state at 5.
+        self.assertEqual(positions, [0, 2, 4, 5])
+
+    def test_sae_mc_probe_limit_applies_to_segments_not_final_override(self):
+        positions = value_estimation._sae_probe_positions(
+            rollout_tokens=[10, 11, 12, 13, 14, 15],
+            response_logprobs=[math.log(0.1)] * 6,
+            sae_threshold=0.2,
+            max_segments=2,
+            include_final_action_probe=True,
+        )
+
+        self.assertEqual(positions, [0, 1, 5])
+
+    def test_sae_mc_probes_require_aligned_logprobs(self):
+        with self.assertRaisesRegex(ValueError, "align one-to-one"):
+            value_estimation._sae_probe_positions(
+                rollout_tokens=[10, 11],
+                response_logprobs=[math.log(0.1)],
+                sae_threshold=0.2,
+                max_segments=16,
+                include_final_action_probe=True,
+            )
+
     def test_mc_sft_targets_supervise_only_the_direct_score(self):
         tokenizer = _FakeTokenizer()
         examples = prepare_gen_value_mc_sft.build_mc_sft_examples(
