@@ -34,8 +34,19 @@ MODEL_CHECKPOINT_ARGS=()
 if [[ "${SAVE_MODEL_EACH_EPOCH}" == "1" ]]; then
     MODEL_CHECKPOINT_ARGS+=(--save_model_each_epoch)
 fi
+ACCELERATE_NETWORK_ARGS=()
+if [[ -n "${MAIN_PROCESS_PORT:-}" ]]; then
+    ACCELERATE_NETWORK_ARGS+=(--main_process_port "${MAIN_PROCESS_PORT}")
+elif [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    # Multiple four-GPU jobs can share one eight-GPU node. Accelerate otherwise
+    # defaults every single-node job to port 29500, so concurrent jobs collide
+    # before distributed initialization even though their GPUs are disjoint.
+    MAIN_PROCESS_PORT="$((10000 + SLURM_JOB_ID % 50000))"
+    ACCELERATE_NETWORK_ARGS+=(--main_process_port "${MAIN_PROCESS_PORT}")
+fi
 
 accelerate launch \
+    "${ACCELERATE_NETWORK_ARGS[@]}" \
     --mixed_precision bf16 \
     --num_processes "${NUM_GPUS}" \
     --use_deepspeed \
