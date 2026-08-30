@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare and collect GPT-5 teacher traces for GenAC-style cold-start SFT.
+"""Prepare, collect, and select teacher traces for GenAC-style cold-start SFT.
 
 The ``prepare`` command converts a frozen-actor critic trace reservoir into an
 OpenAI Batch API JSONL file plus a metadata sidecar. It balances correct and
@@ -9,6 +9,11 @@ not filter states by the source critic's accuracy: GPT-5 is the teacher.
 The ``collect`` command joins a completed Batch API result file back to the raw
 critic prompts, validates every response, parses its scalar estimate, and writes
 the prompt/completion JSONL consumed by ``genac_math_value_trace_sft_h200.sh``.
+
+The ``consensus`` command keeps a concise primary teacher trace only when its
+score agrees with independent judge teachers.  The sampled rollout outcome is
+used as a calibration gate only at the exact final action: an intermediate state
+can have high continuation value even when one sampled continuation later fails.
 """
 
 from __future__ import annotations
@@ -261,6 +266,7 @@ def collect(args: argparse.Namespace) -> None:
 
     selected: list[dict[str, Any]] = []
     filtered_for_error = 0
+    invalid_score_ids: list[str] = []
     for custom_id, metadata in metadata_by_id.items():
         source = metadata.get("source")
         if not isinstance(source, dict):
@@ -268,6 +274,9 @@ def collect(args: argparse.Namespace) -> None:
         generation = extract_response_text(results_by_id[custom_id])
         raw_prediction = parse_generative_value_score(generation, score_min=0.0, score_max=10.0)
         if raw_prediction is None:
+            if getattr(args, "skip_invalid_scores", False):
+                invalid_score_ids.append(custom_id)
+                continue
             raise ValueError(f"Teacher response {custom_id!r} has no valid <answer> score: {generation!r}")
         prediction = rescale_gen_value_score(raw_prediction, score_min=0.0, score_max=10.0)
         outcome = float(source["outcome"])
@@ -293,6 +302,8 @@ def collect(args: argparse.Namespace) -> None:
         json.dumps(
             {
                 "filtered_for_error": filtered_for_error,
+                "invalid_score_ids": invalid_score_ids,
+                "invalid_scores": len(invalid_score_ids),
                 "output": str(args.output),
                 "selected_examples": len(selected),
                 "teacher_model": args.teacher_model,
@@ -301,6 +312,139 @@ def collect(args: argparse.Namespace) -> None:
             sort_keys=True,
         )
     )
+
+
+def teacher_prediction(example: dict[str, Any], *, source: str, prompt: str) -> float:
+    prediction = example.get("teacher_prediction", example.get("prediction"))
+    if not isinstance(prediction, int | float):
+        raise ValueError(f"Teacher row for prompt {prompt!r} in {source} has no numeric prediction.")
+    prediction = float(prediction)
+    if not 0.0 <= prediction <= 1.0:
+        raise ValueError(f"Teacher prediction for prompt {prompt!r} in {source} is outside [0, 1]: {prediction}.")
+    return prediction
+
+
+def index_teacher_rows(examples: Sequence[dict[str, Any]], *, source: str) -> dict[str, dict[str, Any]]:
+    indexed: dict[str, dict[str, Any]] = {}
+    for row_number, example in enumerate(examples, start=1):
+        prompt = example.get("prompt")
+        if not isinstance(prompt, str) or not prompt:
+            raise ValueError(f"Teacher row {row_number} in {source} has no prompt.")
+        if prompt in indexed:
+            raise ValueError(f"Teacher source {source} contains duplicate prompt {prompt!r}.")
+        teacher_prediction(example, source=source, prompt=prompt)
+        indexed[prompt] = example
+    return indexed
+
+
+def select_teacher_consensus(
+    primary_examples: Sequence[dict[str, Any]],
+    judge_example_groups: Sequence[Sequence[dict[str, Any]]],
+    *,
+    max_teacher_range: float,
+    max_final_teacher_squared_error: float,
+    max_examples_per_outcome: int | None,
+    seed: int,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Select balanced SFT traces using teacher agreement and a final-only outcome gate."""
+    if not judge_example_groups:
+        raise ValueError("Teacher consensus requires at least one independent judge.")
+    if max_teacher_range < 0:
+        raise ValueError(f"max_teacher_range must be nonnegative, got {max_teacher_range}.")
+    if max_final_teacher_squared_error < 0:
+        raise ValueError(
+            "max_final_teacher_squared_error must be nonnegative, "
+            f"got {max_final_teacher_squared_error}."
+        )
+
+    primary_by_prompt = index_teacher_rows(primary_examples, source="primary")
+    judges_by_prompt = [
+        index_teacher_rows(examples, source=f"judge_{index}")
+        for index, examples in enumerate(judge_example_groups, start=1)
+    ]
+    candidates: list[dict[str, Any]] = []
+    stats = {
+        "primary_examples": len(primary_examples),
+        "missing_judge": 0,
+        "teacher_disagreement": 0,
+        "final_outcome_disagreement": 0,
+        "consensus_candidates": 0,
+    }
+    for prompt, primary in primary_by_prompt.items():
+        judge_rows = [judge.get(prompt) for judge in judges_by_prompt]
+        if any(row is None for row in judge_rows):
+            stats["missing_judge"] += 1
+            continue
+        rows = [primary, *(row for row in judge_rows if row is not None)]
+        predictions = [
+            teacher_prediction(row, source=f"teacher_{index}", prompt=prompt) for index, row in enumerate(rows)
+        ]
+        prediction_range = max(predictions) - min(predictions)
+        if prediction_range > max_teacher_range + 1e-12:
+            stats["teacher_disagreement"] += 1
+            continue
+
+        outcome = primary.get("outcome", primary.get("target"))
+        if not isinstance(outcome, int | float) or not 0.0 <= float(outcome) <= 1.0:
+            raise ValueError(f"Primary teacher row for prompt {prompt!r} has no valid outcome.")
+        state_kind = primary.get("state_kind", primary.get("kind"))
+        primary_prediction = predictions[0]
+        # At an exact completed action, the verifier outcome is the value target.
+        # Earlier prefixes are deliberately *not* gated by one sampled future.
+        if state_kind == "final_action" and (float(outcome) - primary_prediction) ** 2 > (
+            max_final_teacher_squared_error + 1e-12
+        ):
+            stats["final_outcome_disagreement"] += 1
+            continue
+
+        candidate = dict(primary)
+        candidate.update(
+            {
+                "outcome": float(outcome),
+                "state_kind": state_kind,
+                "prediction": primary_prediction,
+                # The generic selector performs prompt deduplication and balanced
+                # position/outcome sampling after this independent quality gate.
+                "squared_error": 0.0,
+                "teacher_consensus_mean": sum(predictions) / len(predictions),
+                "teacher_consensus_predictions": predictions,
+                "teacher_consensus_range": prediction_range,
+                "teacher_consensus_size": len(predictions),
+            }
+        )
+        candidates.append(candidate)
+    stats["consensus_candidates"] = len(candidates)
+
+    selected = select_gen_value_sft_traces(
+        candidates,
+        max_squared_error=0.0,
+        min_critic_version=0,
+        max_examples_per_outcome=max_examples_per_outcome,
+        balance_outcomes=True,
+        balance_positions=True,
+        seed=seed,
+    )
+    stats["selected_examples"] = len(selected)
+    stats["selected_correct"] = sum(float(example["outcome"]) > 0.5 for example in selected)
+    stats["selected_incorrect"] = len(selected) - stats["selected_correct"]
+    return selected, stats
+
+
+def consensus(args: argparse.Namespace) -> None:
+    primary_examples = read_jsonl([args.primary])
+    judge_example_groups = [read_jsonl([judge]) for judge in args.judges]
+    selected, stats = select_teacher_consensus(
+        primary_examples,
+        judge_example_groups,
+        max_teacher_range=args.max_teacher_range,
+        max_final_teacher_squared_error=args.max_final_teacher_squared_error,
+        max_examples_per_outcome=args.max_examples_per_outcome,
+        seed=args.seed,
+    )
+    if not selected:
+        raise RuntimeError("No balanced teacher traces remained after consensus selection.")
+    write_jsonl(args.output, selected)
+    print(json.dumps({**stats, "output": str(args.output)}, indent=2, sort_keys=True))
 
 
 def parse_args() -> argparse.Namespace:
@@ -341,7 +485,24 @@ def parse_args() -> argparse.Namespace:
     collect_parser.add_argument("--output", required=True, type=pathlib.Path)
     collect_parser.add_argument("--teacher_model", default="gpt-5")
     collect_parser.add_argument("--max_teacher_squared_error", type=float)
+    collect_parser.add_argument(
+        "--skip_invalid_scores",
+        action="store_true",
+        help="Explicitly report and omit successful responses that never emitted a valid score tag.",
+    )
     collect_parser.set_defaults(function=collect)
+
+    consensus_parser = subparsers.add_parser(
+        "consensus", help="Select a balanced primary-teacher SFT set using independent teacher agreement."
+    )
+    consensus_parser.add_argument("--primary", required=True, type=pathlib.Path)
+    consensus_parser.add_argument("--judges", required=True, nargs="+", type=pathlib.Path)
+    consensus_parser.add_argument("--output", required=True, type=pathlib.Path)
+    consensus_parser.add_argument("--max_teacher_range", type=float, default=0.2)
+    consensus_parser.add_argument("--max_final_teacher_squared_error", type=float, default=0.04)
+    consensus_parser.add_argument("--max_examples_per_outcome", type=int, default=512)
+    consensus_parser.add_argument("--seed", type=int, default=0)
+    consensus_parser.set_defaults(function=consensus)
 
     args = parser.parse_args()
     if args.command == "prepare" and args.max_output_tokens <= 0:
@@ -350,6 +511,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max_examples_per_outcome must be positive.")
     if args.command == "collect" and args.max_teacher_squared_error is not None and args.max_teacher_squared_error < 0:
         parser.error("--max_teacher_squared_error must be nonnegative.")
+    if args.command == "consensus" and args.max_teacher_range < 0:
+        parser.error("--max_teacher_range must be nonnegative.")
+    if args.command == "consensus" and args.max_final_teacher_squared_error < 0:
+        parser.error("--max_final_teacher_squared_error must be nonnegative.")
+    if args.command == "consensus" and args.max_examples_per_outcome <= 0:
+        parser.error("--max_examples_per_outcome must be positive.")
     return args
 
 

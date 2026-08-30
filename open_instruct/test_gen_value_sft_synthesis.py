@@ -9,6 +9,7 @@ from scripts.data.synthesize_gen_value_sft import (
     extract_response_text,
     make_batch_request,
     prepare,
+    select_teacher_consensus,
     select_teacher_states,
 )
 
@@ -202,6 +203,126 @@ class TestGenValueSFTSynthesis(unittest.TestCase):
             self.assertEqual(len(sft_rows), 2)
             self.assertEqual({row["teacher_prediction"] for row in sft_rows}, {0.1, 0.9})
             self.assertTrue(all(row["teacher_model"] == "gpt-5" for row in sft_rows))
+
+    def test_collect_can_skip_an_invalid_score_explicitly(self):
+        good = self._state(1.0, "final_action")
+        bad = self._state(0.0, "final_action")
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            metadata_path = root / "metadata.jsonl"
+            result_path = root / "results.jsonl"
+            output_path = root / "sft.jsonl"
+            metadata_path.write_text(
+                json.dumps({"custom_id": "good", "source": good})
+                + "\n"
+                + json.dumps({"custom_id": "bad", "source": bad})
+                + "\n"
+            )
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "custom_id": "good",
+                        "response": {
+                            "status_code": 200,
+                            "body": {"choices": [{"message": {"content": "Sound. <answer>9</answer>"}}]},
+                        },
+                        "error": None,
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "custom_id": "bad",
+                        "response": {
+                            "status_code": 200,
+                            "body": {
+                                "choices": [
+                                    {
+                                        "message": {"content": "Reasoning exhausted its budget."},
+                                        "finish_reason": "length",
+                                    }
+                                ]
+                            },
+                        },
+                        "error": None,
+                    }
+                )
+                + "\n"
+            )
+
+            collect(
+                argparse.Namespace(
+                    metadata=metadata_path,
+                    results=[result_path],
+                    output=output_path,
+                    teacher_model="local-thinking",
+                    max_teacher_squared_error=None,
+                    skip_invalid_scores=True,
+                )
+            )
+
+            rows = [json.loads(line) for line in output_path.read_text().splitlines()]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["prompt"], good["prompt"])
+
+    def test_consensus_uses_outcome_only_for_exact_final_action(self):
+        primary = []
+        judge_one = []
+        judge_two = []
+        for outcome in (0.0, 1.0):
+            for position in ("early", "final_action"):
+                row = self._state(outcome, position)
+                # An incorrect sampled trajectory can still begin in a valuable
+                # state.  Independent teachers agree it has high continuation
+                # value, so this must survive at an early prefix.
+                prediction = 0.8 if outcome == 0.0 else 0.9
+                primary.append({**row, "generation": "primary reasoning", "teacher_prediction": prediction})
+                judge_one.append({**row, "generation": "judge one", "teacher_prediction": prediction - 0.1})
+                judge_two.append({**row, "generation": "judge two", "teacher_prediction": prediction})
+
+        selected, stats = select_teacher_consensus(
+            primary,
+            [judge_one, judge_two],
+            max_teacher_range=0.2,
+            max_final_teacher_squared_error=0.04,
+            max_examples_per_outcome=2,
+            seed=0,
+        )
+
+        selected_keys = {
+            (example["outcome"], example["state_kind"], example["trajectory_fraction"]) for example in selected
+        }
+        self.assertIn((0.0, "segment_start", 0.25), selected_keys)
+        self.assertNotIn((0.0, "final_action", 1.0), selected_keys)
+        self.assertEqual(stats["final_outcome_disagreement"], 1)
+
+    def test_consensus_requires_all_teachers_and_rejects_score_disagreement(self):
+        agreed = self._state(1.0, "final_action")
+        disagreed = self._state(0.0, "final_action")
+        primary = [
+            {**agreed, "generation": "primary", "teacher_prediction": 0.9},
+            {**disagreed, "generation": "primary", "teacher_prediction": 0.1},
+        ]
+        judge_one = [
+            {**agreed, "generation": "judge", "teacher_prediction": 0.8},
+            {**disagreed, "generation": "judge", "teacher_prediction": 0.8},
+        ]
+        judge_two = [{**agreed, "generation": "judge", "teacher_prediction": 1.0}]
+
+        selected, stats = select_teacher_consensus(
+            primary,
+            [judge_one, judge_two],
+            max_teacher_range=0.2,
+            max_final_teacher_squared_error=0.04,
+            max_examples_per_outcome=1,
+            seed=0,
+        )
+
+        # The incorrect prompt is absent from judge two, while the correct prompt
+        # passes at an exact floating-point range of 0.2.
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["outcome"], 1.0)
+        self.assertEqual(stats["missing_judge"], 1)
 
     def test_prepare_rejects_answer_conditioned_prompt_by_default(self):
         example = self._state(0.0, "final_action")
