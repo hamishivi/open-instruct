@@ -75,6 +75,45 @@ class TestGenValueSFTSynthesis(unittest.TestCase):
         self.assertFalse(request["body"]["store"])
         self.assertIn("<answer>N</answer>", request["body"]["instructions"])
 
+    def test_batch_request_supports_local_chat_completions(self):
+        request = make_batch_request(
+            "trace-1",
+            "critic prompt",
+            model="Qwen/Qwen3-8B",
+            reasoning_effort="medium",
+            max_output_tokens=1024,
+            request_format="chat_completions",
+        )
+
+        self.assertEqual(request["url"], "/v1/chat/completions")
+        self.assertEqual(request["body"]["model"], "Qwen/Qwen3-8B")
+        self.assertEqual(request["body"]["messages"][-1], {"role": "user", "content": "critic prompt"})
+        self.assertIn("<answer>N</answer>", request["body"]["messages"][0]["content"])
+        self.assertFalse(request["body"]["stream"])
+
+    def test_extract_response_text_supports_local_reasoning_content(self):
+        text = extract_response_text(
+            {
+                "custom_id": "trace-1",
+                "response": {
+                    "status_code": 200,
+                    "body": {
+                        "choices": [
+                            {
+                                "message": {
+                                    "reasoning_content": "The algebra contains a decisive error. ",
+                                    "content": " <answer>1</answer>",
+                                }
+                            }
+                        ]
+                    },
+                },
+                "error": None,
+            }
+        )
+
+        self.assertEqual(text, "The algebra contains a decisive error.\n<answer>1</answer>")
+
     def test_extract_response_text_rejects_missing_output(self):
         with self.assertRaisesRegex(ValueError, "contains no output_text"):
             extract_response_text(

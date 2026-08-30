@@ -93,8 +93,33 @@ def select_teacher_states(
 
 
 def make_batch_request(
-    custom_id: str, prompt: str, *, model: str, reasoning_effort: str, max_output_tokens: int
+    custom_id: str,
+    prompt: str,
+    *,
+    model: str,
+    reasoning_effort: str,
+    max_output_tokens: int,
+    request_format: str = "responses",
 ) -> dict[str, Any]:
+    if request_format == "chat_completions":
+        return {
+            "custom_id": custom_id,
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": DEFAULT_TEACHER_INSTRUCTIONS},
+                    {"role": "user", "content": prompt},
+                ],
+                "max_tokens": max_output_tokens,
+                "temperature": 0.6,
+                "top_p": 0.95,
+                "stream": False,
+            },
+        }
+    if request_format != "responses":
+        raise ValueError(f"Unsupported batch request format: {request_format!r}.")
     return {
         "custom_id": custom_id,
         "method": "POST",
@@ -132,6 +157,18 @@ def extract_response_text(batch_result: dict[str, Any]) -> str:
                 text = content_item.get("text")
                 if isinstance(text, str) and text:
                     output_texts.append(text)
+    for choice in body.get("choices", []):
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            continue
+        reasoning = message.get("reasoning_content")
+        content = message.get("content")
+        if isinstance(reasoning, str) and reasoning:
+            output_texts.append(reasoning.rstrip())
+        if isinstance(content, str) and content:
+            output_texts.append(content.lstrip())
     if not output_texts:
         raise ValueError(f"Batch result {batch_result.get('custom_id')!r} contains no output_text.")
     return "\n".join(output_texts)
@@ -176,6 +213,7 @@ def prepare(args: argparse.Namespace) -> None:
                 model=args.model,
                 reasoning_effort=args.reasoning_effort,
                 max_output_tokens=args.max_output_tokens,
+                request_format=getattr(args, "request_format", "responses"),
             )
         )
 
@@ -187,6 +225,7 @@ def prepare(args: argparse.Namespace) -> None:
                 "batch_output": str(args.batch_output),
                 "metadata_output": str(args.metadata_output),
                 "model": args.model,
+                "request_format": getattr(args, "request_format", "responses"),
                 "selected_examples": len(selected),
                 "selected_correct": sum(float(example["outcome"]) > 0.5 for example in selected),
                 "selected_incorrect": sum(float(example["outcome"]) <= 0.5 for example in selected),
@@ -264,6 +303,12 @@ def parse_args() -> argparse.Namespace:
     prepare_parser.add_argument("--batch_output", required=True, type=pathlib.Path)
     prepare_parser.add_argument("--metadata_output", required=True, type=pathlib.Path)
     prepare_parser.add_argument("--model", default="gpt-5")
+    prepare_parser.add_argument(
+        "--request_format",
+        choices=("responses", "chat_completions"),
+        default="responses",
+        help="Use Responses for OpenAI Batch or chat_completions for an OpenAI-compatible local batch runner.",
+    )
     prepare_parser.add_argument("--reasoning_effort", choices=("minimal", "low", "medium", "high"), default="medium")
     prepare_parser.add_argument("--max_output_tokens", type=int, default=1024)
     prepare_parser.add_argument("--min_critic_version", type=int, default=0)
