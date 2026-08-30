@@ -18,8 +18,9 @@
 # trace reservoir, so the post-SFT calibration stage exercises unseen prompts.
 # Match Algorithm 1 in GenAC by reward-weighting each sampled critic trace with
 # its raw accuracy-shaped reward. We sample one critic trace per state, so
-# centering across unrelated states of the same outcome removes the absolute
-# calibration signal that frozen-actor pretraining is meant to learn.
+# centering across unrelated states of the same outcome makes each finite batch
+# depend only on relative reward differences and can starve a nearly
+# deterministic critic of useful updates.
 set -euo pipefail
 
 if [[ "${PRESERVE_LD_LIBRARY_PATH:-0}" != "1" ]]; then
