@@ -6,6 +6,7 @@ VALUE_MODEL_PATH="${1:?Value model path required}"
 INPUT_DATASET_PATH="${2:-./value_estimation_data/dapo_math_100pairs.parquet}"
 OUTPUT_PATH="${3:-./value_estimation_data/generative_value_scores.parquet}"
 CONDITIONING="${4:-none}"  # none | gt | correct_demo | rollout_context
+GEN_VALUE_MAX_NEW_TOKENS="${GEN_VALUE_MAX_NEW_TOKENS:-1024}"
 
 uv run python -m open_instruct.value_estimation score_dataset \
     --input_dataset_path "${INPUT_DATASET_PATH}" \
@@ -15,5 +16,5 @@ uv run python -m open_instruct.value_estimation score_dataset \
     --gen_value_conditioning "${CONDITIONING}" \
     --gen_value_score_min 0 \
     --gen_value_score_max 10 \
-    --gen_value_max_new_tokens 8 \
+    --gen_value_max_new_tokens "${GEN_VALUE_MAX_NEW_TOKENS}" \
     --run_name "generative_value_${CONDITIONING}"

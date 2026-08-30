@@ -97,7 +97,10 @@ class ScoreDatasetConfig:
     gen_value_conditioning: str = "none"
     gen_value_score_min: float = 0.0
     gen_value_score_max: float = 10.0
-    gen_value_max_new_tokens: int = 8
+    # Match the online critic budget.  GenAC critics are explicitly prompted to
+    # reason before emitting <answer>...</answer>; an eight-token evaluator makes
+    # a healthy reasoning critic look like a parse failure.
+    gen_value_max_new_tokens: int = 1024
     gen_value_actor_model_name: str | None = None
     gen_value_actor_success_rate: float | None = None
     tokenizer_name_or_path: str | None = None
@@ -489,8 +492,8 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
                 f"score={cfg.gt_conditioning_template!r}."
             )
 
-    preds_per_row: list[list[float]] = []
-    all_preds: list[float] = []
+    preds_per_row: list[list[float | None]] = []
+    all_preds: list[float | None] = []
     all_mc: list[float] = []
     all_horizon_fractions: list[float] = []
 
@@ -508,14 +511,16 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
         is_correct = bool(row.get("rollout_is_correct"))
         response_token_limit = int(row.get("response_token_limit", 8192))
         for pos, p, mc in zip(row["probe_positions"], preds_per_row[i], row["mc_values"]):
-            all_preds.append(float(p))
+            prediction = None if p is None else float(p)
+            all_preds.append(prediction)
             all_mc.append(float(mc))
             horizon_fraction = int(pos) / max(response_token_limit, 1)
             all_horizon_fractions.append(horizon_fraction)
-            if is_correct:
-                correct_preds.append(float(p))
-            else:
-                incorrect_preds.append(float(p))
+            if prediction is not None:
+                if is_correct:
+                    correct_preds.append(prediction)
+                else:
+                    incorrect_preds.append(prediction)
             probe_rows.append(
                 {
                     "run_name": cfg.run_name,
@@ -524,7 +529,8 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
                     "probe_position": int(pos),
                     "response_tokens_remaining": response_token_limit - int(pos),
                     "horizon_fraction": horizon_fraction,
-                    "predicted_value": float(p),
+                    "predicted_value": prediction,
+                    "parsed": prediction is not None,
                     "mc_value": float(mc),
                 }
             )
@@ -532,24 +538,38 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
     # Metrics
     metrics: dict[str, float] = {}
     if all_preds:
-        diffs = [a - b for a, b in zip(all_preds, all_mc)]
-        metrics["mae"] = float(np.mean([abs(d) for d in diffs]))
-        metrics["mse"] = float(np.mean([d**2 for d in diffs]))
-        if len(all_preds) > 1:
+        parsed_indices = [index for index, prediction in enumerate(all_preds) if prediction is not None]
+        parsed_preds = [float(all_preds[index]) for index in parsed_indices]
+        parsed_mc = [all_mc[index] for index in parsed_indices]
+        metrics["examples"] = float(len(all_preds))
+        metrics["parse_rate"] = len(parsed_indices) / len(all_preds)
+        metrics["penalized_mse"] = float(
+            np.mean(
+                [
+                    1.0 if prediction is None else (float(prediction) - target) ** 2
+                    for prediction, target in zip(all_preds, all_mc)
+                ]
+            )
+        )
+        if parsed_preds:
+            diffs = [prediction - target for prediction, target in zip(parsed_preds, parsed_mc)]
+            metrics["mae"] = float(np.mean([abs(difference) for difference in diffs]))
+            metrics["mse"] = float(np.mean([difference**2 for difference in diffs]))
+        if len(parsed_preds) > 1:
             try:
-                metrics["pearson"] = float(pearsonr(all_preds, all_mc)[0])
-                metrics["spearman"] = float(spearmanr(all_preds, all_mc).statistic)
+                metrics["pearson"] = float(pearsonr(parsed_preds, parsed_mc)[0])
+                metrics["spearman"] = float(spearmanr(parsed_preds, parsed_mc).statistic)
             except Exception:
                 pass
         # Calibration bins (deciles of predicted values).
-        order = np.argsort(all_preds)
+        order = np.argsort(parsed_preds)
         bin_size = max(1, len(order) // 10)
         for b in range(10):
             chunk = order[b * bin_size : (b + 1) * bin_size] if b < 9 else order[b * bin_size :]
             if len(chunk) == 0:
                 continue
-            metrics[f"calib_bin_{b}_pred_mean"] = float(np.mean([all_preds[j] for j in chunk]))
-            metrics[f"calib_bin_{b}_mc_mean"] = float(np.mean([all_mc[j] for j in chunk]))
+            metrics[f"calib_bin_{b}_pred_mean"] = float(np.mean([parsed_preds[j] for j in chunk]))
+            metrics[f"calib_bin_{b}_mc_mean"] = float(np.mean([parsed_mc[j] for j in chunk]))
 
         horizon_buckets = {
             "early": [j for j, fraction in enumerate(all_horizon_fractions) if fraction < 0.25],
@@ -559,14 +579,25 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
         for name, indices in horizon_buckets.items():
             if not indices:
                 continue
-            bucket_preds = [all_preds[j] for j in indices]
-            bucket_mc = [all_mc[j] for j in indices]
+            bucket_parsed_indices = [index for index in indices if all_preds[index] is not None]
+            bucket_preds = [float(all_preds[index]) for index in bucket_parsed_indices]
+            bucket_mc = [all_mc[index] for index in bucket_parsed_indices]
             metrics[f"horizon_{name}_examples"] = float(len(indices))
-            metrics[f"horizon_{name}_pred_mean"] = float(np.mean(bucket_preds))
-            metrics[f"horizon_{name}_mc_mean"] = float(np.mean(bucket_mc))
-            metrics[f"horizon_{name}_mse"] = float(
-                np.mean([(prediction - target) ** 2 for prediction, target in zip(bucket_preds, bucket_mc)])
+            metrics[f"horizon_{name}_parse_rate"] = len(bucket_parsed_indices) / len(indices)
+            metrics[f"horizon_{name}_penalized_mse"] = float(
+                np.mean(
+                    [
+                        1.0 if all_preds[index] is None else (float(all_preds[index]) - all_mc[index]) ** 2
+                        for index in indices
+                    ]
+                )
             )
+            if bucket_preds:
+                metrics[f"horizon_{name}_pred_mean"] = float(np.mean(bucket_preds))
+                metrics[f"horizon_{name}_mc_mean"] = float(np.mean(bucket_mc))
+                metrics[f"horizon_{name}_mse"] = float(
+                    np.mean([(prediction - target) ** 2 for prediction, target in zip(bucket_preds, bucket_mc)])
+                )
 
     if correct_preds:
         metrics["correct_pred_mean"] = float(np.mean(correct_preds))
@@ -645,7 +676,7 @@ def _score_with_scalar_value(df, cfg: ScoreDatasetConfig) -> list[list[float]]:
     return all_preds
 
 
-def _score_with_generative_value(df, cfg: ScoreDatasetConfig) -> list[list[float]]:
+def _score_with_generative_value(df, cfg: ScoreDatasetConfig) -> list[list[float | None]]:
     """Score probes using a generative value model served via vLLM."""
     from transformers import AutoTokenizer  # noqa: PLC0415
     from vllm import LLM, SamplingParams  # noqa: PLC0415
@@ -695,17 +726,16 @@ def _score_with_generative_value(df, cfg: ScoreDatasetConfig) -> list[list[float
 
     raw = llm.generate(prompts, sp)
     # Re-collate into per-row lists.
-    all_preds: list[list[float]] = [[0.0 for _ in row["probe_positions"]] for _, row in df.iterrows()]
+    all_preds: list[list[float | None]] = [[None for _ in row["probe_positions"]] for _, row in df.iterrows()]
     for out, (row_idx, p_idx) in zip(raw, positions):
         txt = out.outputs[0].text if hasattr(out, "outputs") else ""
         parsed = value_model_utils.parse_generative_value_score(
             txt, score_min=cfg.gen_value_score_min, score_max=cfg.gen_value_score_max
         )
-        if parsed is None:
-            parsed = 0.5 * (cfg.gen_value_score_min + cfg.gen_value_score_max)
-        all_preds[row_idx][p_idx] = value_model_utils.rescale_gen_value_score(
-            parsed, cfg.gen_value_score_min, cfg.gen_value_score_max
-        )
+        if parsed is not None:
+            all_preds[row_idx][p_idx] = value_model_utils.rescale_gen_value_score(
+                parsed, cfg.gen_value_score_min, cfg.gen_value_score_max
+            )
     return all_preds
 
 

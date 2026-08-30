@@ -12,6 +12,11 @@ class _FakeTokenizer:
 
 
 class TestValueEstimationStates(unittest.TestCase):
+    def test_generative_scorer_default_matches_online_reasoning_budget(self):
+        self.assertEqual(
+            value_estimation.ScoreDatasetConfig.__dataclass_fields__["gen_value_max_new_tokens"].default, 1024
+        )
+
     def test_optional_float_cli_field_is_parsed_as_float(self):
         parser = argparse.ArgumentParser()
         field = next(
