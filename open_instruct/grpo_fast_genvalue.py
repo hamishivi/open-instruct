@@ -305,6 +305,17 @@ class GenValueTrainerActor:
         self._tokenizer.save_pretrained(gen_value_output_dir)
         self._write_trace_reservoir(output_dir)
 
+    def save_versioned_model(self, output_dir: str, expected_version: int) -> str:
+        """Export an exact critic-version snapshot as a loadable Hugging Face model."""
+        if self._step_count != expected_version:
+            raise RuntimeError(
+                "Refusing to save a mislabeled generative-critic snapshot: "
+                f"trainer is at version {self._step_count}, expected {expected_version}."
+            )
+        snapshot_root = pathlib.Path(output_dir) / "gen_value_model_checkpoints" / f"version_{expected_version:06d}"
+        self.save_model(str(snapshot_root))
+        return str(snapshot_root / "gen_value_model")
+
     def _trace_bucket_capacity(self, bucket: str) -> int:
         correct_capacity = self._trace_reservoir_size // 2
         return correct_capacity if bucket == "correct" else self._trace_reservoir_size - correct_capacity
@@ -695,6 +706,9 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
     gen_value_validation_freq: int = 0
     gen_value_validation_max_examples: int = 0
     gen_value_validation_prompt_holdout_fraction: float = 0.125
+    # Export exact critic-version Hugging Face snapshots independently of the
+    # asynchronous policy-step checkpoints. Zero disables periodic snapshots.
+    gen_value_model_snapshot_freq: int = 0
     # Balanced, bounded reservoir of raw on-policy critic traces for inspection and an
     # optional later SFT stage. Zero disables collection.
     gen_value_trace_reservoir_size: int = 0
@@ -765,6 +779,10 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
         if self.gen_value_validation_max_examples < 0:
             raise ValueError(
                 f"--gen_value_validation_max_examples must be >= 0, got {self.gen_value_validation_max_examples}."
+            )
+        if self.gen_value_model_snapshot_freq < 0:
+            raise ValueError(
+                f"--gen_value_model_snapshot_freq must be >= 0, got {self.gen_value_model_snapshot_freq}."
             )
         if not 0.0 < self.gen_value_validation_prompt_holdout_fraction <= 1.0:
             raise ValueError(
@@ -1086,6 +1104,8 @@ def _gen_value_reinforce_loop(
     validation_seed: int,
     validation_prompt_holdout_fraction: float,
     final_action_replay_weight: int,
+    model_snapshot_freq: int,
+    output_dir: str,
     validation_state: dict[str, Any],
     validation_lock: threading.Lock,
 ) -> None:
@@ -1153,6 +1173,17 @@ def _gen_value_reinforce_loop(
             )
             metrics = metrics[0]
             critic_version = int(metrics["gen_value/version"])
+            if model_snapshot_freq > 0 and critic_version % model_snapshot_freq == 0:
+                snapshot_start = time.perf_counter()
+                snapshot_paths, _ = utils.ray_get_with_progress(
+                    [trainer_actor.save_versioned_model.remote(output_dir, critic_version)],
+                    desc=f"Saving generative critic version {critic_version}",
+                    enable=False,
+                    timeout=_GEN_VALUE_OPERATION_TIMEOUT_S,
+                )
+                metrics["gen_value/model_snapshot_version"] = critic_version
+                metrics["gen_value/model_snapshot_seconds"] = time.perf_counter() - snapshot_start
+                logger.info("Saved generative-critic version %d to %s.", critic_version, snapshot_paths[0])
             with progress_lock:
                 synced_version = progress_state["synced_version"]
                 progress_state["version"] = critic_version
@@ -1742,6 +1773,8 @@ def main():
             args.seed,
             args.gen_value_validation_prompt_holdout_fraction,
             args.gen_value_final_action_replay_weight,
+            args.gen_value_model_snapshot_freq,
+            args.output_dir,
             gen_value_validation_state,
             gen_value_validation_lock,
         )
