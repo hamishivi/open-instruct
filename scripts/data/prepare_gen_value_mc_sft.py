@@ -96,6 +96,7 @@ def build_mc_sft_examples(
             prompts_seen.add(prompt)
             score = quantize_mc_value(mc_value, score_max=score_max)
             state_kind = "final_action" if probe_position == len(rollout_tokens) - 1 else "segment_start"
+            trajectory_fraction = probe_position / max(len(rollout_tokens), 1)
             examples.append(
                 {
                     "prompt": prompt,
@@ -107,12 +108,50 @@ def build_mc_sft_examples(
                     "state_kind": state_kind,
                     "response_tokens_used": probe_position,
                     "response_token_limit": response_token_limit,
+                    "rollout_length": len(rollout_tokens),
+                    "trajectory_fraction": trajectory_fraction,
                     "num_continuations": num_continuations,
                     "problem": problem,
                     "direct_mc_score_supervision": True,
                 }
             )
     return examples
+
+
+def repeat_examples_for_horizon(
+    examples: Sequence[dict[str, Any]],
+    *,
+    final_action_repeat: int,
+    late_state_repeat: int,
+    late_state_fraction: float,
+) -> list[dict[str, Any]]:
+    """Deterministically upweight final-action and late-trajectory states.
+
+    Final-action states take precedence over the late-state multiplier so the
+    two repeat factors do not multiply unexpectedly.
+    """
+    if final_action_repeat <= 0 or late_state_repeat <= 0:
+        raise ValueError("final_action_repeat and late_state_repeat must be positive integers.")
+    if not 0.0 <= late_state_fraction <= 1.0:
+        raise ValueError(f"late_state_fraction must be in [0, 1], got {late_state_fraction}.")
+
+    repeated: list[dict[str, Any]] = []
+    for example in examples:
+        if example.get("state_kind") == "final_action":
+            repeat_count = final_action_repeat
+        elif float(example.get("trajectory_fraction", 0.0)) >= late_state_fraction:
+            repeat_count = late_state_repeat
+        else:
+            repeat_count = 1
+        for repeat_index in range(repeat_count):
+            repeated.append(
+                {
+                    **example,
+                    "horizon_repeat_count": repeat_count,
+                    "horizon_repeat_index": repeat_index,
+                }
+            )
+    return repeated
 
 
 def read_excluded_problems(path: pathlib.Path | None) -> set[str]:
@@ -142,6 +181,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_continuations", type=int, default=16)
     parser.add_argument("--min_examples", type=int, default=256)
     parser.add_argument("--score_max", type=int, default=10)
+    parser.add_argument("--final_action_repeat", type=int, default=1)
+    parser.add_argument("--late_state_repeat", type=int, default=1)
+    parser.add_argument("--late_state_fraction", type=float, default=0.75)
     return parser.parse_args()
 
 
@@ -157,11 +199,17 @@ def main() -> None:
     if overlaps:
         raise ValueError(f"MC SFT input overlaps {len(overlaps)} held-out calibration problems.")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name_or_path)
-    examples = build_mc_sft_examples(
+    raw_examples = build_mc_sft_examples(
         rows, tokenizer=tokenizer, min_continuations=args.min_continuations, score_max=args.score_max
     )
-    if len(examples) < args.min_examples:
-        raise ValueError(f"MC SFT dataset has {len(examples)} examples; at least {args.min_examples} required.")
+    if len(raw_examples) < args.min_examples:
+        raise ValueError(f"MC SFT dataset has {len(raw_examples)} examples; at least {args.min_examples} required.")
+    examples = repeat_examples_for_horizon(
+        raw_examples,
+        final_action_repeat=args.final_action_repeat,
+        late_state_repeat=args.late_state_repeat,
+        late_state_fraction=args.late_state_fraction,
+    )
     write_jsonl(args.output, examples)
     score_counts: dict[int, int] = {}
     for example in examples:
@@ -170,11 +218,18 @@ def main() -> None:
     print(
         json.dumps(
             {
-                "examples": len(examples),
+                "raw_examples": len(raw_examples),
+                "training_examples": len(examples),
                 "input_rows": len(rows),
                 "output": str(args.output),
                 "score_counts": score_counts,
                 "unique_problems": len({example["problem"] for example in examples}),
+                "final_action_examples": sum(example["state_kind"] == "final_action" for example in examples),
+                "late_state_examples": sum(
+                    example["state_kind"] != "final_action"
+                    and float(example["trajectory_fraction"]) >= args.late_state_fraction
+                    for example in examples
+                ),
             },
             indent=2,
             sort_keys=True,

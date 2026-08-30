@@ -41,6 +41,40 @@ class TestValueEstimationStates(unittest.TestCase):
         self.assertIn("<rollout>10</rollout>", examples[0]["prompt"])
         self.assertIn("<rollout>10:11</rollout>", examples[1]["prompt"])
         self.assertTrue(all(example["direct_mc_score_supervision"] for example in examples))
+        self.assertEqual([example["trajectory_fraction"] for example in examples], [1 / 3, 2 / 3])
+
+    def test_mc_sft_can_upweight_late_and_final_states(self):
+        examples = prepare_gen_value_mc_sft.build_mc_sft_examples(
+            [
+                {
+                    "problem": "Compute the answer.",
+                    "rollout_tokens": [10, 11, 12, 13, 14, 15],
+                    "probe_positions": [1, 3, 5],
+                    "mc_values": [0.25, 0.5, 1.0],
+                    "num_continuations": 16,
+                }
+            ],
+            tokenizer=_FakeTokenizer(),
+            min_continuations=16,
+        )
+
+        repeated = prepare_gen_value_mc_sft.repeat_examples_for_horizon(
+            examples, final_action_repeat=3, late_state_repeat=2, late_state_fraction=0.5
+        )
+
+        self.assertEqual(len(repeated), 6)
+        self.assertEqual([example["response_tokens_used"] for example in repeated], [1, 3, 3, 5, 5, 5])
+        self.assertEqual([example["horizon_repeat_index"] for example in repeated], [0, 0, 1, 0, 1, 2])
+
+    def test_mc_sft_rejects_invalid_horizon_repeat_configuration(self):
+        with self.assertRaisesRegex(ValueError, "positive integers"):
+            prepare_gen_value_mc_sft.repeat_examples_for_horizon(
+                [], final_action_repeat=0, late_state_repeat=1, late_state_fraction=0.75
+            )
+        with self.assertRaisesRegex(ValueError, r"\[0, 1\]"):
+            prepare_gen_value_mc_sft.repeat_examples_for_horizon(
+                [], final_action_repeat=1, late_state_repeat=1, late_state_fraction=1.1
+            )
 
     def test_mc_sft_rejects_under_sampled_targets(self):
         with self.assertRaisesRegex(ValueError, "only 8 continuations"):
