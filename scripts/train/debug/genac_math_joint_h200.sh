@@ -116,7 +116,8 @@ python open_instruct/grpo_fast_genvalue.py \
     --gen_value_icc_momentum 0.9 \
     --gen_value_learning_rate 1e-6 \
     --gen_value_reinforce_coef 1.0 \
-    --gen_value_reinforce_baseline leave_one_out \
+    --gen_value_reinforce_baseline leave_one_out_by_outcome \
+    --gen_value_final_action_replay_weight 4 \
     --gen_value_sync_freq 5 \
     --gen_value_diagnostic_scoring_freq 0 \
     --gen_value_validation_freq 25 \

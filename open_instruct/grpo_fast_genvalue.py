@@ -166,7 +166,7 @@ class GenValueTrainerActor:
         self._trace_rng = random.Random(trace_seed)
         self._trace_reservoirs: dict[str, list[dict[str, Any]]] = {"correct": [], "incorrect": []}
         self._trace_seen_by_outcome = {"correct": 0, "incorrect": 0}
-        if self._reinforce_baseline not in {"none", "leave_one_out"}:
+        if self._reinforce_baseline not in {"none", "leave_one_out", "leave_one_out_by_outcome"}:
             raise ValueError(f"Unknown generative-value REINFORCE baseline: {self._reinforce_baseline!r}.")
         if self._trace_reservoir_size < 0:
             raise ValueError(f"trace_reservoir_size must be nonnegative, got {self._trace_reservoir_size}.")
@@ -427,7 +427,10 @@ class GenValueTrainerActor:
             return {"gen_value/version": self._step_count, "gen_value/reinforce_steps": self._step_count}
 
         raw_rewards = [float(example["reward"]) for example in validated_examples]
-        reinforce_weights = value_model_utils.generative_value_reinforce_weights(raw_rewards, self._reinforce_baseline)
+        outcomes = [float(example["outcome"]) for example in validated_examples]
+        reinforce_weights = value_model_utils.generative_value_reinforce_weights(
+            raw_rewards, self._reinforce_baseline, outcomes
+        )
         for example, reinforce_weight in zip(validated_examples, reinforce_weights):
             example["reward"] = reinforce_weight
 
@@ -439,7 +442,6 @@ class GenValueTrainerActor:
         gradient_scale = self._reinforce_coef / max(reinforce_token_denominator, 1)
         total_loss = 0.0
         rewards = raw_rewards
-        outcomes = [example["outcome"] for example in validated_examples]
         parsed_count = len(parsed_v_hats)
         has_effective_training_signal = False
         reinforce_token_count = 0
@@ -668,6 +670,9 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
     # Optional variance-reducing baseline for the raw GenAC reward. Leave-one-out
     # centering also makes malformed/inaccurate generations receive negative weight.
     gen_value_reinforce_baseline: str = "none"
+    # Exact final-action critic states are scarce relative to segment starts.
+    # Replaying them improves near-horizon discrimination without changing actor data.
+    gen_value_final_action_replay_weight: int = 1
     # Independent critic update cadence. The default critic batch contains the same
     # number of complete rollouts as one global policy batch, irrespective of policy world size.
     gen_value_batch_size: int | None = None
@@ -716,10 +721,16 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
             raise ValueError(
                 "--gen_value_segmentation=sae requires --use_sae (SAE boundaries come from the policy's vLLM logprobs)."
             )
-        if self.gen_value_reinforce_baseline not in {"none", "leave_one_out"}:
+        if self.gen_value_reinforce_baseline not in {"none", "leave_one_out", "leave_one_out_by_outcome"}:
             raise ValueError(
-                "--gen_value_reinforce_baseline must be one of 'none' or 'leave_one_out', "
+                "--gen_value_reinforce_baseline must be one of 'none', 'leave_one_out', or "
+                "'leave_one_out_by_outcome', "
                 f"got {self.gen_value_reinforce_baseline!r}."
+            )
+        if self.gen_value_final_action_replay_weight < 1:
+            raise ValueError(
+                "--gen_value_final_action_replay_weight must be at least 1, got "
+                f"{self.gen_value_final_action_replay_weight}."
             )
         if self.gen_value_chunk_size <= 0:
             raise ValueError(f"--gen_value_chunk_size must be > 0, got {self.gen_value_chunk_size}.")
@@ -958,6 +969,8 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
     summed_metrics = {
         "gen_value/batch_rollouts",
         "gen_value/batch_pairs",
+        "gen_value/batch_unique_pairs",
+        "gen_value/final_action_replay_examples",
         "gen_value/batch_tokens",
         "gen_value/batch_sequence_tokens",
         "gen_value/train_tokens",
@@ -1071,6 +1084,7 @@ def _gen_value_reinforce_loop(
     validation_max_examples: int,
     validation_seed: int,
     validation_prompt_holdout_fraction: float,
+    final_action_replay_weight: int,
     validation_state: dict[str, Any],
     validation_lock: threading.Lock,
 ) -> None:
@@ -1118,6 +1132,8 @@ def _gen_value_reinforce_loop(
                     }
                 else:
                     pairs = [pair for rollout in rollouts for pair in rollout["pairs"]]
+            unique_pair_count = len(pairs)
+            pairs = value_model_utils.replay_gen_value_final_actions(pairs, final_action_replay_weight)
             policy_training_steps = [int(rollout["policy_training_step"]) for rollout in rollouts]
             source_versions = [int(rollout["critic_version"]) for rollout in rollouts]
             batch_sequence_tokens = sum(
@@ -1162,6 +1178,8 @@ def _gen_value_reinforce_loop(
                     "gen_value/source_value_lag_max": max(critic_version - min(source_versions), 0),
                     "gen_value/batch_rollouts": len(rollouts),
                     "gen_value/batch_pairs": len(pairs),
+                    "gen_value/batch_unique_pairs": unique_pair_count,
+                    "gen_value/final_action_replay_examples": len(pairs) - unique_pair_count,
                     "gen_value/batch_tokens": batch_response_tokens,
                     "gen_value/batch_sequence_tokens": batch_sequence_tokens,
                     "gen_value/training_queue_size": training_queue.qsize(),
@@ -1722,6 +1740,7 @@ def main():
             args.gen_value_validation_max_examples,
             args.seed,
             args.gen_value_validation_prompt_holdout_fraction,
+            args.gen_value_final_action_replay_weight,
             gen_value_validation_state,
             gen_value_validation_lock,
         )

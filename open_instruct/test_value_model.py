@@ -63,6 +63,7 @@ from open_instruct.value_model_utils import (
     predict_values,
     regression_metric_sums,
     regression_metrics_from_sums,
+    replay_gen_value_final_actions,
     resolve_num_siblings_to_sample,
     reward_to_unit_value,
     segment_rollout,
@@ -772,6 +773,27 @@ class TestValueLoss(unittest.TestCase):
 
     def test_gen_value_leave_one_out_baseline_keeps_single_sample_reward(self):
         self.assertEqual(generative_value_reinforce_weights([0.4], baseline="leave_one_out"), [0.4])
+
+    def test_gen_value_leave_one_out_baseline_can_be_stratified_by_outcome(self):
+        weights = generative_value_reinforce_weights(
+            [1.0, 0.8, 0.6, 0.2], baseline="leave_one_out_by_outcome", outcomes=[0.0, 0.0, 1.0, 1.0]
+        )
+
+        np.testing.assert_allclose(weights, [0.2, -0.2, 0.4, -0.4])
+        self.assertAlmostEqual(sum(weights[:2]), 0.0)
+        self.assertAlmostEqual(sum(weights[2:]), 0.0)
+
+    def test_gen_value_outcome_baseline_requires_aligned_outcomes(self):
+        with self.assertRaisesRegex(ValueError, "requires one outcome for every reward"):
+            generative_value_reinforce_weights([1.0, 0.0], baseline="leave_one_out_by_outcome", outcomes=[1.0])
+
+    def test_gen_value_final_action_replay_only_repeats_exact_final_states(self):
+        segment = {"state_kind": "segment_start", "id": 1}
+        final = {"state_kind": "final_action", "id": 2}
+
+        replayed = replay_gen_value_final_actions([segment, final], replay_weight=4)
+
+        self.assertEqual(replayed, [segment, final, final, final, final])
 
     def test_gen_value_reinforce_baseline_rejects_unknown_mode(self):
         with self.assertRaisesRegex(ValueError, "Unknown generative-value REINFORCE baseline"):

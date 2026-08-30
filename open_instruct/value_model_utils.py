@@ -309,7 +309,9 @@ def generative_value_reinforce_reward(outcome: float, prediction: float | None) 
     return 1.0 - squared_error, squared_error
 
 
-def generative_value_reinforce_weights(rewards: Sequence[float], baseline: str) -> list[float]:
+def generative_value_reinforce_weights(
+    rewards: Sequence[float], baseline: str, outcomes: Sequence[float] | None = None
+) -> list[float]:
     """Convert raw GenAC rewards into policy-gradient weights.
 
     ``leave_one_out`` subtracts the mean reward of the other critic samples in the
@@ -321,12 +323,43 @@ def generative_value_reinforce_weights(rewards: Sequence[float], baseline: str) 
     raw_rewards = [float(reward) for reward in rewards]
     if baseline == "none" or len(raw_rewards) <= 1:
         return raw_rewards
-    if baseline != "leave_one_out":
+    if baseline not in {"leave_one_out", "leave_one_out_by_outcome"}:
         raise ValueError(f"Unknown generative-value REINFORCE baseline: {baseline!r}.")
 
-    reward_sum = sum(raw_rewards)
-    denominator = len(raw_rewards) - 1
-    return [reward - (reward_sum - reward) / denominator for reward in raw_rewards]
+    groups: list[list[int]]
+    if baseline == "leave_one_out":
+        groups = [list(range(len(raw_rewards)))]
+    else:
+        if outcomes is None or len(outcomes) != len(raw_rewards):
+            raise ValueError("leave_one_out_by_outcome requires one outcome for every reward.")
+        groups_by_outcome: dict[bool, list[int]] = {False: [], True: []}
+        for index, outcome in enumerate(outcomes):
+            groups_by_outcome[float(outcome) > 0.5].append(index)
+        groups = list(groups_by_outcome.values())
+
+    weights = list(raw_rewards)
+    for indices in groups:
+        if len(indices) <= 1:
+            continue
+        reward_sum = sum(raw_rewards[index] for index in indices)
+        denominator = len(indices) - 1
+        for index in indices:
+            reward = raw_rewards[index]
+            weights[index] = reward - (reward_sum - reward) / denominator
+    return weights
+
+
+def replay_gen_value_final_actions(
+    training_pairs: Sequence[dict[str, Any]], replay_weight: int
+) -> list[dict[str, Any]]:
+    """Repeat exact final-action states without changing other critic states."""
+    if replay_weight < 1:
+        raise ValueError(f"replay_weight must be at least 1, got {replay_weight}.")
+    replayed: list[dict[str, Any]] = []
+    for pair in training_pairs:
+        repeats = replay_weight if pair.get("state_kind") == "final_action" else 1
+        replayed.extend([pair] * repeats)
+    return replayed
 
 
 def build_gen_value_validation_holdout(
