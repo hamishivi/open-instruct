@@ -144,6 +144,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --gen_value_max_new_tokens 1024 \
     --gen_value_max_model_len 32768 \
     --gen_value_temperature 1.0 \
+    --gen_value_inference_temperature 0.0 \
     --gen_value_conditioning "${GEN_VALUE_CONDITIONING}" \
     --gen_value_use_icc true \
     --gen_value_icc_momentum 0.9 \

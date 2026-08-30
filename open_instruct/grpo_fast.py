@@ -1243,60 +1243,84 @@ class PolicyTrainerRayProcess(RayProcess):
         return values_BT, training_pairs
 
     def _score_gen_value_requests(self, requests: list[dict[str, Any]]) -> list[tuple[torch.Tensor, list[dict]]]:
-        """Batch all gen-value prompts for this rank across the gen-value vLLM engines."""
+        """Batch actor-value and critic-training completions across the critic pool.
+
+        Actor-facing values may be generated greedily for stable GAE while the
+        independent training completion remains stochastic for REINFORCE. When
+        both temperatures match, retain the original single-generation path.
+        """
         if not requests:
             return []
         if not self._gen_value_engines:
             return [(torch.zeros(1, request["seq_len"] - 1, device=request["device"]), []) for request in requests]
 
         flat_entries: list[tuple[int, int, str]] = []
-        outputs_by_request: list[list[vllm_utils.RequestOutput | None]] = []
+        request_output_sizes: list[int] = []
         for request_idx, request in enumerate(requests):
             prompts: list[str] = request["prompts"]
-            outputs_by_request.append([None] * len(prompts))
+            request_output_sizes.append(len(prompts))
             for prompt_idx, prompt in enumerate(prompts):
                 flat_entries.append((request_idx, prompt_idx, prompt))
 
         critic_version = self._gen_value_version
         args = self.args
         max_new_tokens: int = getattr(args, "gen_value_max_new_tokens", 8)
-        temperature: float = getattr(args, "gen_value_temperature", 1.0)
+        training_temperature: float = getattr(args, "gen_value_temperature", 1.0)
+        inference_temperature = getattr(args, "gen_value_inference_temperature", None)
+        if inference_temperature is None:
+            inference_temperature = training_temperature
         n_eng = len(self._gen_value_engines)
         buckets: list[list[tuple[int, str]]] = [[] for _ in range(n_eng)]
         for flat_idx, (_, _, prompt) in enumerate(flat_entries):
             buckets[flat_idx % n_eng].append((flat_idx, prompt))
         non_empty = [(e, b) for e, b in enumerate(buckets) if b]
-        refs = [
-            self._gen_value_engines[e].generate_request_outputs.remote(
-                [p for _, p in bucket],
-                temperature=temperature,
-                max_tokens=max_new_tokens,
-                top_p=1.0,
-                stop=["</answer>"],
-                include_stop_str_in_output=True,
-                allow_prompt_truncation=False,
+
+        def generate_outputs(temperature: float, description: str) -> list[list[vllm_utils.RequestOutput]]:
+            refs = [
+                self._gen_value_engines[e].generate_request_outputs.remote(
+                    [p for _, p in bucket],
+                    temperature=temperature,
+                    max_tokens=max_new_tokens,
+                    top_p=1.0,
+                    stop=["</answer>"],
+                    include_stop_str_in_output=True,
+                    allow_prompt_truncation=False,
+                )
+                for e, bucket in non_empty
+            ]
+            engine_results, _ = ray_get_with_progress(
+                refs, desc=description, enable=False, timeout=WEIGHT_SYNC_TIMEOUT_S
             )
-            for e, bucket in non_empty
-        ]
-        engine_results, _ = ray_get_with_progress(
-            refs, desc="Scoring rollouts with generative critic", enable=False, timeout=WEIGHT_SYNC_TIMEOUT_S
+            outputs_by_request: list[list[vllm_utils.RequestOutput | None]] = [
+                [None] * size for size in request_output_sizes
+            ]
+            for (_, bucket), bucket_outputs in zip(non_empty, engine_results):
+                for (flat_idx, _), request_output in zip(bucket, bucket_outputs):
+                    request_idx, prompt_idx, _ = flat_entries[flat_idx]
+                    outputs_by_request[request_idx][prompt_idx] = request_output
+            if any(output is None for outputs in outputs_by_request for output in outputs):
+                raise RuntimeError("A generative-value completion was not returned by the vLLM pool.")
+            return [[output for output in outputs if output is not None] for outputs in outputs_by_request]
+
+        inference_outputs = generate_outputs(
+            float(inference_temperature), "Scoring rollouts with actor-facing generative critic"
+        )
+        training_outputs = (
+            inference_outputs
+            if float(inference_temperature) == float(training_temperature)
+            else generate_outputs(training_temperature, "Sampling generative critic for REINFORCE")
         )
 
-        for (_, bucket), bucket_outputs in zip(non_empty, engine_results):
-            for (flat_idx, _), request_output in zip(bucket, bucket_outputs):
-                request_idx, prompt_idx, _ = flat_entries[flat_idx]
-                outputs_by_request[request_idx][prompt_idx] = request_output
-
         results = []
-        for request, request_outputs in zip(requests, outputs_by_request):
-            if any(request_output is None for request_output in request_outputs):
-                raise RuntimeError("A generative-value completion was not returned by the vLLM pool.")
-            scoring_result = self._finish_gen_value_scoring_request(
-                request, [request_output for request_output in request_outputs if request_output is not None]
-            )
-            for pair in scoring_result[1]:
+        for request, actor_outputs, critic_outputs in zip(requests, inference_outputs, training_outputs, strict=True):
+            actor_values, actor_pairs = self._finish_gen_value_scoring_request(request, actor_outputs)
+            if actor_outputs is critic_outputs:
+                training_pairs = actor_pairs
+            else:
+                _, training_pairs = self._finish_gen_value_scoring_request(request, critic_outputs)
+            for pair in training_pairs:
                 pair["critic_version"] = critic_version
-            results.append(scoring_result)
+            results.append((actor_values, training_pairs))
         return results
 
     def _score_rollout_with_gen_value(

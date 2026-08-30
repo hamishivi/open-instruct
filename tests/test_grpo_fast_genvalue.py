@@ -233,6 +233,20 @@ def test_genvalue_config_requires_positive_temperature():
         GenValueExperimentConfig(**kwargs)
 
 
+def test_genvalue_config_allows_greedy_inference_temperature():
+    kwargs = _base_kwargs()
+    kwargs["gen_value_inference_temperature"] = 0.0
+    cfg = GenValueExperimentConfig(**kwargs)
+    assert cfg.gen_value_inference_temperature == 0.0
+
+
+def test_genvalue_config_rejects_negative_inference_temperature():
+    kwargs = _base_kwargs()
+    kwargs["gen_value_inference_temperature"] = -0.1
+    with pytest.raises(ValueError, match="gen_value_inference_temperature must be >= 0"):
+        GenValueExperimentConfig(**kwargs)
+
+
 def test_genvalue_config_bad_score_range():
     kwargs = _base_kwargs()
     kwargs["gen_value_score_max"] = kwargs["gen_value_score_min"]

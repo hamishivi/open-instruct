@@ -672,7 +672,13 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
     # Default matches GenAC's "Maximum Critic Response Length" (Table 5): the critic
     # needs enough budget to actually do CoT reasoning before emitting the score.
     gen_value_max_new_tokens: int = 1024
+    # Stochastic temperature used to sample critic completions for REINFORCE.
     gen_value_temperature: float = 1.0
+    # Actor-facing values should be stable: a sampled critic completion injects
+    # avoidable noise into every GAE boundary. None preserves the historical
+    # behavior by reusing ``gen_value_temperature``; zero enables greedy value
+    # inference while the independent REINFORCE completion remains stochastic.
+    gen_value_inference_temperature: float | None = None
     # vLLM/trainer context length for the generative critic. When unset, use the
     # critic model's declared maximum. Requests must fit the full prompt and full
     # gen_value_max_new_tokens budget; neither side is silently shortened.
@@ -759,6 +765,10 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
             raise ValueError(f"--gen_value_max_new_tokens must be > 0, got {self.gen_value_max_new_tokens}.")
         if self.gen_value_temperature <= 0.0:
             raise ValueError(f"--gen_value_temperature must be > 0, got {self.gen_value_temperature}.")
+        if self.gen_value_inference_temperature is not None and self.gen_value_inference_temperature < 0.0:
+            raise ValueError(
+                f"--gen_value_inference_temperature must be >= 0 when set, got {self.gen_value_inference_temperature}."
+            )
         if self.gen_value_max_model_len is not None and self.gen_value_max_model_len <= self.gen_value_max_new_tokens:
             raise ValueError(
                 "--gen_value_max_model_len must be greater than --gen_value_max_new_tokens "
@@ -1069,11 +1079,14 @@ def _gen_value_scoring_loop(
             with engines_lock:
                 with progress_lock:
                     critic_version = progress_state["synced_version"]
+                inference_temperature = args.gen_value_inference_temperature
+                if inference_temperature is None:
+                    inference_temperature = args.gen_value_temperature
                 scores, _ = score_partial_rollout_batch(
                     gen_value_vllm_engines,
                     prompts,
                     max_new_tokens=args.gen_value_max_new_tokens,
-                    temperature=args.gen_value_temperature,
+                    temperature=inference_temperature,
                     score_min=args.gen_value_score_min,
                     score_max=args.gen_value_score_max,
                 )
@@ -1918,11 +1931,14 @@ def main():
                             for example in validation_examples
                         ]
                         with gen_value_engines_lock:
+                            inference_temperature = args.gen_value_inference_temperature
+                            if inference_temperature is None:
+                                inference_temperature = args.gen_value_temperature
                             predictions, generations = score_partial_rollout_batch(
                                 gen_value_vllm_engines,
                                 prompts,
                                 max_new_tokens=args.gen_value_max_new_tokens,
-                                temperature=args.gen_value_temperature,
+                                temperature=inference_temperature,
                                 score_min=args.gen_value_score_min,
                                 score_max=args.gen_value_score_max,
                             )
