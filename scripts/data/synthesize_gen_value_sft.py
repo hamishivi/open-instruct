@@ -100,6 +100,7 @@ def make_batch_request(
     reasoning_effort: str,
     max_output_tokens: int,
     request_format: str = "responses",
+    enable_thinking: bool = False,
 ) -> dict[str, Any]:
     if request_format == "chat_completions":
         return {
@@ -112,11 +113,13 @@ def make_batch_request(
                     {"role": "system", "content": DEFAULT_TEACHER_INSTRUCTIONS},
                     {"role": "user", "content": prompt},
                 ],
-                # Qwen3's default hidden-thinking mode can consume the entire
-                # critic response budget before producing the required score.
-                # Disable it here; the visible answer is still explicitly
-                # prompted to contain concise value-focused reasoning.
-                "chat_template_kwargs": {"enable_thinking": False},
+                # Qwen3's hidden-thinking mode can consume the entire 1,024-token
+                # critic response budget before producing the required score, so
+                # keep it off by default.  A larger offline teacher can opt in
+                # with a larger output budget for a controlled teacher-quality
+                # comparison; ``extract_response_text`` preserves both reasoning
+                # and the final scored content when the server separates them.
+                "chat_template_kwargs": {"enable_thinking": enable_thinking},
                 "max_tokens": max_output_tokens,
                 "temperature": 0.6,
                 "top_p": 0.95,
@@ -219,6 +222,7 @@ def prepare(args: argparse.Namespace) -> None:
                 reasoning_effort=args.reasoning_effort,
                 max_output_tokens=args.max_output_tokens,
                 request_format=getattr(args, "request_format", "responses"),
+                enable_thinking=getattr(args, "enable_thinking", False),
             )
         )
 
@@ -316,6 +320,11 @@ def parse_args() -> argparse.Namespace:
     )
     prepare_parser.add_argument("--reasoning_effort", choices=("minimal", "low", "medium", "high"), default="medium")
     prepare_parser.add_argument("--max_output_tokens", type=int, default=1024)
+    prepare_parser.add_argument(
+        "--enable_thinking",
+        action="store_true",
+        help="Enable local Qwen3 hidden reasoning; use with chat_completions and a larger output budget.",
+    )
     prepare_parser.add_argument("--min_critic_version", type=int, default=0)
     prepare_parser.add_argument("--max_examples_per_outcome", type=int, default=512)
     prepare_parser.add_argument("--seed", type=int, default=0)

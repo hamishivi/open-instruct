@@ -92,6 +92,20 @@ class TestGenValueSFTSynthesis(unittest.TestCase):
         self.assertEqual(request["body"]["chat_template_kwargs"], {"enable_thinking": False})
         self.assertFalse(request["body"]["stream"])
 
+    def test_batch_request_can_enable_local_thinking(self):
+        request = make_batch_request(
+            "trace-1",
+            "critic prompt",
+            model="Qwen/Qwen3-32B",
+            reasoning_effort="medium",
+            max_output_tokens=4096,
+            request_format="chat_completions",
+            enable_thinking=True,
+        )
+
+        self.assertEqual(request["body"]["chat_template_kwargs"], {"enable_thinking": True})
+        self.assertEqual(request["body"]["max_tokens"], 4096)
+
     def test_extract_response_text_supports_local_reasoning_content(self):
         text = extract_response_text(
             {
