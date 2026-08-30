@@ -292,7 +292,8 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
             gt = gt[0] if gt else ""
         return str(gt)
 
-    prompts = [_extract_prompt(r) for r in records]
+    problems = [_extract_prompt(r) for r in records]
+    prompts = list(problems)
     ground_truths = [_extract_gt(r) for r in records]
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name_or_path)
 
@@ -403,6 +404,7 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
                 )
             row = {
                 "prompt": prompt,
+                "problem": problems[orig_idx],
                 "prompt_token_ids": main["prompt_token_ids"],
                 "ground_truth": gt,
                 "verifier_name": cfg.verifier_name,
@@ -711,7 +713,7 @@ def _score_with_generative_value(df, cfg: ScoreDatasetConfig) -> list[list[float
                 siblings=row.get("sibling_rollouts") or [],
                 score_min=cfg.gen_value_score_min,
                 score_max=cfg.gen_value_score_max,
-                problem=row.get("prompt", ""),
+                problem=row.get("problem", row.get("prompt", "")),
                 actor_model_name=cfg.gen_value_actor_model_name or row.get("actor_model_name"),
                 actor_success_rate=(
                     cfg.gen_value_actor_success_rate
