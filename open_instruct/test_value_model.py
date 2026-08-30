@@ -36,6 +36,7 @@ from open_instruct.rl_utils import (
     calculate_advantages_packed_sae_vapo,
     calculate_advantages_packed_vapo,
     calculate_length_adaptive_lambda,
+    estimate_sae_terminal_credit_retention,
 )
 from open_instruct.value_model_utils import (
     accumulation_group_token_counts,
@@ -308,6 +309,11 @@ class TestGAEVariants(unittest.TestCase):
         self.assertEqual(calculate_length_adaptive_lambda(1, alpha=1.0), 0.0)
         # alpha*length = 100 -> lambda close to 1
         self.assertGreater(calculate_length_adaptive_lambda(100, alpha=1.0), 0.98)
+
+    def test_estimated_sae_terminal_credit_exposes_short_trace(self):
+        self.assertEqual(estimate_sae_terminal_credit_retention(0.48, 1.0, 1024), 1.0)
+        self.assertAlmostEqual(estimate_sae_terminal_credit_retention(0.48, 0.95, 128), 0.0446, places=3)
+        self.assertLess(estimate_sae_terminal_credit_retention(0.48, 0.95, 1024), 1e-10)
 
     def test_skip_tool_outputs_bootstraps_across_observation_gap(self):
         # Prompt [0], action0 [1,2], tool [3,4], action1 [5,6] with terminal reward at t=6.

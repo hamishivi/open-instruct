@@ -116,6 +116,7 @@ from open_instruct.rl_utils import (
     calculate_advantages_packed_sae,
     calculate_advantages_packed_sae_vapo,
     calculate_advantages_packed_vapo,
+    estimate_sae_terminal_credit_retention,
     masked_mean,
 )
 from open_instruct.utils import (
@@ -1878,6 +1879,14 @@ class PolicyTrainerRayProcess(RayProcess):
                 skip_tool_outputs=args.skip_tool_outputs,
             )
             metrics.update(sae_metrics)
+            boundary_fraction = sae_metrics["value/sae_boundary_frac"]
+            boundary_lambda = sae_metrics["value/sae_boundary_lambda_mean"]
+            metrics["value/sae_estimated_terminal_credit_128"] = estimate_sae_terminal_credit_retention(
+                boundary_fraction, boundary_lambda, 128
+            )
+            metrics["value/sae_estimated_terminal_credit_1024"] = estimate_sae_terminal_credit_retention(
+                boundary_fraction, boundary_lambda, 1024
+            )
             return policy_adv, critic_returns, metrics
         if args.use_sae:
             assert logprobs_np is not None
@@ -1893,6 +1902,12 @@ class PolicyTrainerRayProcess(RayProcess):
                 skip_tool_outputs=args.skip_tool_outputs,
             )
             metrics["value/sae_boundary_frac"] = bf
+            metrics["value/sae_estimated_terminal_credit_128"] = estimate_sae_terminal_credit_retention(
+                bf, args.gae_lambda, 128
+            )
+            metrics["value/sae_estimated_terminal_credit_1024"] = estimate_sae_terminal_credit_retention(
+                bf, args.gae_lambda, 1024
+            )
             return adv, returns, metrics
         if args.decoupled_gae:
             policy_adv, critic_returns, avg_lam = calculate_advantages_packed_vapo(

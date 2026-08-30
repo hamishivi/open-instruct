@@ -454,6 +454,25 @@ def calculate_length_adaptive_lambda(response_length: int, alpha: float = 0.05) 
     return max(0.0, min(0.999, lam))
 
 
+def estimate_sae_terminal_credit_retention(
+    boundary_fraction: float, boundary_lambda: float, token_distance: int
+) -> float:
+    """Estimate how much terminal credit survives across an SAE token distance.
+
+    SAE uses lambda=1 away from boundaries and ``boundary_lambda`` at boundaries. Treating the
+    observed boundary fraction as the per-token boundary probability gives a transparent early-warning
+    estimate: ``(1 - boundary_fraction * (1 - boundary_lambda)) ** token_distance``.
+    """
+    if not 0.0 <= boundary_fraction <= 1.0:
+        raise ValueError(f"boundary_fraction must be in [0, 1], got {boundary_fraction}.")
+    if not 0.0 <= boundary_lambda <= 1.0:
+        raise ValueError(f"boundary_lambda must be in [0, 1], got {boundary_lambda}.")
+    if token_distance < 0:
+        raise ValueError(f"token_distance must be nonnegative, got {token_distance}.")
+    mean_lambda = 1.0 - boundary_fraction * (1.0 - boundary_lambda)
+    return mean_lambda**token_distance
+
+
 def _next_response_token_indices(response_masks: np.ndarray, dones: np.ndarray) -> np.ndarray:
     """For each position, index of the next response token in the same episode, or -1 if none.
 
