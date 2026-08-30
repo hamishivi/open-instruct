@@ -16,6 +16,10 @@
 # critic-only training from a previously exported Hugging Face model.  The default
 # seed intentionally differs from the seed-1 rollout stream used to build the SFT
 # trace reservoir, so the post-SFT calibration stage exercises unseen prompts.
+# Match Algorithm 1 in GenAC by reward-weighting each sampled critic trace with
+# its raw accuracy-shaped reward. We sample one critic trace per state, so
+# centering across unrelated states of the same outcome removes the absolute
+# calibration signal that frozen-actor pretraining is meant to learn.
 set -euo pipefail
 
 if [[ "${PRESERVE_LD_LIBRARY_PATH:-0}" != "1" ]]; then
@@ -132,7 +136,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --gen_value_icc_momentum 0.9 \
     --gen_value_learning_rate 1e-6 \
     --gen_value_reinforce_coef 1.0 \
-    --gen_value_reinforce_baseline leave_one_out_by_outcome \
+    --gen_value_reinforce_baseline none \
     --gen_value_final_action_replay_weight 4 \
     --gen_value_sync_freq 5 \
     --gen_value_diagnostic_scoring_freq 0 \
