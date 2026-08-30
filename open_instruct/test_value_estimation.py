@@ -107,6 +107,62 @@ class TestValueEstimationStates(unittest.TestCase):
         self.assertEqual([example["response_tokens_used"] for example in repeated], [1, 3, 3, 5, 5, 5])
         self.assertEqual([example["horizon_repeat_index"] for example in repeated], [0, 0, 1, 0, 1, 2])
 
+    def test_mc_sft_pools_independent_targets_for_shared_exact_states(self):
+        examples = prepare_gen_value_mc_sft.build_mc_sft_examples(
+            [
+                {
+                    "problem": "Compute the answer.",
+                    "rollout_tokens": [10, 11, 12],
+                    "probe_positions": [0, 2],
+                    "mc_values": [0.25, 1.0],
+                    "num_continuations": 16,
+                },
+                {
+                    "problem": "Compute the answer.",
+                    "rollout_tokens": [10, 13],
+                    "probe_positions": [0, 1],
+                    "mc_values": [0.5, 0.0],
+                    "num_continuations": 32,
+                },
+            ],
+            tokenizer=_FakeTokenizer(),
+            min_continuations=16,
+        )
+
+        self.assertEqual(len(examples), 3)
+        pooled = examples[0]
+        self.assertAlmostEqual(pooled["target"], (0.25 * 16 + 0.5 * 32) / 48)
+        self.assertEqual(pooled["generation"], " <answer>4</answer>")
+        self.assertEqual(pooled["num_continuations"], 48)
+        self.assertEqual(pooled["mc_source_count"], 2)
+        self.assertEqual(pooled["source_rollout_lengths"], [3, 2])
+        self.assertEqual(pooled["source_trajectory_fractions"], [0.0, 0.0])
+
+    def test_mc_sft_rejects_prompt_collisions_with_inconsistent_metadata(self):
+        with self.assertRaisesRegex(ValueError, "inconsistent metadata fields"):
+            prepare_gen_value_mc_sft.build_mc_sft_examples(
+                [
+                    {
+                        "problem": "First problem identity.",
+                        "prompt_token_ids": [1],
+                        "rollout_tokens": [10],
+                        "probe_positions": [0],
+                        "mc_values": [0.25],
+                        "num_continuations": 16,
+                    },
+                    {
+                        "problem": "Second problem identity.",
+                        "prompt_token_ids": [1],
+                        "rollout_tokens": [11],
+                        "probe_positions": [0],
+                        "mc_values": [0.5],
+                        "num_continuations": 16,
+                    },
+                ],
+                tokenizer=_FakeTokenizer(),
+                min_continuations=16,
+            )
+
     def test_mc_sft_uses_the_exact_decoded_actor_prompt_as_the_problem(self):
         tokenizer = _FakeTokenizer()
 

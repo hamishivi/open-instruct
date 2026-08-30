@@ -63,7 +63,7 @@ def build_mc_sft_examples(
         )
 
     examples: list[dict[str, Any]] = []
-    prompts_seen: set[str] = set()
+    prompt_to_example_index: dict[str, int] = {}
     for row_index, row in enumerate(rows):
         probe_positions = [int(position) for position in optional_sequence_as_list(row.get("probe_positions"))]
         mc_values = [float(value) for value in optional_sequence_as_list(row.get("mc_values"))]
@@ -111,35 +111,91 @@ def build_mc_sft_examples(
                 response_tokens_used=probe_position,
                 response_token_limit=response_token_limit,
             )
-            if prompt in prompts_seen:
-                raise ValueError(
-                    f"Duplicate exact critic prompt generated for row {row_index}, probe {probe_position}."
-                )
-            prompts_seen.add(prompt)
             score = quantize_mc_value(mc_value, score_max=score_max)
             state_kind = "final_action" if probe_position == len(rollout_tokens) - 1 else "segment_start"
             # Match online critic metadata: zero at the first action and one at
             # the causal state immediately before the sampled final action.
             trajectory_fraction = probe_position / max(len(rollout_tokens) - 1, 1)
-            examples.append(
+            example = {
+                "prompt": prompt,
+                "generation": f" <answer>{score}</answer>",
+                "target": mc_value,
+                "outcome": mc_value,
+                "prediction": score / score_max,
+                "squared_error": (score / score_max - mc_value) ** 2,
+                "state_kind": state_kind,
+                "response_tokens_used": probe_position,
+                "response_token_limit": response_token_limit,
+                "rollout_length": len(rollout_tokens),
+                "source_rollout_lengths": [len(rollout_tokens)],
+                "trajectory_fraction": trajectory_fraction,
+                "source_trajectory_fractions": [trajectory_fraction],
+                "num_continuations": num_continuations,
+                "mc_source_count": 1,
+                "problem": problem,
+                "critic_problem": critic_problem,
+                "ground_truth": ground_truth,
+                "gen_value_conditioning": gen_value_conditioning,
+                "direct_mc_score_supervision": True,
+            }
+            existing_index = prompt_to_example_index.get(prompt)
+            if existing_index is None:
+                prompt_to_example_index[prompt] = len(examples)
+                examples.append(example)
+                continue
+
+            # Correct and incorrect sampled trajectories for one problem share
+            # their initial causal state and can share a few later prefixes.
+            # Their MC continuations are independent estimates of the same
+            # state value, so pool successes rather than emitting contradictory
+            # labels or discarding either estimate.
+            existing = examples[existing_index]
+            consistency_fields = (
+                "problem",
+                "critic_problem",
+                "ground_truth",
+                "gen_value_conditioning",
+                "response_tokens_used",
+                "response_token_limit",
+            )
+            inconsistent_fields = [
+                field for field in consistency_fields if existing.get(field) != example.get(field)
+            ]
+            if inconsistent_fields:
+                raise ValueError(
+                    f"Exact critic prompt collision for row {row_index}, probe {probe_position} has inconsistent "
+                    f"metadata fields: {inconsistent_fields}."
+                )
+            existing_continuations = int(existing["num_continuations"])
+            pooled_continuations = existing_continuations + num_continuations
+            pooled_value = (
+                float(existing["target"]) * existing_continuations + mc_value * num_continuations
+            ) / pooled_continuations
+            pooled_score = quantize_mc_value(pooled_value, score_max=score_max)
+            existing.update(
                 {
-                    "prompt": prompt,
-                    "generation": f" <answer>{score}</answer>",
-                    "target": mc_value,
-                    "outcome": mc_value,
-                    "prediction": score / score_max,
-                    "squared_error": (score / score_max - mc_value) ** 2,
-                    "state_kind": state_kind,
-                    "response_tokens_used": probe_position,
-                    "response_token_limit": response_token_limit,
-                    "rollout_length": len(rollout_tokens),
-                    "trajectory_fraction": trajectory_fraction,
-                    "num_continuations": num_continuations,
-                    "problem": problem,
-                    "critic_problem": critic_problem,
-                    "ground_truth": ground_truth,
-                    "gen_value_conditioning": gen_value_conditioning,
-                    "direct_mc_score_supervision": True,
+                    "generation": f" <answer>{pooled_score}</answer>",
+                    "target": pooled_value,
+                    "outcome": pooled_value,
+                    "prediction": pooled_score / score_max,
+                    "squared_error": (pooled_score / score_max - pooled_value) ** 2,
+                    "state_kind": (
+                        "final_action"
+                        if "final_action" in {str(existing["state_kind"]), state_kind}
+                        else "segment_start"
+                    ),
+                    "rollout_length": max(int(existing["rollout_length"]), len(rollout_tokens)),
+                    "source_rollout_lengths": [
+                        *optional_sequence_as_list(existing.get("source_rollout_lengths")),
+                        len(rollout_tokens),
+                    ],
+                    "trajectory_fraction": max(float(existing["trajectory_fraction"]), trajectory_fraction),
+                    "source_trajectory_fractions": [
+                        *optional_sequence_as_list(existing.get("source_trajectory_fractions")),
+                        trajectory_fraction,
+                    ],
+                    "num_continuations": pooled_continuations,
+                    "mc_source_count": int(existing["mc_source_count"]) + 1,
                 }
             )
     return examples
