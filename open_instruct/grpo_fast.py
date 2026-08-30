@@ -2096,6 +2096,13 @@ class PolicyTrainerRayProcess(RayProcess):
         # policy loop. No-op when `use_value_model=False`.
         value_loss_inputs: list[dict] | None = None
         sae_step_metrics: dict[str, float] = {}
+        if _use_gen_value:
+            training_temperature = float(getattr(self.args, "gen_value_temperature", 1.0))
+            inference_temperature = getattr(self.args, "gen_value_inference_temperature", None)
+            if inference_temperature is None:
+                inference_temperature = training_temperature
+            sae_step_metrics["gen_value/inference_temperature"] = float(inference_temperature)
+            sae_step_metrics["gen_value/training_temperature"] = training_temperature
         # When use_generative_value_model=True and gen-value engines are wired up, we score
         # each rollout at fixed-chunk boundaries and use those piecewise-constant estimates as
         # the value function for GAE instead of the scalar value head.
