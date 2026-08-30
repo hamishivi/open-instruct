@@ -65,6 +65,7 @@ from open_instruct.value_model_utils import (
     resolve_num_siblings_to_sample,
     reward_to_unit_value,
     segment_rollout,
+    select_gen_value_sft_traces,
     unit_value_to_reward,
     validate_terminal_rewards,
     value_clipped_mse_loss,
@@ -849,6 +850,68 @@ class TestValueLoss(unittest.TestCase):
             self.assertEqual(manifest["critic_version"], 25)
             self.assertEqual(manifest["retained_examples"], 1)
             self.assertEqual(manifest["seen_by_outcome"], {"correct": 11, "incorrect": 23})
+
+    def test_gen_value_sft_trace_selection_is_accurate_balanced_and_deduplicated(self):
+        examples = [
+            {
+                "source_critic_version": 20,
+                "outcome": 1.0,
+                "prediction": 0.8,
+                "squared_error": 0.04,
+                "prompt": "correct-a",
+                "generation": "reasoning <answer>0.8</answer>",
+            },
+            {
+                "source_critic_version": 25,
+                "outcome": 1.0,
+                "prediction": 0.9,
+                "squared_error": 0.01,
+                "prompt": "correct-a",
+                "generation": "better reasoning <answer>0.9</answer>",
+            },
+            {
+                "source_critic_version": 25,
+                "outcome": 1.0,
+                "prediction": 0.95,
+                "squared_error": 0.0025,
+                "prompt": "correct-b",
+                "generation": "reasoning <answer>0.95</answer>",
+            },
+            {
+                "source_critic_version": 25,
+                "outcome": 0.0,
+                "prediction": 0.1,
+                "squared_error": 0.01,
+                "prompt": "incorrect-a",
+                "generation": "reasoning <answer>0.1</answer>",
+            },
+            {
+                "source_critic_version": 25,
+                "outcome": 0.0,
+                "prediction": None,
+                "squared_error": None,
+                "prompt": "parse-failure",
+                "generation": "unparseable",
+            },
+            {
+                "source_critic_version": 25,
+                "outcome": 0.0,
+                "prediction": 0.8,
+                "squared_error": 0.64,
+                "prompt": "inaccurate",
+                "generation": "reasoning <answer>0.8</answer>",
+            },
+        ]
+
+        selected = select_gen_value_sft_traces(examples, max_squared_error=0.04, min_critic_version=25, seed=7)
+
+        self.assertEqual(len(selected), 2)
+        self.assertEqual({example["outcome"] for example in selected}, {0.0, 1.0})
+        selected_by_prompt = {example["prompt"]: example for example in selected}
+        self.assertNotIn("parse-failure", selected_by_prompt)
+        self.assertNotIn("inaccurate", selected_by_prompt)
+        if "correct-a" in selected_by_prompt:
+            self.assertEqual(selected_by_prompt["correct-a"]["prediction"], 0.9)
 
     def test_final_action_prefix_retains_observations_and_is_causal(self):
         prefix, response_tokens_used = causal_final_action_prefix_token_ids(

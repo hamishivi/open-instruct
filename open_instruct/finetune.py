@@ -523,7 +523,7 @@ def main(args: FlatArguments, tc: TokenizerConfig):
     # when multiple ranks on a shared filesystem all try to access the
     # HF hub cache concurrently.
     model_path = args.config_name or args.model_name_or_path
-    if model_path and accelerator.is_main_process:
+    if model_path and accelerator.is_main_process and not os.path.isdir(model_path):
         snapshot_download(model_path, revision=args.model_revision)
     accelerator.wait_for_everyone()
 

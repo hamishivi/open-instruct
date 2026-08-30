@@ -1209,6 +1209,56 @@ def sft_tulu_tokenize_and_truncate_v1(row: dict[str, Any], tokenizer: PreTrained
     return row
 
 
+def gen_value_sft_tokenize_and_truncate_v1(row: dict[str, Any], tokenizer: PreTrainedTokenizer, max_seq_length: int):
+    """Tokenize a raw generative-value prompt/completion pair for SFT.
+
+    Generative-value inference uses a preformatted raw prompt rather than the
+    model's chat template. Applying a chat template again during SFT changes the
+    conditioning distribution, so concatenate the retained prompt and generation
+    verbatim and mask only the prompt tokens.
+    """
+    prompt = row.get("prompt")
+    generation = row.get("generation")
+    if not isinstance(prompt, str) or not prompt:
+        raise ValueError("Generative-value SFT rows require a non-empty string 'prompt'.")
+    if not isinstance(generation, str) or not generation:
+        raise ValueError("Generative-value SFT rows require a non-empty string 'generation'.")
+
+    if max_seq_length <= 0:
+        raise ValueError(f"max_seq_length must be positive, got {max_seq_length}.")
+    combined_text = prompt + generation
+    try:
+        encoded = tokenizer(combined_text, add_special_tokens=False, return_offsets_mapping=True)
+        input_ids = list(encoded[INPUT_IDS_KEY])
+        offsets = encoded["offset_mapping"]
+        prompt_token_count = max(
+            (token_index + 1 for token_index, (start, end) in enumerate(offsets) if start < len(prompt) and end > 0),
+            default=0,
+        )
+    except (NotImplementedError, TypeError, ValueError):
+        # Slow tokenizers do not expose offsets. Mask the common prefix plus
+        # one boundary-spanning token when the prompt/completion seam merges.
+        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        input_ids = tokenizer.encode(combined_text, add_special_tokens=False)
+        common_prefix = 0
+        for prompt_id, combined_id in zip(prompt_ids, input_ids):
+            if prompt_id != combined_id:
+                break
+            common_prefix += 1
+        prompt_token_count = common_prefix + int(common_prefix < len(prompt_ids) and common_prefix < len(input_ids))
+
+    if tokenizer.eos_token_id is not None and (not input_ids or input_ids[-1] != tokenizer.eos_token_id):
+        input_ids.append(tokenizer.eos_token_id)
+    input_ids = input_ids[:max_seq_length]
+    labels = copy.deepcopy(input_ids)
+    labels[: min(prompt_token_count, len(labels))] = [MASKED_TOKEN_VALUE] * min(prompt_token_count, len(labels))
+
+    row[INPUT_IDS_KEY] = torch.tensor(input_ids, dtype=torch.long)
+    row[LABELS_KEY] = torch.tensor(labels, dtype=torch.long)
+    row[ATTENTION_MASK_KEY] = torch.ones(len(input_ids), dtype=torch.long)
+    return row
+
+
 def last_turn_tulu_tokenize_and_truncate_v1(row: dict[str, Any], tokenizer: PreTrainedTokenizer, max_seq_length: int):
     """taken directly from https://github.com/allenai/open-instruct/blob/ba11286e5b9eb00d4ce5b40ef4cac1389888416a/open_instruct/finetune.py#L385"""
     messages = row["messages"]
@@ -1550,6 +1600,7 @@ TRANSFORM_FNS = {
     "sft_tokenize_mask_out_prompt_v1": (sft_tokenize_mask_out_prompt_v1, "map"),
     "sft_filter_v1": (sft_filter_v1, "filter"),
     "sft_tulu_tokenize_and_truncate_v1": (sft_tulu_tokenize_and_truncate_v1, "map"),
+    "gen_value_sft_tokenize_and_truncate_v1": (gen_value_sft_tokenize_and_truncate_v1, "map"),
     "sft_tulu_filter_v1": (sft_tulu_filter_v1, "filter"),
     "preference_tokenize_v1": (preference_tokenize_v1, "map"),
     "preference_filter_v1": (preference_filter_v1, "filter"),

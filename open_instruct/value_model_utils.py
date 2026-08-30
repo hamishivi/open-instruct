@@ -541,6 +541,73 @@ def write_gen_value_training_trace_reservoir(
     return trace_path
 
 
+def select_gen_value_sft_traces(
+    examples: Sequence[dict[str, Any]],
+    max_squared_error: float,
+    min_critic_version: int = 0,
+    max_examples_per_outcome: int | None = None,
+    balance_outcomes: bool = True,
+    seed: int = 0,
+) -> list[dict[str, Any]]:
+    """Select parsed, accurate critic traces for prompt-preserving SFT.
+
+    Each retained prompt is used at most once so SFT cannot see contradictory
+    completions for the same state. Sampling after the accuracy gate preserves a
+    representative mix from the on-policy reservoir instead of selecting only the
+    easiest states.
+    """
+    if max_squared_error < 0:
+        raise ValueError(f"max_squared_error must be nonnegative, got {max_squared_error}.")
+    if min_critic_version < 0:
+        raise ValueError(f"min_critic_version must be nonnegative, got {min_critic_version}.")
+    if max_examples_per_outcome is not None and max_examples_per_outcome <= 0:
+        raise ValueError(f"max_examples_per_outcome must be positive when set, got {max_examples_per_outcome}.")
+
+    best_by_prompt: dict[str, dict[str, Any]] = {}
+    for example in examples:
+        prompt = example.get("prompt")
+        generation = example.get("generation")
+        prediction = example.get("prediction")
+        squared_error = example.get("squared_error")
+        outcome = example.get("outcome")
+        critic_version = example.get("source_critic_version", 0)
+        if not isinstance(prompt, str) or not prompt or not isinstance(generation, str) or not generation:
+            continue
+        if not isinstance(prediction, (float, int)) or not math.isfinite(float(prediction)):
+            continue
+        if not isinstance(squared_error, (float, int)) or not math.isfinite(float(squared_error)):
+            continue
+        if not isinstance(outcome, (float, int)) or not math.isfinite(float(outcome)):
+            continue
+        if not isinstance(critic_version, int) or critic_version < min_critic_version:
+            continue
+        if float(squared_error) > max_squared_error:
+            continue
+        previous = best_by_prompt.get(prompt)
+        if previous is None or float(squared_error) < float(previous["squared_error"]):
+            best_by_prompt[prompt] = dict(example)
+
+    buckets: dict[str, list[dict[str, Any]]] = {"correct": [], "incorrect": []}
+    for example in best_by_prompt.values():
+        bucket = "correct" if float(example["outcome"]) > 0.5 else "incorrect"
+        buckets[bucket].append(example)
+
+    rng = random.Random(seed)
+    for bucket in buckets.values():
+        rng.shuffle(bucket)
+    if balance_outcomes and all(buckets.values()):
+        balanced_size = min(len(bucket) for bucket in buckets.values())
+        per_outcome_limit = balanced_size
+    else:
+        per_outcome_limit = max((len(bucket) for bucket in buckets.values()), default=0)
+    if max_examples_per_outcome is not None:
+        per_outcome_limit = min(per_outcome_limit, max_examples_per_outcome)
+
+    selected = buckets["correct"][:per_outcome_limit] + buckets["incorrect"][:per_outcome_limit]
+    rng.shuffle(selected)
+    return selected
+
+
 def pack_gen_value_examples(examples: list[dict[str, Any]], target_tokens: int) -> list[list[dict[str, Any]]]:
     """Pack critic examples in order up to the policy's token budget.
 

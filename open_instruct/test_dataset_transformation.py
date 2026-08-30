@@ -1,6 +1,7 @@
 import gc
 import gzip
 import hashlib
+import json
 import os
 import shutil
 import tempfile
@@ -80,6 +81,43 @@ class TestRLVRTokenize(unittest.TestCase):
             add_generation_prompt=True,
             return_dict=False,
             tools=None,
+        )
+
+
+class TestGenValueSFTTokenize(unittest.TestCase):
+    def test_preserves_raw_prompt_and_masks_only_prompt_tokens(self):
+        tokenizer = mock.MagicMock()
+        tokenizer.eos_token_id = 99
+        tokenizer.return_value = {"input_ids": [1, 2, 3, 4], "offset_mapping": [(0, 3), (3, 10), (10, 20), (20, 51)]}
+
+        row = open_instruct.dataset_transformation.gen_value_sft_tokenize_and_truncate_v1(
+            {"prompt": "raw prompt", "generation": "reasoning <answer>1</answer>"}, tokenizer, max_seq_length=32
+        )
+
+        self.assertEqual(row[open_instruct.dataset_transformation.INPUT_IDS_KEY].tolist(), [1, 2, 3, 4, 99])
+        self.assertEqual(
+            row[open_instruct.dataset_transformation.LABELS_KEY].tolist(),
+            [open_instruct.dataset_transformation.MASKED_TOKEN_VALUE] * 2 + [3, 4, 99],
+        )
+        self.assertEqual(row[open_instruct.dataset_transformation.ATTENTION_MASK_KEY].tolist(), [1] * 5)
+        tokenizer.assert_called_once_with(
+            "raw promptreasoning <answer>1</answer>", add_special_tokens=False, return_offsets_mapping=True
+        )
+
+    def test_slow_tokenizer_masks_a_boundary_spanning_token(self):
+        tokenizer = mock.MagicMock()
+        tokenizer.eos_token_id = 99
+        tokenizer.side_effect = NotImplementedError
+        tokenizer.encode.side_effect = [[1, 2], [1, 7, 3]]
+
+        row = open_instruct.dataset_transformation.gen_value_sft_tokenize_and_truncate_v1(
+            {"prompt": "raw prompt", "generation": "generation"}, tokenizer, max_seq_length=32
+        )
+
+        self.assertEqual(row[open_instruct.dataset_transformation.INPUT_IDS_KEY].tolist(), [1, 7, 3, 99])
+        self.assertEqual(
+            row[open_instruct.dataset_transformation.LABELS_KEY].tolist(),
+            [open_instruct.dataset_transformation.MASKED_TOKEN_VALUE] * 2 + [3, 99],
         )
 
 
@@ -176,6 +214,45 @@ class TestCachedDataset(unittest.TestCase):
         for row in dataset:
             dataset_hash.update(str(row["input_ids"]).encode())
         self.assertEqual(dataset_hash.hexdigest(), GOLD_SFT["hash"])
+
+    def test_get_cached_dataset_gen_value_raw_prompt_sft(self):
+        trace_path = os.path.join(self.temp_dir.name, "gen_value_traces.jsonl")
+        with open(trace_path, "w") as trace_file:
+            trace_file.write(
+                json.dumps(
+                    {
+                        "prompt": "Estimate success probability.\nAssistant: ",
+                        "generation": "The work is nearly complete. <answer>0.9</answer>",
+                    }
+                )
+                + "\n"
+            )
+        tc = open_instruct.dataset_transformation.TokenizerConfig(
+            tokenizer_name_or_path=TOKENIZER_PATH, tokenizer_revision="main", use_fast=True, add_bos=False
+        )
+
+        dataset = open_instruct.dataset_transformation.get_cached_dataset_tulu(
+            [trace_path, "1.0"],
+            ["train"],
+            tc,
+            ["gen_value_sft_tokenize_and_truncate_v1", "sft_tulu_filter_v1"],
+            [{"max_seq_length": 4096}, {}],
+            open_instruct.dataset_transformation.TOKENIZED_SFT_DATASET_KEYS,
+            dataset_skip_cache=True,
+            dataset_local_cache_dir=self.temp_dir.name,
+        )
+
+        self.assertEqual(len(dataset), 1)
+        labels = dataset[0][open_instruct.dataset_transformation.LABELS_KEY]
+        self.assertGreater(
+            sum(label != open_instruct.dataset_transformation.MASKED_TOKEN_VALUE for label in labels), 0
+        )
+        first_unmasked = next(
+            index
+            for index, label in enumerate(labels)
+            if label != open_instruct.dataset_transformation.MASKED_TOKEN_VALUE
+        )
+        self.assertGreater(first_unmasked, 0)
 
     def test_get_cached_dataset_tulu_preference(self):
         tc = open_instruct.dataset_transformation.TokenizerConfig(
