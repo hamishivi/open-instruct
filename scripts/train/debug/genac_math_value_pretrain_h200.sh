@@ -11,7 +11,9 @@
 #   - 1 generative-critic vLLM engine
 #   - 1 generative-critic DeepSpeed trainer
 #
-# total_episodes = 100 critic-only steps * 32 prompts * 8 samples = 25,600
+# By default total_episodes = 100 critic-only steps * 32 prompts * 8 samples = 25,600.
+# VALUE_PRETRAIN_STEPS and GEN_VALUE_MODEL_PATH can be overridden to continue
+# critic-only training from a previously exported Hugging Face model.
 set -euo pipefail
 
 if [[ "${PRESERVE_LD_LIBRARY_PATH:-0}" != "1" ]]; then
@@ -25,15 +27,25 @@ export TOKENIZERS_PARALLELISM=false
 export HF_HOME="${HF_HOME:-/tmp/hf_home}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 
+EXP_NAME="${EXP_NAME:-genac-math-value-pretrain-h200}"
+RUN_OUTPUT_DIR="${RUN_OUTPUT_DIR:-${PWD}/outputs/${EXP_NAME}}"
+CHECKPOINT_STATE_DIR="${CHECKPOINT_STATE_DIR:-${RUN_OUTPUT_DIR}/checkpoint_states}"
+VALUE_PRETRAIN_STEPS="${VALUE_PRETRAIN_STEPS:-100}"
+GEN_VALUE_MODEL_PATH="${GEN_VALUE_MODEL_PATH:-Qwen/Qwen3-4B-Instruct-2507}"
+NUM_UNIQUE_PROMPTS_ROLLOUT=32
+NUM_SAMPLES_PER_PROMPT_ROLLOUT=8
+
+if [[ ! "${VALUE_PRETRAIN_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: VALUE_PRETRAIN_STEPS must be at least 1" >&2
+    exit 1
+fi
+TOTAL_EPISODES=$((VALUE_PRETRAIN_STEPS * NUM_UNIQUE_PROMPTS_ROLLOUT * NUM_SAMPLES_PER_PROMPT_ROLLOUT))
+
 ray stop --force 2>/dev/null || true
 ray start --head --port=8888 --dashboard-host=0.0.0.0
 trap 'ray stop --force' EXIT
 
 mkdir -p "${HOME}/.triton/autotune"
-
-EXP_NAME="${EXP_NAME:-genac-math-value-pretrain-h200}"
-RUN_OUTPUT_DIR="${RUN_OUTPUT_DIR:-${PWD}/outputs/${EXP_NAME}}"
-CHECKPOINT_STATE_DIR="${CHECKPOINT_STATE_DIR:-${RUN_OUTPUT_DIR}/checkpoint_states}"
 
 python open_instruct/grpo_fast_genvalue.py \
     --exp_name "${EXP_NAME}" \
@@ -45,8 +57,8 @@ python open_instruct/grpo_fast_genvalue.py \
     --response_length 8192 \
     --pack_length 10240 \
     --per_device_train_batch_size 1 \
-    --num_unique_prompts_rollout 32 \
-    --num_samples_per_prompt_rollout 8 \
+    --num_unique_prompts_rollout "${NUM_UNIQUE_PROMPTS_ROLLOUT}" \
+    --num_samples_per_prompt_rollout "${NUM_SAMPLES_PER_PROMPT_ROLLOUT}" \
     --filter_zero_std_samples false \
     --model_name_or_path Qwen/Qwen3-4B-Base \
     --chat_template_name qwen_instruct_user_boxed_math \
@@ -62,7 +74,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --advantage_normalization_type centered \
     --learning_rate 1e-6 \
     --lr_scheduler_type constant \
-    --total_episodes 25600 \
+    --total_episodes "${TOTAL_EPISODES}" \
     --num_epochs 1 \
     --num_mini_batches 1 \
     --deepspeed_stage 3 \
@@ -85,13 +97,13 @@ python open_instruct/grpo_fast_genvalue.py \
     --with_tracking \
     --push_to_hub false \
     --use_value_model \
-    --value_warmup_steps 100 \
+    --value_warmup_steps "${VALUE_PRETRAIN_STEPS}" \
     --gae_lambda 1.0 \
     --gamma 1.0 \
     --use_sae \
     --sae_threshold 0.2 \
     --use_generative_value_model \
-    --gen_value_model_name_or_path Qwen/Qwen3-4B-Instruct-2507 \
+    --gen_value_model_name_or_path "${GEN_VALUE_MODEL_PATH}" \
     --gen_value_vllm_num_engines 1 \
     --gen_value_vllm_tensor_parallel_size 1 \
     --gen_value_segmentation sae \
