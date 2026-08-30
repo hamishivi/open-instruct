@@ -4,6 +4,7 @@ import math
 import unittest
 
 import numpy as np
+from scripts.data import prepare_gen_value_mc_sft
 
 from open_instruct import value_estimation
 
@@ -15,6 +16,67 @@ class _FakeTokenizer:
 
 
 class TestValueEstimationStates(unittest.TestCase):
+    def test_mc_sft_targets_supervise_only_the_direct_score(self):
+        examples = prepare_gen_value_mc_sft.build_mc_sft_examples(
+            [
+                {
+                    "problem": "Compute the answer.",
+                    "rollout_tokens": [10, 11, 12],
+                    "probe_positions": [1, 2],
+                    "mc_values": [0.0, 0.5625],
+                    "num_continuations": 16,
+                    "response_token_limit": 8192,
+                    "actor_model_name": "Qwen/Qwen3-4B-Base",
+                    "actor_success_rate": 0.1,
+                }
+            ],
+            tokenizer=_FakeTokenizer(),
+            min_continuations=16,
+        )
+
+        self.assertEqual(
+            [example["generation"] for example in examples], [" <answer>0</answer>", " <answer>6</answer>"]
+        )
+        self.assertEqual([example["target"] for example in examples], [0.0, 0.5625])
+        self.assertIn("<rollout>10</rollout>", examples[0]["prompt"])
+        self.assertIn("<rollout>10:11</rollout>", examples[1]["prompt"])
+        self.assertTrue(all(example["direct_mc_score_supervision"] for example in examples))
+
+    def test_mc_sft_rejects_under_sampled_targets(self):
+        with self.assertRaisesRegex(ValueError, "only 8 continuations"):
+            prepare_gen_value_mc_sft.build_mc_sft_examples(
+                [
+                    {
+                        "problem": "Compute the answer.",
+                        "rollout_tokens": [10],
+                        "probe_positions": [0],
+                        "mc_values": [0.5],
+                        "num_continuations": 8,
+                    }
+                ],
+                tokenizer=_FakeTokenizer(),
+                min_continuations=16,
+            )
+
+    def test_problem_exclusion_happens_before_sampling(self):
+        dataset = [
+            {"messages": [{"role": "user", "content": "held out"}]},
+            {"messages": [{"role": "user", "content": "training one"}]},
+            {"prompt": "training two"},
+        ]
+
+        indices = value_estimation._sample_record_indices(
+            dataset, num_to_sample=3, seed=7, excluded_problems={"held out"}
+        )
+
+        self.assertCountEqual(indices, [1, 2])
+
+    def test_problem_exclusion_fails_when_nothing_remains(self):
+        with self.assertRaisesRegex(ValueError, "No dataset rows remain"):
+            value_estimation._sample_record_indices(
+                [{"prompt": "held out"}], num_to_sample=1, seed=7, excluded_problems={"held out"}
+            )
+
     def test_generative_scorer_default_matches_online_reasoning_budget(self):
         self.assertEqual(
             value_estimation.ScoreDatasetConfig.__dataclass_fields__["gen_value_max_new_tokens"].default, 1024

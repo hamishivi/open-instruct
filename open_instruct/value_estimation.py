@@ -51,6 +51,12 @@ class MakeDatasetConfig:
     output_path: str
     dataset_name: str = "hamishivi/DAPO-Math-17k-Processed_filtered"
     dataset_split: str = "train"
+    exclude_problem_dataset_path: str | None = None
+    """Optional parquet whose ``problem`` strings are excluded before sampling.
+
+    This keeps offline value-training prefixes disjoint from a fixed Monte Carlo
+    calibration set without relying on different random seeds to avoid overlap.
+    """
     num_prompts_to_sample: int = 2000  # Sample this many, keep first 100 with 1 correct + 1 wrong.
     target_num_pairs: int = 100
     rollouts_per_prompt: int = 8
@@ -265,26 +271,54 @@ def _verify(prediction: str, ground_truth: str, verifier_name: str) -> bool:
     return float(v(tokenized_prediction=[], prediction=prediction, label=ground_truth).score) >= 1.0
 
 
+def _extract_problem(row: dict[str, Any]) -> str:
+    """Return the unformatted user problem used to identify held-out states."""
+    if "messages" in row and isinstance(row["messages"], list) and row["messages"]:
+        return str(row["messages"][-1].get("content", ""))
+    return str(row.get("prompt", ""))
+
+
+def _sample_record_indices(
+    dataset: Any, *, num_to_sample: int, seed: int, excluded_problems: set[str] | None = None
+) -> list[int]:
+    """Sample dataset rows after exact problem-level holdout exclusion."""
+    excluded_problems = excluded_problems or set()
+    eligible_indices = [
+        index for index in range(len(dataset)) if _extract_problem(dataset[index]) not in excluded_problems
+    ]
+    if not eligible_indices:
+        raise ValueError("No dataset rows remain after held-out problem exclusion.")
+    rng = random.Random(seed)
+    return rng.sample(eligible_indices, min(num_to_sample, len(eligible_indices)))
+
+
 def make_dataset(cfg: MakeDatasetConfig) -> str:
     """Build the value-estimation dataset described in the plan."""
     import pandas as pd  # noqa: PLC0415
     from datasets import load_dataset  # noqa: PLC0415
     from transformers import AutoTokenizer  # noqa: PLC0415
 
-    random.seed(cfg.seed)
     np.random.seed(cfg.seed)
 
     logger.info(f"Loading dataset {cfg.dataset_name} split={cfg.dataset_split}")
     ds = load_dataset(cfg.dataset_name, split=cfg.dataset_split)
-    num_to_sample = min(cfg.num_prompts_to_sample, len(ds))
-    indices = random.sample(range(len(ds)), num_to_sample)
+    excluded_problems: set[str] = set()
+    if cfg.exclude_problem_dataset_path is not None:
+        exclusion_path = pathlib.Path(cfg.exclude_problem_dataset_path)
+        if not exclusion_path.is_file():
+            raise FileNotFoundError(f"Held-out problem dataset does not exist: {exclusion_path}")
+        exclusion_frame = pd.read_parquet(exclusion_path, columns=["problem"])
+        excluded_problems = {
+            problem for problem in exclusion_frame["problem"].tolist() if isinstance(problem, str) and problem
+        }
+        logger.info(f"Excluding {len(excluded_problems)} held-out problems from value-estimation sampling")
+    indices = _sample_record_indices(
+        ds, num_to_sample=cfg.num_prompts_to_sample, seed=cfg.seed, excluded_problems=excluded_problems
+    )
     records = [ds[i] for i in indices]
 
     def _extract_prompt(row: dict) -> str:
-        # DAPO rows typically have `messages` or a `prompt` field; handle both.
-        if "messages" in row and isinstance(row["messages"], list) and row["messages"]:
-            return row["messages"][-1].get("content", "")
-        return row.get("prompt", "")
+        return _extract_problem(row)
 
     def _extract_gt(row: dict) -> str:
         gt = row.get("ground_truth") or row.get("gt") or row.get("answer") or ""
