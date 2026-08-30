@@ -550,6 +550,28 @@ def gen_value_validation_metrics(
     prefixes = [(example, prediction) for example, prediction in parsed if example["kind"] == "segment_start"]
     prefix_correct = [(example, prediction) for example, prediction in prefixes if float(example["target"]) > 0.5]
     prefix_incorrect = [(example, prediction) for example, prediction in prefixes if float(example["target"]) <= 0.5]
+    # A single prefix aggregate can hide the failure mode that matters most for
+    # actor training: values that become less discriminative as a rollout gets
+    # closer to its observed outcome.  The fixed holdout deliberately samples
+    # prefixes near 25%, 50%, and 75% of each completed trajectory, so expose
+    # those regions separately.  These are relative to the observed rollout
+    # end, unlike ``near_horizon`` below, which measures proximity to the hard
+    # response-token limit.
+    prefix_position_bands = {"early": (0.0, 0.375), "middle": (0.375, 0.625), "late": (0.625, 1.0)}
+    prefix_position_groups: dict[str, list[tuple[dict[str, Any], float]]] = {}
+    for band, (lower, upper) in prefix_position_bands.items():
+        band_rows = [
+            (example, prediction)
+            for example, prediction in prefixes
+            if example.get("trajectory_fraction") is not None
+            and lower <= float(example["trajectory_fraction"]) <= upper
+        ]
+        prefix_position_groups[f"prefix_{band}_correct"] = [
+            (example, prediction) for example, prediction in band_rows if float(example["target"]) > 0.5
+        ]
+        prefix_position_groups[f"prefix_{band}_incorrect"] = [
+            (example, prediction) for example, prediction in band_rows if float(example["target"]) <= 0.5
+        ]
     near_horizon_incorrect = []
     for example, prediction in parsed:
         if example["kind"] == "initial" or float(example["target"]) > 0.5:
@@ -569,6 +591,8 @@ def gen_value_validation_metrics(
     add_group("final_action_incorrect", final_action_incorrect)
     add_group("prefix_correct", prefix_correct)
     add_group("prefix_incorrect", prefix_incorrect)
+    for name, rows in prefix_position_groups.items():
+        add_group(name, rows)
     add_group("near_horizon_incorrect", near_horizon_incorrect)
     if final_correct and final_incorrect:
         metrics["gen_value/validation_final_value_gap"] = (
@@ -580,6 +604,14 @@ def gen_value_validation_metrics(
             metrics["gen_value/validation_prefix_correct_v_hat_mean"]
             - metrics["gen_value/validation_prefix_incorrect_v_hat_mean"]
         )
+    for band in prefix_position_bands:
+        correct = prefix_position_groups[f"prefix_{band}_correct"]
+        incorrect = prefix_position_groups[f"prefix_{band}_incorrect"]
+        if correct and incorrect:
+            metrics[f"gen_value/validation_prefix_{band}_value_gap"] = (
+                metrics[f"gen_value/validation_prefix_{band}_correct_v_hat_mean"]
+                - metrics[f"gen_value/validation_prefix_{band}_incorrect_v_hat_mean"]
+            )
     return metrics
 
 

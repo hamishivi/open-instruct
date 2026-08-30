@@ -906,6 +906,23 @@ class TestValueLoss(unittest.TestCase):
         self.assertAlmostEqual(metrics["gen_value/validation_prefix_value_gap"], 0.6)
         self.assertAlmostEqual(metrics["gen_value/validation_near_horizon_incorrect_v_hat_mean"], 0.1)
 
+    def test_gen_value_validation_metrics_measure_trajectory_position_ranking(self):
+        examples = [
+            {"kind": "segment_start", "target": 1.0, "trajectory_fraction": 0.25},
+            {"kind": "segment_start", "target": 0.0, "trajectory_fraction": 0.25},
+            {"kind": "segment_start", "target": 1.0, "trajectory_fraction": 0.50},
+            {"kind": "segment_start", "target": 0.0, "trajectory_fraction": 0.50},
+            {"kind": "segment_start", "target": 1.0, "trajectory_fraction": 0.75},
+            {"kind": "segment_start", "target": 0.0, "trajectory_fraction": 0.75},
+        ]
+
+        metrics = gen_value_validation_metrics(examples, [0.6, 0.4, 0.7, 0.5, 0.9, 0.2])
+
+        self.assertAlmostEqual(metrics["gen_value/validation_prefix_early_value_gap"], 0.2)
+        self.assertAlmostEqual(metrics["gen_value/validation_prefix_middle_value_gap"], 0.2)
+        self.assertAlmostEqual(metrics["gen_value/validation_prefix_late_value_gap"], 0.7)
+        self.assertAlmostEqual(metrics["gen_value/validation_prefix_late_incorrect_v_hat_mean"], 0.2)
+
     def test_gen_value_validation_snapshot_preserves_inspectable_outputs(self):
         examples = [
             {
