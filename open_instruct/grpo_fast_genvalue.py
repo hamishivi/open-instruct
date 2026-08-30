@@ -1072,9 +1072,13 @@ def _gen_value_reinforce_loop(
                     validation_state["captured"] = True
                     capture_metrics = {
                         "gen_value/validation_examples": float(len(validation_examples)),
+                        "gen_value/validation_heldout_prompt_groups": float(
+                            sum(example["kind"] == "initial" for example in validation_examples)
+                        ),
                         "gen_value/validation_heldout_pairs": float(
                             sum(len(rollout["pairs"]) for rollout in rollouts) - len(pairs)
                         ),
+                        "gen_value/validation_training_pairs": float(len(pairs)),
                     }
                 else:
                     pairs = [pair for rollout in rollouts for pair in rollout["pairs"]]
