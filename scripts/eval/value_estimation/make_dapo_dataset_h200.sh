@@ -12,21 +12,34 @@ ROLLOUTS_PER_PROMPT="${ROLLOUTS_PER_PROMPT:-8}"
 CONTINUATIONS_PER_PROBE="${CONTINUATIONS_PER_PROBE:-8}"
 PROBE_INTERVAL="${PROBE_INTERVAL:-2000}"
 MAX_PROBES="${MAX_PROBES:-6}"
+PROBE_MODE="${PROBE_MODE:-fixed}"
+SAE_THRESHOLD="${SAE_THRESHOLD:-0.2}"
+SEED="${SEED:-1}"
+EXCLUDE_PROBLEM_DATASET_PATH="${EXCLUDE_PROBLEM_DATASET_PATH:-}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 
-python -m open_instruct.value_estimation make_dataset \
-    --model_name_or_path "${MODEL_NAME_OR_PATH}" \
-    --output_path "${OUTPUT_PATH}" \
-    --dataset_name hamishivi/DAPO-Math-17k-Processed_filtered \
-    --num_prompts_to_sample "${NUM_PROMPTS_TO_SAMPLE}" \
-    --target_num_pairs "${TARGET_NUM_PAIRS}" \
-    --rollouts_per_prompt "${ROLLOUTS_PER_PROMPT}" \
-    --continuations_per_probe "${CONTINUATIONS_PER_PROBE}" \
-    --probe_interval "${PROBE_INTERVAL}" \
-    --max_probes "${MAX_PROBES}" \
-    --max_prompt_length 2048 \
-    --max_response_length 8192 \
-    --chat_template_name qwen_instruct_user_boxed_math \
-    --tensor_parallel_size "${TENSOR_PARALLEL_SIZE}" \
+MAKE_DATASET_ARGS=(
+    --model_name_or_path "${MODEL_NAME_OR_PATH}"
+    --output_path "${OUTPUT_PATH}"
+    --dataset_name hamishivi/DAPO-Math-17k-Processed_filtered
+    --num_prompts_to_sample "${NUM_PROMPTS_TO_SAMPLE}"
+    --target_num_pairs "${TARGET_NUM_PAIRS}"
+    --rollouts_per_prompt "${ROLLOUTS_PER_PROMPT}"
+    --continuations_per_probe "${CONTINUATIONS_PER_PROBE}"
+    --probe_interval "${PROBE_INTERVAL}"
+    --probe_mode "${PROBE_MODE}"
+    --sae_threshold "${SAE_THRESHOLD}"
+    --max_probes "${MAX_PROBES}"
+    --max_prompt_length 2048
+    --max_response_length 8192
+    --chat_template_name qwen_instruct_user_boxed_math
+    --seed "${SEED}"
+    --tensor_parallel_size "${TENSOR_PARALLEL_SIZE}"
     --gpu_memory_utilization "${GPU_MEMORY_UTILIZATION}"
+)
+if [[ -n "${EXCLUDE_PROBLEM_DATASET_PATH}" ]]; then
+    MAKE_DATASET_ARGS+=(--exclude_problem_dataset_path "${EXCLUDE_PROBLEM_DATASET_PATH}")
+fi
+
+python -m open_instruct.value_estimation make_dataset "${MAKE_DATASET_ARGS[@]}"
