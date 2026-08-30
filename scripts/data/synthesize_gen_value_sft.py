@@ -204,6 +204,25 @@ def extract_response_text(batch_result: dict[str, Any]) -> str:
 
 def prepare(args: argparse.Namespace) -> None:
     examples = read_jsonl(args.inputs)
+    excluded_problem_count = 0
+    excluded_state_count = 0
+    exclude_problem_dataset = getattr(args, "exclude_problem_dataset", None)
+    if exclude_problem_dataset is not None:
+        import pandas as pd  # noqa: PLC0415
+
+        excluded_frame = pd.read_parquet(exclude_problem_dataset, columns=["problem"])
+        excluded_problems = {
+            problem for problem in excluded_frame["problem"].tolist() if isinstance(problem, str) and problem
+        }
+        excluded_problem_count = len(excluded_problems)
+        retained_examples = []
+        for example in examples:
+            prompt = str(example.get("prompt", ""))
+            if any(problem in prompt for problem in excluded_problems):
+                excluded_state_count += 1
+            else:
+                retained_examples.append(example)
+        examples = retained_examples
     selected = select_teacher_states(
         examples,
         min_critic_version=args.min_critic_version,
@@ -253,6 +272,8 @@ def prepare(args: argparse.Namespace) -> None:
                 "metadata_output": str(args.metadata_output),
                 "model": args.model,
                 "request_format": getattr(args, "request_format", "responses"),
+                "excluded_holdout_problems": excluded_problem_count,
+                "excluded_holdout_states": excluded_state_count,
                 "selected_examples": len(selected),
                 "selected_correct": sum(float(example["outcome"]) > 0.5 for example in selected),
                 "selected_incorrect": sum(float(example["outcome"]) <= 0.5 for example in selected),
@@ -505,6 +526,11 @@ def parse_args() -> argparse.Namespace:
     prepare_parser.add_argument("inputs", nargs="+", type=pathlib.Path, help="Critic reservoir JSONL file(s).")
     prepare_parser.add_argument("--batch_output", required=True, type=pathlib.Path)
     prepare_parser.add_argument("--metadata_output", required=True, type=pathlib.Path)
+    prepare_parser.add_argument(
+        "--exclude_problem_dataset",
+        type=pathlib.Path,
+        help="Parquet with a 'problem' column whose held-out problems must not seed value SFT.",
+    )
     prepare_parser.add_argument("--model", default="gpt-5")
     prepare_parser.add_argument(
         "--request_format",

@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pandas as pd
 from scripts.data.synthesize_gen_value_sft import (
     audit,
     collect,
@@ -358,6 +359,7 @@ class TestGenValueSFTSynthesis(unittest.TestCase):
                     model="gpt-5",
                     reasoning_effort="medium",
                     max_output_tokens=1024,
+                    exclude_problem_dataset=None,
                     min_critic_version=25,
                     max_examples_per_outcome=1,
                     seed=0,
@@ -366,6 +368,38 @@ class TestGenValueSFTSynthesis(unittest.TestCase):
             )
 
             self.assertEqual(len((root / "batch.jsonl").read_text().splitlines()), 1)
+
+    def test_prepare_excludes_heldout_mc_problems_before_balancing(self):
+        kept = self._state(0.0, "final_action")
+        kept["prompt"] = "Problem:\ntraining problem\n\nPartial response:\n<rollout>x</rollout>"
+        excluded = self._state(1.0, "final_action")
+        excluded["prompt"] = "Problem:\nheldout problem\n\nPartial response:\n<rollout>y</rollout>"
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            input_path = root / "snapshot.jsonl"
+            input_path.write_text(json.dumps(kept) + "\n" + json.dumps(excluded) + "\n")
+            holdout_path = root / "holdout.parquet"
+            pd.DataFrame({"problem": ["heldout problem"]}).to_parquet(holdout_path, index=False)
+
+            prepare(
+                argparse.Namespace(
+                    inputs=[input_path],
+                    batch_output=root / "batch.jsonl",
+                    metadata_output=root / "metadata.jsonl",
+                    model="gpt-5",
+                    reasoning_effort="medium",
+                    max_output_tokens=1024,
+                    min_critic_version=0,
+                    max_examples_per_outcome=1,
+                    seed=0,
+                    allow_ground_truth_conditioning=False,
+                    exclude_problem_dataset=holdout_path,
+                )
+            )
+
+            metadata = [json.loads(line) for line in (root / "metadata.jsonl").read_text().splitlines()]
+            self.assertEqual(len(metadata), 1)
+            self.assertEqual(metadata[0]["source"]["prompt"], kept["prompt"])
 
     def test_audit_requires_parseable_unique_unconditioned_traces(self):
         example = self._state(0.0, "final_action")
