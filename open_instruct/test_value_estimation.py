@@ -1,3 +1,5 @@
+import argparse
+import dataclasses
 import unittest
 
 from open_instruct import value_estimation
@@ -10,6 +12,19 @@ class _FakeTokenizer:
 
 
 class TestValueEstimationStates(unittest.TestCase):
+    def test_optional_float_cli_field_is_parsed_as_float(self):
+        parser = argparse.ArgumentParser()
+        field = next(
+            field
+            for field in dataclasses.fields(value_estimation.ScoreDatasetConfig)
+            if field.name == "gen_value_actor_success_rate"
+        )
+        value_estimation._add_field(parser, field)
+
+        args = parser.parse_args(["--gen_value_actor_success_rate", "0.125"])
+
+        self.assertEqual(args.gen_value_actor_success_rate, 0.125)
+
     def test_actor_state_uses_exact_token_prefix(self):
         self.assertEqual(value_estimation._actor_state_token_ids([1, 2], [3, 4, 5], 2), [1, 2, 3, 4])
         with self.assertRaises(ValueError):

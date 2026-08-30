@@ -98,6 +98,8 @@ class ScoreDatasetConfig:
     gen_value_score_min: float = 0.0
     gen_value_score_max: float = 10.0
     gen_value_max_new_tokens: int = 8
+    gen_value_actor_model_name: str | None = None
+    gen_value_actor_success_rate: float | None = None
     tokenizer_name_or_path: str | None = None
     run_name: str = "value_estimation_run"
     device: str = "cuda"
@@ -329,9 +331,11 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
 
     # Filter to prompts with at least one correct and one incorrect rollout.
     kept = []
+    evaluated_verdicts: list[bool] = []
     for i, cands in enumerate(rollouts):
         gt = ground_truths[i]
         verdicts = [_verify(c["text"], gt, cfg.verifier_name) for c in cands]
+        evaluated_verdicts.extend(verdicts)
         has_correct = any(verdicts)
         has_incorrect = not all(verdicts)
         if has_correct and has_incorrect:
@@ -339,6 +343,8 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
             if len(kept) >= cfg.target_num_pairs:
                 break
     logger.info(f"Kept {len(kept)} prompts with at least one correct + incorrect rollout")
+    observed_actor_success_rate = sum(evaluated_verdicts) / max(len(evaluated_verdicts), 1)
+    logger.info(f"Observed actor success rate across screened rollouts: {observed_actor_success_rate:.3f}")
 
     # Build rows: for each kept prompt, pick the first correct + first incorrect rollout.
     # The other rollouts become the sibling_rollouts pool for conditioning variants.
@@ -405,6 +411,8 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
                 "mc_values": [],  # filled in below
                 "num_continuations": cfg.continuations_per_probe,
                 "response_token_limit": cfg.max_response_length,
+                "actor_model_name": cfg.model_name_or_path,
+                "actor_success_rate": observed_actor_success_rate,
             }
             row_idx = len(rows)
             rows.append(row)
@@ -673,6 +681,12 @@ def _score_with_generative_value(df, cfg: ScoreDatasetConfig) -> list[list[float
                 score_min=cfg.gen_value_score_min,
                 score_max=cfg.gen_value_score_max,
                 problem=row.get("prompt", ""),
+                actor_model_name=cfg.gen_value_actor_model_name or row.get("actor_model_name"),
+                actor_success_rate=(
+                    cfg.gen_value_actor_success_rate
+                    if cfg.gen_value_actor_success_rate is not None
+                    else row.get("actor_success_rate")
+                ),
                 response_tokens_used=int(t),
                 response_token_limit=int(row.get("response_token_limit", 8192)),
             )
@@ -844,13 +858,14 @@ def _add_field(parser, f) -> None:
     kwargs: dict[str, Any] = {"dest": f.name}
     if f.default is not dataclasses.MISSING:
         kwargs["default"] = None  # use None so CLI absence means "use default"
-    if f.type is bool or f.type == "bool":
+    field_type = f.type if isinstance(f.type, str) else getattr(f.type, "__name__", str(f.type))
+    if field_type in {"bool", "bool | None"}:
         kwargs["action"] = "store_true"
-    elif f.type in (int, "int"):
+    elif field_type in {"int", "int | None"}:
         kwargs["type"] = int
-    elif f.type in (float, "float"):
+    elif field_type in {"float", "float | None"}:
         kwargs["type"] = float
-    elif f.type in (str, "str") or getattr(f.type, "__name__", None) == "str":
+    elif field_type in {"str", "str | None"}:
         kwargs["type"] = str
     else:
         kwargs["type"] = str  # fallback; works for list[str] via comma-separated
