@@ -548,6 +548,26 @@ class TestScoreParsing(unittest.TestCase):
         self.assertIn("<rollout>", p)
         self.assertIn("Answer:", p)
 
+    def test_prompt_has_actor_and_remaining_budget_context(self):
+        p = build_generative_value_prompt(
+            "partial",
+            conditioning="none",
+            actor_model_name="Qwen/Qwen3-4B-Base",
+            actor_success_rate=0.125,
+            response_tokens_used=7000,
+            response_token_limit=8192,
+        )
+
+        self.assertIn("The active actor is Qwen/Qwen3-4B-Base", p)
+        self.assertIn("success rate on this task distribution is 12.5%", p)
+        self.assertIn("used 7000 of its 8192 token budget; 1192 tokens remain", p)
+
+    def test_prompt_rejects_invalid_remaining_budget_context(self):
+        with self.assertRaisesRegex(ValueError, "response_tokens_used must be in"):
+            build_generative_value_prompt(
+                "partial", conditioning="none", response_tokens_used=8193, response_token_limit=8192
+            )
+
 
 class TestValueLoss(unittest.TestCase):
     def test_defaults(self):

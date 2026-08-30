@@ -671,6 +671,10 @@ def build_generative_value_prompt(
     score_min: float = 0.0,
     score_max: float = 10.0,
     problem: str = "",
+    actor_model_name: str | None = None,
+    actor_success_rate: float | None = None,
+    response_tokens_used: int | None = None,
+    response_token_limit: int | None = None,
 ) -> str:
     """Build the gen-value prompt.
 
@@ -699,8 +703,33 @@ def build_generative_value_prompt(
             lines.append(line)
         conditioning_text = "Here are some other attempts at this question:\n" + "".join(lines)
 
-    # Instruction template mirrors Figure 3 of GenAC (arXiv:2604.10701), minus the
-    # In-Context Conditioning item (paper's step 2), which is intentionally omitted.
+    state_context: list[str] = []
+    if actor_model_name:
+        state_context.append(f"The active actor is {actor_model_name}.")
+    if actor_success_rate is not None:
+        bounded_success_rate = max(0.0, min(1.0, float(actor_success_rate)))
+        state_context.append(
+            f"Its smoothed recent success rate on this task distribution is {bounded_success_rate:.1%}."
+        )
+    if response_token_limit is not None:
+        if response_token_limit <= 0:
+            raise ValueError(f"response_token_limit must be positive, got {response_token_limit}.")
+        used = 0 if response_tokens_used is None else int(response_tokens_used)
+        if not 0 <= used <= response_token_limit:
+            raise ValueError(
+                f"response_tokens_used must be in [0, {response_token_limit}], got {response_tokens_used}."
+            )
+        state_context.append(
+            f"The response has used {used} of its {response_token_limit} token budget; "
+            f"{response_token_limit - used} tokens remain."
+        )
+
+    state_context_block = "\n".join(state_context)
+    if state_context_block:
+        state_context_block = f"Actor and horizon context:\n{state_context_block}\n\n"
+
+    # Instruction template mirrors Figure 3 of GenAC (arXiv:2604.10701), including
+    # policy conditioning and the finite response horizon that defines the value function.
     instruction = (
         "You will be given a problem and a partial response. Your job is to predict the "
         f"expected value of the response on an integer scale from {int(score_min)} (very "
@@ -717,6 +746,7 @@ def build_generative_value_prompt(
     conditioning_block = f"{conditioning_text}\n" if conditioning_text else ""
     return (
         f"{instruction}\n\n"
+        f"{state_context_block}"
         f"{problem_block}"
         f"{conditioning_block}"
         f"Partial response:\n<rollout>{partial_response}</rollout>\nAnswer:"

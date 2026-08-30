@@ -300,6 +300,7 @@ class PolicyTrainerRayProcess(RayProcess):
         self._gen_value_training_queue = None
         self._gen_value_version = 0
         self._gen_value_latest_enqueued_policy_training_step: int | None = None
+        self._gen_value_icc_success_rate = 0.0
 
     def set_gen_value_engines(self, engines: list) -> None:
         self._gen_value_engines = engines
@@ -309,6 +310,38 @@ class PolicyTrainerRayProcess(RayProcess):
 
     def set_gen_value_version(self, version: int) -> None:
         self._gen_value_version = int(version)
+
+    def _update_gen_value_icc_success_rate(self, data_BT: data_types.CollatedBatchData) -> tuple[float, float]:
+        """Update the globally consistent EMA used to policy-condition the generative critic."""
+        if data_BT.rewards is None or data_BT.dones is None:
+            raise RuntimeError("Generative-value ICC requires terminal rewards and dones.")
+        value_min = self.args.value_reward_min
+        value_max = self.args.value_reward_max
+        if value_min is None or value_max is None or value_max <= value_min:
+            raise RuntimeError(
+                f"Generative-value ICC requires resolved value reward bounds, got min={value_min}, max={value_max}."
+            )
+
+        reward_sum = torch.zeros((), dtype=torch.float64, device=self.device)
+        terminal_count = torch.zeros((), dtype=torch.float64, device=self.device)
+        for rewards, dones in zip(data_BT.rewards, data_BT.dones):
+            terminal_mask = dones[:, 1:].bool()
+            terminal_rewards = rewards[:, 1:].double()[terminal_mask]
+            normalized_rewards = ((terminal_rewards - value_min) / (value_max - value_min)).clamp(0.0, 1.0)
+            reward_sum += normalized_rewards.sum()
+            terminal_count += terminal_mask.sum()
+        stats = torch.stack([reward_sum, terminal_count])
+        if dist.is_initialized():
+            dist.all_reduce(stats)
+        if stats[1] <= 0:
+            raise RuntimeError("Generative-value ICC received no terminal rollout rewards.")
+
+        batch_success_rate = float((stats[0] / stats[1]).item())
+        momentum = float(getattr(self.args, "gen_value_icc_momentum", 0.9))
+        self._gen_value_icc_success_rate = (
+            momentum * self._gen_value_icc_success_rate + (1.0 - momentum) * batch_success_rate
+        )
+        return batch_success_rate, self._gen_value_icc_success_rate
 
     def get_dataloader_state(self) -> dict[str, Any]:
         return self._streaming_dataloader.state_dict()
@@ -969,9 +1002,17 @@ class PolicyTrainerRayProcess(RayProcess):
         score_min: float = getattr(args, "gen_value_score_min", 0.0)
         score_max: float = getattr(args, "gen_value_score_max", 10.0)
         conditioning: str = getattr(args, "gen_value_conditioning", "none")
+        use_icc: bool = bool(getattr(args, "gen_value_use_icc", False))
+        actor_model_name = None
+        actor_success_rate = None
+        if use_icc:
+            actor_model_name = getattr(getattr(self, "model_config", None), "model_name_or_path", None)
+            actor_success_rate = getattr(self, "_gen_value_icc_success_rate", 0.0)
+        response_token_limit = getattr(self.streaming_config, "response_length", None)
 
         prompts: list[str] = []
         prompt_subseq_idx: list[int] = []
+        prompt_response_tokens_used: list[int] = []
         per_subseq_info: list[dict] = []
 
         for s_idx, sub in enumerate(subseqs):
@@ -1020,7 +1061,13 @@ class PolicyTrainerRayProcess(RayProcess):
             segment_start_prefixes = value_model_utils.causal_segment_start_prefix_token_ids(
                 ids.tolist(), mask.tolist(), boundaries
             )
-            for partial_token_ids in segment_start_prefixes:
+            segment_starts = [0] + [boundary + 1 for boundary in boundaries[:-1]]
+            if len(segment_starts) != len(segment_start_prefixes):
+                raise RuntimeError(
+                    "Generative-value segment starts do not align with causal prefixes: "
+                    f"{len(segment_starts)} != {len(segment_start_prefixes)}."
+                )
+            for partial_token_ids, response_tokens_used in zip(segment_start_prefixes, segment_starts):
                 partial_text = self.tokenizer.decode(partial_token_ids, skip_special_tokens=False)
                 p = value_model_utils.build_generative_value_prompt(
                     partial_response=partial_text,
@@ -1030,9 +1077,14 @@ class PolicyTrainerRayProcess(RayProcess):
                     score_min=score_min,
                     score_max=score_max,
                     problem=problem_text,
+                    actor_model_name=actor_model_name,
+                    actor_success_rate=actor_success_rate,
+                    response_tokens_used=response_tokens_used,
+                    response_token_limit=response_token_limit,
                 )
                 prompts.append(p)
                 prompt_subseq_idx.append(s_idx)
+                prompt_response_tokens_used.append(response_tokens_used)
 
             # Shifted indices for this subseq's response tokens in the pack's (seq_len-1) layout.
             # Pack position of each response token is offset + k; the shifted index is (pack_pos-1).
@@ -1058,6 +1110,8 @@ class PolicyTrainerRayProcess(RayProcess):
             "device": device,
             "prompts": prompts,
             "prompt_subseq_idx": prompt_subseq_idx,
+            "prompt_response_tokens_used": prompt_response_tokens_used,
+            "response_token_limit": response_token_limit,
             "per_subseq_info": per_subseq_info,
         }
 
@@ -1070,6 +1124,8 @@ class PolicyTrainerRayProcess(RayProcess):
         device = request["device"]
         prompts: list[str] = request["prompts"]
         prompt_subseq_idx: list[int] = request["prompt_subseq_idx"]
+        prompt_response_tokens_used: list[int] = request["prompt_response_tokens_used"]
+        response_token_limit: int | None = request["response_token_limit"]
         per_subseq_info: list[dict] = request["per_subseq_info"]
         score_min: float = getattr(args, "gen_value_score_min", 0.0)
         score_max: float = getattr(args, "gen_value_score_max", 10.0)
@@ -1125,7 +1181,13 @@ class PolicyTrainerRayProcess(RayProcess):
         training_pairs: list[dict] = []
         for k, request_output in enumerate(request_outputs):
             training_pairs.append(
-                {"request_output": request_output, "outcome": None, "subseq_idx": prompt_subseq_idx[k]}
+                {
+                    "request_output": request_output,
+                    "outcome": None,
+                    "subseq_idx": prompt_subseq_idx[k],
+                    "response_tokens_used": prompt_response_tokens_used[k],
+                    "response_token_limit": response_token_limit,
+                }
             )
         return values_BT, training_pairs
 
@@ -1949,6 +2011,11 @@ class PolicyTrainerRayProcess(RayProcess):
         # each rollout at fixed-chunk boundaries and use those piecewise-constant estimates as
         # the value function for GAE instead of the scalar value head.
         _gen_value_training_rollouts: list[dict] = []
+
+        if _use_gen_value and bool(getattr(self.args, "gen_value_use_icc", False)):
+            icc_batch_success_rate, icc_success_rate = self._update_gen_value_icc_success_rate(data_BT)
+            sae_step_metrics["gen_value/icc_batch_success_rate"] = icc_batch_success_rate
+            sae_step_metrics["gen_value/icc_success_rate"] = icc_success_rate
 
         if self.args.use_value_model:
             assert data_BT.rewards is not None and data_BT.dones is not None, (

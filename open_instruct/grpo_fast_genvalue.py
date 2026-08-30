@@ -301,6 +301,8 @@ class GenValueTrainerActor:
         skipped_empty_generation = 0
         mses: list[float] = []  # Parsed generations only; parse failures have no numeric prediction.
         parsed_v_hats: list[float] = []  # Only for pairs where parsing succeeded.
+        near_horizon_incorrect_v_hats: list[float] = []
+        near_horizon_incorrect_mses: list[float] = []
         for pair in training_pairs:
             if pair["outcome"] is None:
                 continue
@@ -331,6 +333,15 @@ class GenValueTrainerActor:
             reward, squared_error = value_model_utils.generative_value_reinforce_reward(outcome, v_hat)
             if squared_error is not None:
                 mses.append(squared_error)
+                response_tokens_used = pair.get("response_tokens_used")
+                response_token_limit = pair.get("response_token_limit")
+                if response_tokens_used is not None and response_token_limit is not None:
+                    response_token_limit = int(response_token_limit)
+                    remaining_tokens = response_token_limit - int(response_tokens_used)
+                    near_horizon_threshold = max(512, math.ceil(0.1 * response_token_limit))
+                    if outcome <= 0.5 and remaining_tokens <= near_horizon_threshold:
+                        near_horizon_incorrect_v_hats.append(v_hat)
+                        near_horizon_incorrect_mses.append(squared_error)
             validated_examples.append(
                 {
                     "sequence_ids": sequence_ids,
@@ -467,6 +478,14 @@ class GenValueTrainerActor:
             # vs. ``outcome_mean`` and whether it's moving over training. Undefined when
             # no pair parsed this step, so we only emit the key when we have signal.
             metrics["gen_value/v_hat_mean"] = sum(parsed_v_hats) / len(parsed_v_hats)
+        if near_horizon_incorrect_v_hats:
+            metrics["gen_value/near_horizon_incorrect_v_hat_mean"] = sum(near_horizon_incorrect_v_hats) / len(
+                near_horizon_incorrect_v_hats
+            )
+            metrics["gen_value/near_horizon_incorrect_mse"] = sum(near_horizon_incorrect_mses) / len(
+                near_horizon_incorrect_mses
+            )
+            metrics["gen_value/near_horizon_incorrect_examples"] = len(near_horizon_incorrect_v_hats)
         return metrics
 
     def setup_model_update_group(self, vllm_engines: list) -> None:
@@ -565,6 +584,10 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
     gen_value_batch_size: int | None = None
     # Conditioning for the gen-value prompt: one of none, gt, correct_demo, rollout_context.
     gen_value_conditioning: str = "none"
+    # Paper-style In-Context Conditioning: identify the active actor and provide an EMA of
+    # its observed success rate so the critic can calibrate values to the current policy.
+    gen_value_use_icc: bool = True
+    gen_value_icc_momentum: float = 0.9
     # How often (in critic optimizer updates) to publish gen-value weights to vLLM.
     # Set to 0 to keep the serving critic frozen while its trainer continues updating.
     gen_value_sync_freq: int = 1
@@ -621,6 +644,8 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
                 f"{sorted(value_model_utils.GEN_VALUE_CONDITIONING_TYPES)}, "
                 f"got {self.gen_value_conditioning!r}."
             )
+        if not 0.0 <= self.gen_value_icc_momentum < 1.0:
+            raise ValueError(f"--gen_value_icc_momentum must be in [0, 1), got {self.gen_value_icc_momentum}.")
 
 
 def _resolve_gen_value_tokenizer(args: GenValueExperimentConfig, tc: TokenizerConfig) -> tuple[str, str | None]:
@@ -779,6 +804,8 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
         "gen_value/parse_rate": "gen_value/train_examples",
         "gen_value/mse": "gen_value/parsed_examples",
         "gen_value/v_hat_mean": "gen_value/parsed_examples",
+        "gen_value/near_horizon_incorrect_v_hat_mean": "gen_value/near_horizon_incorrect_examples",
+        "gen_value/near_horizon_incorrect_mse": "gen_value/near_horizon_incorrect_examples",
         "gen_value/tis_ratio": "gen_value/tis_tokens",
         "gen_value/tis_clipfrac": "gen_value/tis_tokens",
         "gen_value/tis_mask_frac_kept": "gen_value/tis_mask_tokens",
@@ -798,6 +825,7 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
         "gen_value/train_tokens",
         "gen_value/train_examples",
         "gen_value/parsed_examples",
+        "gen_value/near_horizon_incorrect_examples",
         "gen_value/train_packs",
         "gen_value/train_pack_tokens",
         "gen_value/tis_tokens",
