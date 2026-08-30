@@ -146,6 +146,8 @@ class GenValueTrainerActor:
         max_grad_norm: float = 1.0,
         checkpoint_path: str | None = None,
         checkpoint_tag: str | None = None,
+        trace_reservoir_size: int = 0,
+        trace_seed: int = 0,
     ) -> None:
         self._score_min = score_min
         self._score_max = score_max
@@ -158,6 +160,12 @@ class GenValueTrainerActor:
         self._tis_mask_upper = tis_mask_upper
         self._reinforce_coef = reinforce_coef
         self._step_count = 0
+        self._trace_reservoir_size = trace_reservoir_size
+        self._trace_rng = random.Random(trace_seed)
+        self._trace_reservoirs: dict[str, list[dict[str, Any]]] = {"correct": [], "incorrect": []}
+        self._trace_seen_by_outcome = {"correct": 0, "incorrect": 0}
+        if self._trace_reservoir_size < 0:
+            raise ValueError(f"trace_reservoir_size must be nonnegative, got {self._trace_reservoir_size}.")
         if self._pack_length <= 0:
             raise ValueError(f"Generative critic pack length must be > 0, got {self._pack_length}.")
         if self._pack_length > self._max_sequence_tokens:
@@ -275,18 +283,76 @@ class GenValueTrainerActor:
         )
         if saved is False:
             raise RuntimeError(f"Failed to save generative-value DeepSpeed checkpoint to {checkpoint_dir}.")
-        return {
+        trace_path = self._write_trace_reservoir(checkpoint_state_dir)
+        checkpoint_metadata = {
             "gen_value_trainer_saved": True,
             "gen_value_trainer_checkpoint": str(checkpoint_dir.relative_to(checkpoint_state_dir)),
             "gen_value_trainer_checkpoint_tag": checkpoint_tag,
             "gen_value_version": self._step_count,
         }
+        if trace_path is not None:
+            checkpoint_metadata["gen_value_training_trace_reservoir"] = str(trace_path)
+        return checkpoint_metadata
 
     def save_model(self, output_dir: str) -> None:
         gen_value_output_dir = pathlib.Path(output_dir) / "gen_value_model"
         gen_value_output_dir.mkdir(parents=True, exist_ok=True)
         self._model.module.save_pretrained(gen_value_output_dir, safe_serialization=True)
         self._tokenizer.save_pretrained(gen_value_output_dir)
+        self._write_trace_reservoir(output_dir)
+
+    def _trace_bucket_capacity(self, bucket: str) -> int:
+        correct_capacity = self._trace_reservoir_size // 2
+        return correct_capacity if bucket == "correct" else self._trace_reservoir_size - correct_capacity
+
+    def _maybe_store_training_trace(
+        self,
+        pair: dict[str, Any],
+        prompt_ids: list[int],
+        generation: str,
+        outcome: float,
+        prediction: float | None,
+        squared_error: float | None,
+        reward: float,
+    ) -> None:
+        if self._trace_reservoir_size == 0:
+            return
+        bucket = "correct" if outcome > 0.5 else "incorrect"
+        capacity = self._trace_bucket_capacity(bucket)
+        self._trace_seen_by_outcome[bucket] += 1
+        seen = self._trace_seen_by_outcome[bucket]
+        reservoir = self._trace_reservoirs[bucket]
+        if len(reservoir) < capacity:
+            replacement_index: int | None = len(reservoir)
+        else:
+            sampled_index = self._trace_rng.randrange(seen)
+            replacement_index = sampled_index if sampled_index < capacity else None
+        if replacement_index is None:
+            return
+        example = {
+            "source_critic_version": int(pair.get("critic_version", 0)),
+            "state_kind": pair.get("state_kind"),
+            "response_tokens_used": pair.get("response_tokens_used"),
+            "response_token_limit": pair.get("response_token_limit"),
+            "outcome": outcome,
+            "prediction": prediction,
+            "squared_error": squared_error,
+            "reinforce_reward": reward,
+            "prompt": self._tokenizer.decode(prompt_ids, skip_special_tokens=False),
+            "generation": generation,
+        }
+        if replacement_index == len(reservoir):
+            reservoir.append(example)
+        else:
+            reservoir[replacement_index] = example
+
+    def _write_trace_reservoir(self, output_dir: str) -> pathlib.Path | None:
+        examples = self._trace_reservoirs["correct"] + self._trace_reservoirs["incorrect"]
+        if not examples:
+            return None
+        return value_model_utils.write_gen_value_training_trace_reservoir(
+            output_dir, self._step_count, examples, self._trace_seen_by_outcome
+        )
 
     def reinforce_step(self, training_pairs: list[dict]) -> dict:
         """Apply one REINFORCE gradient step with the MSE-shaped critic reward.
@@ -331,6 +397,7 @@ class GenValueTrainerActor:
             if v_hat is not None:
                 parsed_v_hats.append(v_hat)
             reward, squared_error = value_model_utils.generative_value_reinforce_reward(outcome, v_hat)
+            self._maybe_store_training_trace(pair, prompt_ids, completion.text, outcome, v_hat, squared_error, reward)
             if squared_error is not None:
                 mses.append(squared_error)
                 response_tokens_used = pair.get("response_tokens_used")
@@ -460,6 +527,9 @@ class GenValueTrainerActor:
             "gen_value/train_max_pack_tokens": max(pack_token_counts),
             "gen_value/lr": self._optimizer.param_groups[0]["lr"],
         }
+        if self._trace_reservoir_size > 0:
+            metrics["gen_value/trace_examples_seen"] = sum(self._trace_seen_by_outcome.values())
+            metrics["gen_value/trace_examples_retained"] = sum(len(rows) for rows in self._trace_reservoirs.values())
         if grad_norm is not None:
             metrics["gen_value/grad_norm"] = grad_norm
         if skipped_empty_generation:
@@ -595,6 +665,9 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
     # its REINFORCE update. Rescore them at critic version 0 and each frequency multiple.
     gen_value_validation_freq: int = 0
     gen_value_validation_max_examples: int = 0
+    # Balanced, bounded reservoir of raw on-policy critic traces for inspection and an
+    # optional later SFT stage. Zero disables collection.
+    gen_value_trace_reservoir_size: int = 0
 
     def __post_init__(self):
         super().__post_init__()
@@ -647,6 +720,10 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
         if self.gen_value_validation_max_examples < 0:
             raise ValueError(
                 f"--gen_value_validation_max_examples must be >= 0, got {self.gen_value_validation_max_examples}."
+            )
+        if self.gen_value_trace_reservoir_size < 0:
+            raise ValueError(
+                f"--gen_value_trace_reservoir_size must be >= 0, got {self.gen_value_trace_reservoir_size}."
             )
         if (self.gen_value_validation_freq == 0) != (self.gen_value_validation_max_examples == 0):
             raise ValueError(
@@ -1476,6 +1553,8 @@ def main():
             max_grad_norm=args.max_grad_norm if args.max_grad_norm is not None else 0.0,
             checkpoint_path=gen_value_checkpoint_path,
             checkpoint_tag=gen_value_checkpoint_tag,
+            trace_reservoir_size=args.gen_value_trace_reservoir_size,
+            trace_seed=args.seed,
         )
         ready_results, _ = utils.ray_get_with_progress(
             [gen_value_trainer.ready.remote(), gen_value_trainer.get_version.remote()],

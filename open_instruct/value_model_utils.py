@@ -514,6 +514,33 @@ def write_gen_value_validation_snapshot(
     return snapshot_path
 
 
+def write_gen_value_training_trace_reservoir(
+    output_dir: str, version: int, examples: Sequence[dict[str, Any]], seen_by_outcome: dict[str, int]
+) -> pathlib.Path:
+    """Persist a bounded sample of on-policy critic prompts and generations for inspection/SFT."""
+    trace_dir = pathlib.Path(output_dir) / "gen_value_training_traces"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    trace_path = trace_dir / "reservoir.jsonl"
+    temporary_path = trace_path.with_suffix(".jsonl.tmp")
+    with temporary_path.open("w", encoding="utf-8") as trace_file:
+        for example in examples:
+            trace_file.write(json.dumps(example, ensure_ascii=False) + "\n")
+    temporary_path.replace(trace_path)
+
+    manifest_path = trace_dir / "manifest.json"
+    manifest_tmp = manifest_path.with_suffix(".json.tmp")
+    manifest = {
+        "critic_version": int(version),
+        "retained_examples": len(examples),
+        "seen_by_outcome": {key: int(value) for key, value in seen_by_outcome.items()},
+    }
+    with manifest_tmp.open("w", encoding="utf-8") as manifest_file:
+        json.dump(manifest, manifest_file, indent=2, sort_keys=True)
+        manifest_file.write("\n")
+    manifest_tmp.replace(manifest_path)
+    return trace_path
+
+
 def pack_gen_value_examples(examples: list[dict[str, Any]], target_tokens: int) -> list[list[dict[str, Any]]]:
     """Pack critic examples in order up to the policy's token budget.
 

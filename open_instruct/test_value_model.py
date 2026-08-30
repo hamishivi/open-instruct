@@ -70,6 +70,7 @@ from open_instruct.value_model_utils import (
     value_clipped_mse_loss,
     value_metric_sums,
     value_metrics_from_sums,
+    write_gen_value_training_trace_reservoir,
     write_gen_value_validation_snapshot,
 )
 
@@ -827,6 +828,27 @@ class TestValueLoss(unittest.TestCase):
             self.assertEqual(row["prediction"], 0.2)
             self.assertEqual(row["prompt"], "critic prompt")
             self.assertEqual(row["generation"], "reasoning <answer>2</answer>")
+
+    def test_gen_value_training_trace_reservoir_is_atomic_and_manifested(self):
+        examples = [
+            {
+                "outcome": 0.0,
+                "prediction": 0.2,
+                "prompt": "critic prompt",
+                "generation": "reasoning <answer>2</answer>",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as output_dir:
+            trace_path = write_gen_value_training_trace_reservoir(
+                output_dir, version=25, examples=examples, seen_by_outcome={"correct": 11, "incorrect": 23}
+            )
+
+            self.assertEqual(trace_path, Path(output_dir) / "gen_value_training_traces/reservoir.jsonl")
+            self.assertEqual(json.loads(trace_path.read_text()), examples[0])
+            manifest = json.loads(trace_path.with_name("manifest.json").read_text())
+            self.assertEqual(manifest["critic_version"], 25)
+            self.assertEqual(manifest["retained_examples"], 1)
+            self.assertEqual(manifest["seen_by_outcome"], {"correct": 11, "incorrect": 23})
 
     def test_final_action_prefix_retains_observations_and_is_causal(self):
         prefix, response_tokens_used = causal_final_action_prefix_token_ids(
