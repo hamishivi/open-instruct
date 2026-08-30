@@ -10,13 +10,17 @@ from open_instruct import value_estimation
 
 
 class _FakeTokenizer:
+    def __init__(self):
+        self.skip_special_tokens_calls = []
+
     def decode(self, token_ids, skip_special_tokens=True):
-        assert skip_special_tokens
+        self.skip_special_tokens_calls.append(skip_special_tokens)
         return ":".join(str(token_id) for token_id in token_ids)
 
 
 class TestValueEstimationStates(unittest.TestCase):
     def test_mc_sft_targets_supervise_only_the_direct_score(self):
+        tokenizer = _FakeTokenizer()
         examples = prepare_gen_value_mc_sft.build_mc_sft_examples(
             [
                 {
@@ -30,7 +34,7 @@ class TestValueEstimationStates(unittest.TestCase):
                     "actor_success_rate": 0.1,
                 }
             ],
-            tokenizer=_FakeTokenizer(),
+            tokenizer=tokenizer,
             min_continuations=16,
         )
 
@@ -42,6 +46,7 @@ class TestValueEstimationStates(unittest.TestCase):
         self.assertIn("<rollout>10:11</rollout>", examples[1]["prompt"])
         self.assertTrue(all(example["direct_mc_score_supervision"] for example in examples))
         self.assertEqual([example["trajectory_fraction"] for example in examples], [1 / 3, 2 / 3])
+        self.assertEqual(tokenizer.skip_special_tokens_calls, [False, False])
 
     def test_mc_sft_can_upweight_late_and_final_states(self):
         examples = prepare_gen_value_mc_sft.build_mc_sft_examples(
@@ -151,8 +156,10 @@ class TestValueEstimationStates(unittest.TestCase):
             value_estimation._actor_state_token_ids([1], [2], 2)
 
     def test_full_continuation_includes_observed_prefix(self):
-        decoded = value_estimation._decode_full_continuation(_FakeTokenizer(), [10, 11], [12, 13])
+        tokenizer = _FakeTokenizer()
+        decoded = value_estimation._decode_full_continuation(tokenizer, [10, 11], [12, 13])
         self.assertEqual(decoded, "10:11:12:13")
+        self.assertEqual(tokenizer.skip_special_tokens_calls, [True])
 
     def test_sampled_eos_does_not_define_remaining_horizon(self):
         positions = value_estimation._fixed_probe_positions(

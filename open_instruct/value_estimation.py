@@ -842,7 +842,10 @@ def _score_with_generative_value(df, cfg: ScoreDatasetConfig) -> list[list[float
     for idx, row in df.iterrows():
         rollout_tokens = list(row["rollout_tokens"])
         for p_idx, t in enumerate(row["probe_positions"]):
-            partial = tokenizer.decode(rollout_tokens[:t], skip_special_tokens=True)
+            # Online generative-value scoring preserves special response tokens
+            # when decoding causal prefixes; use the identical representation in
+            # held-out scoring.
+            partial = tokenizer.decode(rollout_tokens[:t], skip_special_tokens=False)
             prompt = value_model_utils.build_generative_value_prompt(
                 partial,
                 conditioning=cfg.gen_value_conditioning,

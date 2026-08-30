@@ -77,7 +77,10 @@ def build_mc_sft_examples(
                 raise ValueError(
                     f"Row {row_index} probe position {probe_position} is outside rollout length {len(rollout_tokens)}."
                 )
-            partial_response = tokenizer.decode(rollout_tokens[:probe_position], skip_special_tokens=True)
+            # Match the online critic prompt exactly. Special response tokens can
+            # encode meaningful causal boundaries and must not disappear during
+            # offline SFT conversion.
+            partial_response = tokenizer.decode(rollout_tokens[:probe_position], skip_special_tokens=False)
             prompt = value_model_utils.build_generative_value_prompt(
                 partial_response,
                 conditioning="none",
