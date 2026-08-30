@@ -32,6 +32,18 @@ def outcome_counts(examples: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
+def position_counts(examples: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for example in examples:
+        position = str(example.get("state_kind") or "unknown")
+        trajectory_fraction = example.get("trajectory_fraction")
+        if position != "final_action" and isinstance(trajectory_fraction, int | float):
+            fraction = float(trajectory_fraction)
+            position = "early" if fraction <= 0.375 else "middle" if fraction <= 0.625 else "late"
+        counts[position] = counts.get(position, 0) + 1
+    return counts
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("inputs", nargs="+", type=pathlib.Path, help="Reservoir JSONL file(s).")
@@ -45,6 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_critic_version", type=int, default=0)
     parser.add_argument("--max_examples_per_outcome", type=int)
     parser.add_argument("--no_balance_outcomes", action="store_true")
+    parser.add_argument("--no_balance_positions", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
@@ -58,6 +71,7 @@ def main() -> None:
         min_critic_version=args.min_critic_version,
         max_examples_per_outcome=args.max_examples_per_outcome,
         balance_outcomes=not args.no_balance_outcomes,
+        balance_positions=not args.no_balance_positions,
         seed=args.seed,
     )
     if not selected:
@@ -74,6 +88,7 @@ def main() -> None:
         "input_examples": len(examples),
         "selected_examples": len(selected),
         "selected_by_outcome": outcome_counts(selected),
+        "selected_by_position": position_counts(selected),
         "max_squared_error": args.max_squared_error,
         "min_critic_version": args.min_critic_version,
         "output": str(args.output),

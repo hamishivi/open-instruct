@@ -1034,6 +1034,50 @@ class TestValueLoss(unittest.TestCase):
         if "correct-a" in selected_by_prompt:
             self.assertEqual(selected_by_prompt["correct-a"]["prediction"], 0.9)
 
+    def test_gen_value_sft_trace_selection_balances_trajectory_positions(self):
+        examples = []
+        positions = {
+            "early": {"state_kind": "segment_start", "trajectory_fraction": 0.25},
+            "middle": {"state_kind": "segment_start", "trajectory_fraction": 0.5},
+            "late": {"state_kind": "segment_start", "trajectory_fraction": 0.75},
+            "final_action": {"state_kind": "final_action", "trajectory_fraction": 1.0},
+        }
+        for outcome in (0.0, 1.0):
+            for position, metadata in positions.items():
+                examples.append(
+                    {
+                        "source_critic_version": 25,
+                        "outcome": outcome,
+                        "prediction": 0.1 if outcome == 0.0 else 0.9,
+                        "squared_error": 0.01,
+                        "prompt": f"{outcome}-{position}",
+                        "generation": f"reasoning <answer>{1 if outcome == 0.0 else 9}</answer>",
+                        **metadata,
+                    }
+                )
+        # Final-action replay can contribute several copies/prompts. Position
+        # balancing must not let those crowd the intermediate states out.
+        examples.append({**examples[-1], "prompt": "1.0-final-action-extra"})
+
+        selected = select_gen_value_sft_traces(examples, max_squared_error=0.04, min_critic_version=25, seed=3)
+
+        self.assertEqual(len(selected), 8)
+        selected_positions = {
+            (
+                "final_action"
+                if example["state_kind"] == "final_action"
+                else "early"
+                if example["trajectory_fraction"] <= 0.375
+                else "middle"
+                if example["trajectory_fraction"] <= 0.625
+                else "late"
+            )
+            for example in selected
+        }
+        self.assertEqual(selected_positions, set(positions))
+        self.assertEqual(sum(example["outcome"] == 0.0 for example in selected), 4)
+        self.assertEqual(sum(example["outcome"] == 1.0 for example in selected), 4)
+
     def test_final_action_prefix_retains_observations_and_is_causal(self):
         prefix, response_tokens_used = causal_final_action_prefix_token_ids(
             [10, 11, 20, 21, 30, 31, 22], [False, False, True, True, False, False, True]

@@ -338,6 +338,7 @@ class GenValueTrainerActor:
             "state_kind": pair.get("state_kind"),
             "response_tokens_used": pair.get("response_tokens_used"),
             "response_token_limit": pair.get("response_token_limit"),
+            "trajectory_fraction": pair.get("trajectory_fraction"),
             "outcome": outcome,
             "prediction": prediction,
             "squared_error": squared_error,

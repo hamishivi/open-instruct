@@ -1014,6 +1014,7 @@ class PolicyTrainerRayProcess(RayProcess):
         prompts: list[str] = []
         prompt_subseq_idx: list[int] = []
         prompt_response_tokens_used: list[int] = []
+        prompt_trajectory_fractions: list[float] = []
         prompt_state_kinds: list[str] = []
         per_subseq_info: list[dict] = []
 
@@ -1087,6 +1088,7 @@ class PolicyTrainerRayProcess(RayProcess):
                 prompts.append(p)
                 prompt_subseq_idx.append(s_idx)
                 prompt_response_tokens_used.append(response_tokens_used)
+                prompt_trajectory_fractions.append(response_tokens_used / max(n_resp_sub - 1, 1))
                 prompt_state_kinds.append("segment_start")
 
             # Add a high-resolution boundary state immediately before the final
@@ -1097,6 +1099,7 @@ class PolicyTrainerRayProcess(RayProcess):
             has_final_action_override = segment_starts[-1] != n_resp_sub - 1
             if not has_final_action_override:
                 prompt_state_kinds[-1] = "final_action"
+                prompt_trajectory_fractions[-1] = 1.0
             else:
                 final_prefix_ids, final_response_tokens_used = value_model_utils.causal_final_action_prefix_token_ids(
                     ids.tolist(), mask.tolist()
@@ -1119,6 +1122,7 @@ class PolicyTrainerRayProcess(RayProcess):
                 )
                 prompt_subseq_idx.append(s_idx)
                 prompt_response_tokens_used.append(final_response_tokens_used)
+                prompt_trajectory_fractions.append(1.0)
                 prompt_state_kinds.append("final_action")
 
             # Shifted indices for this subseq's response tokens in the pack's (seq_len-1) layout.
@@ -1147,6 +1151,7 @@ class PolicyTrainerRayProcess(RayProcess):
             "prompts": prompts,
             "prompt_subseq_idx": prompt_subseq_idx,
             "prompt_response_tokens_used": prompt_response_tokens_used,
+            "prompt_trajectory_fractions": prompt_trajectory_fractions,
             "prompt_state_kinds": prompt_state_kinds,
             "response_token_limit": response_token_limit,
             "per_subseq_info": per_subseq_info,
@@ -1162,6 +1167,7 @@ class PolicyTrainerRayProcess(RayProcess):
         prompts: list[str] = request["prompts"]
         prompt_subseq_idx: list[int] = request["prompt_subseq_idx"]
         prompt_response_tokens_used: list[int] = request["prompt_response_tokens_used"]
+        prompt_trajectory_fractions: list[float] = request["prompt_trajectory_fractions"]
         prompt_state_kinds: list[str] = request["prompt_state_kinds"]
         response_token_limit: int | None = request["response_token_limit"]
         per_subseq_info: list[dict] = request["per_subseq_info"]
@@ -1229,6 +1235,7 @@ class PolicyTrainerRayProcess(RayProcess):
                     "outcome": None,
                     "subseq_idx": prompt_subseq_idx[k],
                     "response_tokens_used": prompt_response_tokens_used[k],
+                    "trajectory_fraction": prompt_trajectory_fractions[k],
                     "response_token_limit": response_token_limit,
                     "state_kind": prompt_state_kinds[k],
                 }

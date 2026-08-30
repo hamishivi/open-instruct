@@ -130,6 +130,7 @@ class TestGenerativeValueBoundaryState(unittest.TestCase):
 
         self.assertEqual(request["prompt_state_kinds"], ["segment_start", "final_action"])
         self.assertEqual(request["prompt_response_tokens_used"], [0, 3])
+        self.assertEqual(request["prompt_trajectory_fractions"], [0.0, 1.0])
         self.assertIn("Partial response:\n<rollout>20 21 22</rollout>", request["prompts"][1])
 
         request_outputs = [
@@ -140,6 +141,7 @@ class TestGenerativeValueBoundaryState(unittest.TestCase):
 
         torch.testing.assert_close(values, torch.tensor([[0.0, 0.5, 0.5, 0.5, 0.0]]))
         self.assertEqual([pair["state_kind"] for pair in training_pairs], ["segment_start", "final_action"])
+        self.assertEqual([pair["trajectory_fraction"] for pair in training_pairs], [0.0, 1.0])
 
     def test_packed_final_action_probes_do_not_cross_subsequences(self):
         trainer = self._trainer()
@@ -155,6 +157,7 @@ class TestGenerativeValueBoundaryState(unittest.TestCase):
         )
         self.assertEqual(request["prompt_subseq_idx"], [0, 0, 1, 1])
         self.assertEqual(request["prompt_response_tokens_used"], [0, 1, 0, 2])
+        self.assertEqual(request["prompt_trajectory_fractions"], [0.0, 1.0, 0.0, 1.0])
 
         request_outputs = [
             SimpleNamespace(outputs=[SimpleNamespace(text=f"<answer>{score}</answer>")]) for score in (5, 1, 6, 2)

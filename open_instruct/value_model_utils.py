@@ -685,14 +685,16 @@ def select_gen_value_sft_traces(
     min_critic_version: int = 0,
     max_examples_per_outcome: int | None = None,
     balance_outcomes: bool = True,
+    balance_positions: bool = True,
     seed: int = 0,
 ) -> list[dict[str, Any]]:
     """Select parsed, accurate critic traces for prompt-preserving SFT.
 
     Each retained prompt is used at most once so SFT cannot see contradictory
-    completions for the same state. Sampling after the accuracy gate preserves a
-    representative mix from the on-policy reservoir instead of selecting only the
-    easiest states.
+    completions for the same state. By default, sampling after the accuracy gate
+    balances both outcomes and trajectory positions. This prevents final-action
+    replay from crowding intermediate states out of the SFT set and explicitly
+    retains the early-to-late coverage needed to learn value propagation.
     """
     if max_squared_error < 0:
         raise ValueError(f"max_squared_error must be nonnegative, got {max_squared_error}.")
@@ -725,23 +727,85 @@ def select_gen_value_sft_traces(
         if previous is None or float(squared_error) < float(previous["squared_error"]):
             best_by_prompt[prompt] = dict(example)
 
-    buckets: dict[str, list[dict[str, Any]]] = {"correct": [], "incorrect": []}
+    def position_bucket(example: dict[str, Any]) -> str:
+        if example.get("state_kind") == "final_action":
+            return "final_action"
+        trajectory_fraction = example.get("trajectory_fraction")
+        if isinstance(trajectory_fraction, int | float) and math.isfinite(float(trajectory_fraction)):
+            fraction = float(trajectory_fraction)
+            if fraction <= 0.375:
+                return "early"
+            if fraction <= 0.625:
+                return "middle"
+            return "late"
+        # Reservoirs produced before trajectory fractions were recorded still
+        # distinguish exact-final states from the coarser segment-start states.
+        return str(example.get("state_kind") or "unknown")
+
+    buckets: dict[str, dict[str, list[dict[str, Any]]]] = {"correct": {}, "incorrect": {}}
     for example in best_by_prompt.values():
-        bucket = "correct" if float(example["outcome"]) > 0.5 else "incorrect"
-        buckets[bucket].append(example)
+        outcome_bucket = "correct" if float(example["outcome"]) > 0.5 else "incorrect"
+        position = position_bucket(example) if balance_positions else "all"
+        buckets[outcome_bucket].setdefault(position, []).append(example)
 
     rng = random.Random(seed)
-    for bucket in buckets.values():
-        rng.shuffle(bucket)
-    if balance_outcomes and all(buckets.values()):
-        balanced_size = min(len(bucket) for bucket in buckets.values())
-        per_outcome_limit = balanced_size
-    else:
-        per_outcome_limit = max((len(bucket) for bucket in buckets.values()), default=0)
-    if max_examples_per_outcome is not None:
-        per_outcome_limit = min(per_outcome_limit, max_examples_per_outcome)
+    for outcome_buckets in buckets.values():
+        for bucket in outcome_buckets.values():
+            rng.shuffle(bucket)
 
-    selected = buckets["correct"][:per_outcome_limit] + buckets["incorrect"][:per_outcome_limit]
+    if balance_outcomes and all(buckets.values()):
+        positions = sorted(set(buckets["correct"]) & set(buckets["incorrect"]))
+        capacities = {
+            position: min(len(buckets["correct"][position]), len(buckets["incorrect"][position]))
+            for position in positions
+        }
+        per_outcome_limit = sum(capacities.values())
+        if max_examples_per_outcome is not None:
+            per_outcome_limit = min(per_outcome_limit, max_examples_per_outcome)
+
+        # Allocate the same position quota to both outcomes. Round-robin allocation
+        # gives every available position coverage before adding a second example.
+        shuffled_positions = list(positions)
+        rng.shuffle(shuffled_positions)
+        quotas = dict.fromkeys(positions, 0)
+        while sum(quotas.values()) < per_outcome_limit:
+            made_progress = False
+            for position in shuffled_positions:
+                if quotas[position] >= capacities[position]:
+                    continue
+                quotas[position] += 1
+                made_progress = True
+                if sum(quotas.values()) == per_outcome_limit:
+                    break
+            if not made_progress:
+                break
+        selected = [
+            example
+            for outcome in ("correct", "incorrect")
+            for position in positions
+            for example in buckets[outcome][position][: quotas[position]]
+        ]
+    else:
+        selected = []
+        for outcome_buckets in buckets.values():
+            positions = sorted(outcome_buckets)
+            available = sum(len(outcome_buckets[position]) for position in positions)
+            limit = available if max_examples_per_outcome is None else min(available, max_examples_per_outcome)
+            outcome_selected: list[dict[str, Any]] = []
+            next_index = dict.fromkeys(positions, 0)
+            while len(outcome_selected) < limit:
+                made_progress = False
+                for position in positions:
+                    bucket = outcome_buckets[position]
+                    if next_index[position] < len(bucket):
+                        outcome_selected.append(bucket[next_index[position]])
+                        next_index[position] += 1
+                        made_progress = True
+                        if len(outcome_selected) == limit:
+                            break
+                if not made_progress:
+                    break
+            selected.extend(outcome_selected)
     rng.shuffle(selected)
     return selected
 
