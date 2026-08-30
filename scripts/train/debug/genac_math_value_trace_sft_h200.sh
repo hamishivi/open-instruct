@@ -32,7 +32,7 @@ accelerate launch \
     --learning_rate "${LEARNING_RATE}" \
     --lr_scheduler_type linear \
     --warmup_ratio 0.03 \
-    --weight_decay 0.0 \
+    --weight_decay 0.01 \
     --num_train_epochs "${NUM_TRAIN_EPOCHS}" \
     --dataset_mixer_list "${TRACE_JSONL}" 1.0 \
     --dataset_mixer_list_splits train \

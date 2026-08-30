@@ -31,7 +31,10 @@ EXP_NAME="${EXP_NAME:-genac-math-value-pretrain-h200}"
 RUN_OUTPUT_DIR="${RUN_OUTPUT_DIR:-${PWD}/outputs/${EXP_NAME}}"
 CHECKPOINT_STATE_DIR="${CHECKPOINT_STATE_DIR:-${RUN_OUTPUT_DIR}/checkpoint_states}"
 VALUE_PRETRAIN_STEPS="${VALUE_PRETRAIN_STEPS:-100}"
-GEN_VALUE_MODEL_PATH="${GEN_VALUE_MODEL_PATH:-Qwen/Qwen3-4B-Instruct-2507}"
+# The GenAC cold-start recipe SFTs and RL-pretrains the base model. Keep an
+# explicit override for ablations and for continuing from an exported SFT/RL
+# critic checkpoint.
+GEN_VALUE_MODEL_PATH="${GEN_VALUE_MODEL_PATH:-Qwen/Qwen3-4B-Base}"
 GEN_VALUE_CONDITIONING="${GEN_VALUE_CONDITIONING:-none}"
 NUM_UNIQUE_PROMPTS_ROLLOUT=32
 NUM_SAMPLES_PER_PROMPT_ROLLOUT=8
