@@ -75,6 +75,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --truncated_importance_sampling_ratio_cap 2.0 \
     --advantage_normalization_type centered \
     --learning_rate 1e-6 \
+    --weight_decay 0.01 \
     --lr_scheduler_type constant \
     --total_episodes "${TOTAL_EPISODES}" \
     --num_epochs 1 \
