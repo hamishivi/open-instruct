@@ -38,6 +38,7 @@ will ultimately produce a verifier-correct answer within its remaining token bud
 sampled trajectory's eventual outcome. Respond with concise value-focused reasoning followed by exactly one final
 tag of the form <answer>N</answer>, where N is an integer from 0 to 10. Do not output anything after the tag."""
 GROUND_TRUTH_CONDITIONING_MARKER = "\n\nThe correct answer is "
+PARTIAL_RESPONSE_MARKER = "\n\nPartial response:\n<rollout>"
 
 
 def read_jsonl(paths: Sequence[pathlib.Path]) -> list[dict[str, Any]]:
@@ -61,6 +62,19 @@ def write_jsonl(path: pathlib.Path, rows: Sequence[dict[str, Any]]) -> None:
         for row in rows:
             output_file.write(json.dumps(row, ensure_ascii=False) + "\n")
     temporary_path.replace(path)
+
+
+def prompt_has_ground_truth_conditioning(prompt: str) -> bool:
+    """Detect answer conditioning without inspecting the actor's response text.
+
+    Incorrect actor trajectories can themselves contain phrases such as
+    ``The correct answer is ...``. Those are useful negative states, not leaked
+    critic conditioning, so only inspect the prompt prefix before ``<rollout>``.
+    Older/nonstandard prompts without the delimiter retain the conservative
+    whole-prompt check.
+    """
+    prefix, delimiter, _ = prompt.partition(PARTIAL_RESPONSE_MARKER)
+    return GROUND_TRUTH_CONDITIONING_MARKER in (prefix if delimiter else prompt)
 
 
 def select_teacher_states(
@@ -200,9 +214,7 @@ def prepare(args: argparse.Namespace) -> None:
         raise RuntimeError("No raw critic states passed the teacher-state selection criteria.")
     if not args.allow_ground_truth_conditioning:
         leaked_answer_prompts = [
-            example
-            for example in selected
-            if GROUND_TRUTH_CONDITIONING_MARKER in str(example.get("prompt", ""))
+            example for example in selected if prompt_has_ground_truth_conditioning(str(example.get("prompt", "")))
         ]
         if leaked_answer_prompts:
             raise ValueError(
@@ -308,6 +320,58 @@ def collect(args: argparse.Namespace) -> None:
                 "output": str(args.output),
                 "selected_examples": len(selected),
                 "teacher_model": args.teacher_model,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+def audit(args: argparse.Namespace) -> None:
+    """Fail closed unless an SFT JSONL is large, parseable, and unconditioned."""
+    examples = read_jsonl(args.inputs)
+    if len(examples) < args.min_examples:
+        raise ValueError(f"Value SFT dataset has {len(examples)} traces; at least {args.min_examples} are required.")
+
+    missing_prompt = 0
+    missing_generation = 0
+    invalid_score = 0
+    leaked_answer_conditioning = 0
+    prompts: list[str] = []
+    for example in examples:
+        prompt = example.get("prompt")
+        generation = example.get("generation")
+        if not isinstance(prompt, str) or not prompt:
+            missing_prompt += 1
+        else:
+            prompts.append(prompt)
+            if prompt_has_ground_truth_conditioning(prompt):
+                leaked_answer_conditioning += 1
+        if not isinstance(generation, str) or not generation:
+            missing_generation += 1
+        elif parse_generative_value_score(generation, score_min=0.0, score_max=10.0) is None:
+            invalid_score += 1
+
+    duplicate_prompts = len(prompts) - len(set(prompts))
+    failures = {
+        "missing_prompt": missing_prompt,
+        "missing_generation": missing_generation,
+        "invalid_score": invalid_score,
+        "duplicate_prompts": duplicate_prompts,
+    }
+    if leaked_answer_conditioning and not args.allow_ground_truth_conditioning:
+        failures["answer_conditioned_prompt"] = leaked_answer_conditioning
+    nonzero_failures = {name: count for name, count in failures.items() if count}
+    if nonzero_failures:
+        raise ValueError(f"Value SFT audit failed: {nonzero_failures}.")
+
+    print(
+        json.dumps(
+            {
+                "answer_conditioned_prompts": leaked_answer_conditioning,
+                "examples": len(examples),
+                "inputs": [str(path) for path in args.inputs],
+                "unique_prompts": len(set(prompts)),
             },
             indent=2,
             sort_keys=True,
@@ -478,6 +542,14 @@ def parse_args() -> argparse.Namespace:
     )
     collect_parser.set_defaults(function=collect)
 
+    audit_parser = subparsers.add_parser(
+        "audit", help="Validate size, score format, prompt uniqueness, and conditioning of SFT JSONL files."
+    )
+    audit_parser.add_argument("inputs", nargs="+", type=pathlib.Path)
+    audit_parser.add_argument("--min_examples", type=int, default=512)
+    audit_parser.add_argument("--allow_ground_truth_conditioning", action="store_true")
+    audit_parser.set_defaults(function=audit)
+
     consensus_parser = subparsers.add_parser(
         "consensus", help="Select a balanced primary-teacher SFT set using independent teacher agreement."
     )
@@ -496,6 +568,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max_examples_per_outcome must be positive.")
     if args.command == "collect" and args.max_teacher_squared_error is not None and args.max_teacher_squared_error < 0:
         parser.error("--max_teacher_squared_error must be nonnegative.")
+    if args.command == "audit" and args.min_examples < 0:
+        parser.error("--min_examples must be nonnegative.")
     if args.command == "consensus" and args.max_teacher_range < 0:
         parser.error("--max_teacher_range must be nonnegative.")
     if args.command == "consensus" and args.max_examples_per_outcome <= 0:

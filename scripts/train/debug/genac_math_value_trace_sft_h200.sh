@@ -14,17 +14,11 @@ if [[ ! "${MIN_TRACE_EXAMPLES}" =~ ^[0-9]+$ ]]; then
     echo "MIN_TRACE_EXAMPLES must be a nonnegative integer: ${MIN_TRACE_EXAMPLES}" >&2
     exit 1
 fi
-NUM_TRACE_EXAMPLES=$(awk 'NF { count += 1 } END { print count + 0 }' "${TRACE_JSONL}")
-if ((NUM_TRACE_EXAMPLES < MIN_TRACE_EXAMPLES)); then
-    echo "Refusing undersized value SFT: ${NUM_TRACE_EXAMPLES} traces < ${MIN_TRACE_EXAMPLES}." >&2
-    echo "Set MIN_TRACE_EXAMPLES=0 only for an explicit infrastructure smoke test." >&2
-    exit 1
+AUDIT_ARGS=("${TRACE_JSONL}" --min_examples "${MIN_TRACE_EXAMPLES}")
+if [[ "${ALLOW_GROUND_TRUTH_CONDITIONING}" == "1" ]]; then
+    AUDIT_ARGS+=(--allow_ground_truth_conditioning)
 fi
-if [[ "${ALLOW_GROUND_TRUTH_CONDITIONING}" != "1" ]] && \
-    grep -Fq 'The correct answer is ' "${TRACE_JSONL}"; then
-    echo "Refusing answer-conditioned traces in the paper-style value SFT dataset." >&2
-    exit 1
-fi
+uv run python scripts/data/synthesize_gen_value_sft.py audit "${AUDIT_ARGS[@]}"
 
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-4B-Base}
 NUM_GPUS=${NUM_GPUS:-4}

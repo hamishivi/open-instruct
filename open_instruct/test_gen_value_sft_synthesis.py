@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from scripts.data.synthesize_gen_value_sft import (
+    audit,
     collect,
     extract_response_text,
     make_batch_request,
@@ -337,6 +338,47 @@ class TestGenValueSFTSynthesis(unittest.TestCase):
                         allow_ground_truth_conditioning=False,
                     )
                 )
+
+    def test_prepare_allows_answer_phrase_inside_actor_rollout(self):
+        example = self._state(0.0, "final_action")
+        example["prompt"] = (
+            "critic header\n\nProblem:\nA problem\n\nPartial response:\n<rollout>"
+            "The correct answer is 7, but I guessed 8.</rollout>\nAnswer:"
+        )
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            input_path = root / "snapshot.jsonl"
+            input_path.write_text(json.dumps(example) + "\n")
+
+            prepare(
+                argparse.Namespace(
+                    inputs=[input_path],
+                    batch_output=root / "batch.jsonl",
+                    metadata_output=root / "metadata.jsonl",
+                    model="gpt-5",
+                    reasoning_effort="medium",
+                    max_output_tokens=1024,
+                    min_critic_version=25,
+                    max_examples_per_outcome=1,
+                    seed=0,
+                    allow_ground_truth_conditioning=False,
+                )
+            )
+
+            self.assertEqual(len((root / "batch.jsonl").read_text().splitlines()), 1)
+
+    def test_audit_requires_parseable_unique_unconditioned_traces(self):
+        example = self._state(0.0, "final_action")
+        example["prompt"] = (
+            "critic header\n\nProblem:\nA problem\n\nPartial response:\n<rollout>"
+            "The correct answer is not obvious.</rollout>\nAnswer:"
+        )
+        example["generation"] = "The state is weak. <answer>1</answer>"
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            input_path = Path(temporary_dir) / "sft.jsonl"
+            input_path.write_text(json.dumps(example) + "\n")
+
+            audit(argparse.Namespace(inputs=[input_path], min_examples=1, allow_ground_truth_conditioning=False))
 
 
 if __name__ == "__main__":
