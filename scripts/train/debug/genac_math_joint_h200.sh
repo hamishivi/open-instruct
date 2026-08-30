@@ -7,8 +7,8 @@
 # total_episodes = 300 joint steps * 32 prompts * 8 samples = 76,800
 # Two half-rate actor epochs make DAPO clipping active on the second pass while
 # keeping the nominal per-rollout update scale close to one 1e-6 pass.
-# Continue the raw-reward REINFORCE objective used during critic pretraining and
-# in Algorithm 1 of GenAC.
+# Continue the replay-safe, outcome-stratified leave-one-out critic objective
+# used during critic pretraining.
 set -euo pipefail
 
 if [[ -z "${GEN_VALUE_MODEL_PATH:-}" ]]; then
@@ -49,6 +49,7 @@ EXP_NAME="${EXP_NAME:-genac-math-joint-h200}"
 RUN_OUTPUT_DIR="${RUN_OUTPUT_DIR:-${PWD}/outputs/${EXP_NAME}}"
 CHECKPOINT_STATE_DIR="${CHECKPOINT_STATE_DIR:-${RUN_OUTPUT_DIR}/checkpoint_states}"
 GEN_VALUE_CONDITIONING="${GEN_VALUE_CONDITIONING:-none}"
+GEN_VALUE_REINFORCE_BASELINE="${GEN_VALUE_REINFORCE_BASELINE:-leave_one_out_by_outcome}"
 
 python open_instruct/grpo_fast_genvalue.py \
     --exp_name "${EXP_NAME}" \
@@ -128,7 +129,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --gen_value_icc_momentum 0.9 \
     --gen_value_learning_rate 1e-6 \
     --gen_value_reinforce_coef 1.0 \
-    --gen_value_reinforce_baseline none \
+    --gen_value_reinforce_baseline "${GEN_VALUE_REINFORCE_BASELINE}" \
     --gen_value_final_action_replay_weight 4 \
     --gen_value_sync_freq 5 \
     --gen_value_diagnostic_scoring_freq 0 \

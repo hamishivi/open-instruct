@@ -16,11 +16,10 @@
 # critic-only training from a previously exported Hugging Face model.  The default
 # seed intentionally differs from the seed-1 rollout stream used to build the SFT
 # trace reservoir, so the post-SFT calibration stage exercises unseen prompts.
-# Match Algorithm 1 in GenAC by reward-weighting each sampled critic trace with
-# its raw accuracy-shaped reward. We sample one critic trace per state, so
-# centering across unrelated states of the same outcome makes each finite batch
-# depend only on relative reward differences and can starve a nearly
-# deterministic critic of useful updates.
+# Center critic rewards against other independently sampled completions with the
+# same binary outcome. This preserves the policy-gradient expectation while
+# turning inaccurate scores and parse failures into an explicit negative signal.
+# Final-action replay copies are collapsed before computing the baseline.
 set -euo pipefail
 
 if [[ "${PRESERVE_LD_LIBRARY_PATH:-0}" != "1" ]]; then
@@ -43,6 +42,7 @@ VALUE_PRETRAIN_STEPS="${VALUE_PRETRAIN_STEPS:-100}"
 # critic checkpoint.
 GEN_VALUE_MODEL_PATH="${GEN_VALUE_MODEL_PATH:-Qwen/Qwen3-4B-Base}"
 GEN_VALUE_CONDITIONING="${GEN_VALUE_CONDITIONING:-none}"
+GEN_VALUE_REINFORCE_BASELINE="${GEN_VALUE_REINFORCE_BASELINE:-leave_one_out_by_outcome}"
 SEED="${SEED:-17}"
 NUM_UNIQUE_PROMPTS_ROLLOUT=32
 NUM_SAMPLES_PER_PROMPT_ROLLOUT=8
@@ -143,7 +143,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --gen_value_icc_momentum 0.9 \
     --gen_value_learning_rate 1e-6 \
     --gen_value_reinforce_coef 1.0 \
-    --gen_value_reinforce_baseline none \
+    --gen_value_reinforce_baseline "${GEN_VALUE_REINFORCE_BASELINE}" \
     --gen_value_final_action_replay_weight 4 \
     --gen_value_sync_freq 5 \
     --gen_value_diagnostic_scoring_freq 0 \

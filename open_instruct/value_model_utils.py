@@ -370,6 +370,47 @@ def generative_value_reinforce_weights(
     return weights
 
 
+def generative_value_reinforce_weights_with_replay(
+    rewards: Sequence[float], baseline: str, sample_ids: Sequence[int], outcomes: Sequence[float] | None = None
+) -> list[float]:
+    """Compute baseline weights once per sampled completion, then replay them.
+
+    Final-action replay intentionally repeats the same sampled critic completion.
+    Including those copies in a leave-one-out baseline would make the baseline
+    depend on the current action and would also let replay frequency distort the
+    reference reward. Collapse copies by identity, compute the baseline on unique
+    samples, and broadcast each resulting weight back to its replay copies.
+    """
+    if len(rewards) != len(sample_ids):
+        raise ValueError("REINFORCE rewards and sample_ids must have the same length.")
+    if outcomes is not None and len(outcomes) != len(rewards):
+        raise ValueError("REINFORCE rewards and outcomes must have the same length.")
+
+    unique_ids: list[int] = []
+    unique_rewards: list[float] = []
+    unique_outcomes: list[float] | None = [] if outcomes is not None else None
+    identity_to_unique_index: dict[int, int] = {}
+    for index, sample_id in enumerate(sample_ids):
+        reward = float(rewards[index])
+        outcome = float(outcomes[index]) if outcomes is not None else None
+        unique_index = identity_to_unique_index.get(int(sample_id))
+        if unique_index is None:
+            identity_to_unique_index[int(sample_id)] = len(unique_ids)
+            unique_ids.append(int(sample_id))
+            unique_rewards.append(reward)
+            if unique_outcomes is not None:
+                assert outcome is not None
+                unique_outcomes.append(outcome)
+            continue
+        if reward != unique_rewards[unique_index] or (
+            unique_outcomes is not None and outcome != unique_outcomes[unique_index]
+        ):
+            raise ValueError("Replay copies with one sample_id must have identical rewards and outcomes.")
+
+    unique_weights = generative_value_reinforce_weights(unique_rewards, baseline, unique_outcomes)
+    return [unique_weights[identity_to_unique_index[int(sample_id)]] for sample_id in sample_ids]
+
+
 def replay_gen_value_final_actions(
     training_pairs: Sequence[dict[str, Any]], replay_weight: int
 ) -> list[dict[str, Any]]:

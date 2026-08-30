@@ -55,6 +55,7 @@ from open_instruct.value_model_utils import (
     gen_value_validation_metrics,
     generative_value_reinforce_reward,
     generative_value_reinforce_weights,
+    generative_value_reinforce_weights_with_replay,
     grouped_token_counts,
     is_postfix_template,
     missing_value_fallback,
@@ -798,6 +799,20 @@ class TestValueLoss(unittest.TestCase):
         np.testing.assert_allclose(weights, [0.2, -0.2, 0.4, -0.4])
         self.assertAlmostEqual(sum(weights[:2]), 0.0)
         self.assertAlmostEqual(sum(weights[2:]), 0.0)
+
+    def test_gen_value_replay_does_not_contaminate_leave_one_out_baseline(self):
+        weights = generative_value_reinforce_weights_with_replay(
+            [1.0, 1.0, 1.0, 0.5, 0.25],
+            baseline="leave_one_out_by_outcome",
+            sample_ids=[10, 10, 10, 20, 30],
+            outcomes=[0.0, 0.0, 0.0, 0.0, 0.0],
+        )
+
+        np.testing.assert_allclose(weights, [0.625, 0.625, 0.625, -0.125, -0.5])
+
+    def test_gen_value_replay_requires_consistent_sample_metadata(self):
+        with self.assertRaisesRegex(ValueError, "identical rewards and outcomes"):
+            generative_value_reinforce_weights_with_replay([1.0, 0.5], baseline="leave_one_out", sample_ids=[10, 10])
 
     def test_gen_value_outcome_baseline_requires_aligned_outcomes(self):
         with self.assertRaisesRegex(ValueError, "requires one outcome for every reward"):

@@ -432,6 +432,7 @@ class GenValueTrainerActor:
                     "rollout_logprobs": completion.logprobs,
                     "outcome": outcome,
                     "reward": reward,
+                    "source_pair_id": id(pair),
                 }
             )
 
@@ -440,8 +441,11 @@ class GenValueTrainerActor:
 
         raw_rewards = [float(example["reward"]) for example in validated_examples]
         outcomes = [float(example["outcome"]) for example in validated_examples]
-        reinforce_weights = value_model_utils.generative_value_reinforce_weights(
-            raw_rewards, self._reinforce_baseline, outcomes
+        reinforce_weights = value_model_utils.generative_value_reinforce_weights_with_replay(
+            raw_rewards,
+            self._reinforce_baseline,
+            [int(example["source_pair_id"]) for example in validated_examples],
+            outcomes,
         )
         for example, reinforce_weight in zip(validated_examples, reinforce_weights):
             example["reward"] = reinforce_weight
