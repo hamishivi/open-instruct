@@ -61,10 +61,11 @@ python open_instruct/grpo_fast_genvalue.py \
     --verification_reward 1.0 \
     --remap_verifier math=final_boxed_math \
     --non_stop_penalty false \
-    --beta 0.0 \
+    --beta 0.01 \
     --loss_fn dapo \
     --clip_higher 0.272 \
-    --truncated_importance_sampling_ratio_cap 2.0 \
+    --use_vllm_logprobs \
+    --truncated_importance_sampling_ratio_cap 0.0 \
     --advantage_normalization_type centered \
     --learning_rate 1e-6 \
     --lr_scheduler_type constant \
@@ -80,8 +81,8 @@ python open_instruct/grpo_fast_genvalue.py \
     --vllm_gpu_memory_utilization 0.85 \
     --vllm_top_p 1.0 \
     --vllm_enable_prefix_caching \
-    --inflight_updates true \
-    --async_steps 8 \
+    --inflight_updates false \
+    --async_steps 2 \
     --seed 1 \
     --local_eval_every 25 \
     --eval_on_step_0 true \
