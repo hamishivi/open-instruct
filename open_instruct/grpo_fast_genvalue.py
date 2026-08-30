@@ -411,15 +411,9 @@ class GenValueTrainerActor:
                 )
             if squared_error is not None:
                 mses.append(squared_error)
-                response_tokens_used = pair.get("response_tokens_used")
-                response_token_limit = pair.get("response_token_limit")
-                if response_tokens_used is not None and response_token_limit is not None:
-                    response_token_limit = int(response_token_limit)
-                    remaining_tokens = response_token_limit - int(response_tokens_used)
-                    near_horizon_threshold = max(512, math.ceil(0.1 * response_token_limit))
-                    if is_first_replay and outcome <= 0.5 and remaining_tokens <= near_horizon_threshold:
-                        near_horizon_incorrect_v_hats.append(v_hat)
-                        near_horizon_incorrect_mses.append(squared_error)
+                if is_first_replay and value_model_utils.is_gen_value_near_horizon_incorrect(pair):
+                    near_horizon_incorrect_v_hats.append(v_hat)
+                    near_horizon_incorrect_mses.append(squared_error)
             validated_examples.append(
                 {
                     "sequence_ids": sequence_ids,

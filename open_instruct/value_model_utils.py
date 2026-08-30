@@ -375,6 +375,20 @@ def unique_replayed_gen_value_pairs(training_pairs: Sequence[dict[str, Any]]) ->
     return unique
 
 
+def is_gen_value_near_horizon_incorrect(example: dict[str, Any]) -> bool:
+    """Whether a failed critic state is close to the hard response-token limit."""
+    target = example.get("target", example.get("outcome"))
+    used = example.get("response_tokens_used")
+    limit = example.get("response_token_limit")
+    if target is None or float(target) > 0.5 or used is None or limit is None:
+        return False
+    limit = int(limit)
+    if limit <= 0:
+        return False
+    threshold = max(512, math.ceil(0.1 * limit))
+    return limit - int(used) <= threshold
+
+
 def build_gen_value_validation_holdout(
     rollouts: list[dict[str, Any]], max_examples: int, seed: int = 0, prompt_holdout_fraction: float = 0.125
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -403,11 +417,27 @@ def build_gen_value_validation_holdout(
 
     rng = random.Random(seed)
     grouped_rollouts = list(rollout_groups.items())
-    rng.shuffle(grouped_rollouts)
     holdout_group_count = min(
         len(grouped_rollouts), max_examples, max(1, math.ceil(prompt_holdout_fraction * len(grouped_rollouts)))
     )
-    heldout_groups = grouped_rollouts[:holdout_group_count]
+    # Near-horizon failures are rare but are exactly the states that reveal whether
+    # the critic can recognize a rollout that has exhausted its opportunity to
+    # recover. Reserve up to half the held-out prompt-group budget for groups that
+    # contain one, then fill the remainder randomly. Without this reservation a
+    # seemingly healthy aggregate validation curve can entirely miss the collapse
+    # mode that actor training is most likely to exploit.
+    near_horizon_groups = [
+        group
+        for group in grouped_rollouts
+        if any(is_gen_value_near_horizon_incorrect(pair) for rollout in group[1] for pair in rollout.get("pairs", []))
+    ]
+    rng.shuffle(near_horizon_groups)
+    reserved_count = min(len(near_horizon_groups), max(1, math.ceil(holdout_group_count / 2)))
+    reserved_group_ids = {id(group) for group in near_horizon_groups[:reserved_count]}
+    remaining_groups = [group for group in grouped_rollouts if id(group) not in reserved_group_ids]
+    rng.shuffle(remaining_groups)
+    heldout_groups = near_horizon_groups[:reserved_count] + remaining_groups[: holdout_group_count - reserved_count]
+    rng.shuffle(heldout_groups)
     heldout_rollout_ids = {id(rollout) for _, group in heldout_groups for rollout in group}
     validation_examples: list[dict[str, Any]] = []
     final_candidates: list[dict[str, Any]] = []
@@ -463,6 +493,7 @@ def build_gen_value_validation_holdout(
         incorrect = [pair for pair in candidates if float(pair["outcome"]) <= 0.5]
         rng.shuffle(correct)
         rng.shuffle(incorrect)
+        incorrect.sort(key=lambda pair: not is_gen_value_near_horizon_incorrect(pair))
         selected_correct = correct[: min(len(correct), count // 2)]
         selected_incorrect = incorrect[: min(len(incorrect), count - len(selected_correct))]
         selected = selected_correct + selected_incorrect
@@ -585,17 +616,11 @@ def gen_value_validation_metrics(
         prefix_position_groups[f"prefix_{band}_incorrect"] = [
             (example, prediction) for example, prediction in band_rows if float(example["target"]) <= 0.5
         ]
-    near_horizon_incorrect = []
-    for example, prediction in parsed:
-        if example["kind"] == "initial" or float(example["target"]) > 0.5:
-            continue
-        used = example.get("response_tokens_used")
-        limit = example.get("response_token_limit")
-        if used is None or limit is None:
-            continue
-        threshold = max(512, math.ceil(0.1 * int(limit)))
-        if int(limit) - int(used) <= threshold:
-            near_horizon_incorrect.append((example, prediction))
+    near_horizon_incorrect = [
+        (example, prediction)
+        for example, prediction in parsed
+        if example["kind"] != "initial" and is_gen_value_near_horizon_incorrect(example)
+    ]
 
     add_group("initial", initial)
     add_group("final_correct", final_correct)

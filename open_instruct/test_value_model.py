@@ -852,6 +852,32 @@ class TestValueLoss(unittest.TestCase):
         self.assertEqual(len(training_pairs), 14)
         self.assertTrue(all(pair_["request_output"].prompt_token_ids[0] != heldout_group for pair_ in training_pairs))
 
+    def test_gen_value_validation_holdout_reserves_rare_near_horizon_failure(self):
+        def pair(group_index, outcome, used, kind="segment_start"):
+            return {
+                "request_output": SimpleNamespace(prompt_token_ids=[group_index, used]),
+                "outcome": outcome,
+                "response_tokens_used": used,
+                "response_token_limit": 1000,
+                "state_kind": kind,
+            }
+
+        rollouts = []
+        for group_index in range(8):
+            final_tokens = 950 if group_index == 7 else 400
+            rollouts.append(
+                {"pairs": [pair(group_index, 0.0, 0), pair(group_index, 0.0, final_tokens, "final_action")]}
+            )
+
+        examples, training_pairs = build_gen_value_validation_holdout(
+            rollouts, max_examples=8, seed=0, prompt_holdout_fraction=0.125
+        )
+
+        heldout_groups = {example["prompt_token_ids"][0] for example in examples}
+        self.assertEqual(heldout_groups, {7})
+        self.assertTrue(any(example["response_tokens_used"] == 950 for example in examples))
+        self.assertTrue(all(pair_["request_output"].prompt_token_ids[0] != 7 for pair_ in training_pairs))
+
     def test_gen_value_validation_holdout_covers_trajectory_prefixes_and_final_action(self):
         def pair(prompt_ids, outcome, used, kind="segment_start"):
             return {
