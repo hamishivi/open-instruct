@@ -8,6 +8,24 @@ if [[ ! -f "${TRACE_JSONL}" ]]; then
     exit 1
 fi
 
+MIN_TRACE_EXAMPLES=${MIN_TRACE_EXAMPLES:-512}
+ALLOW_GROUND_TRUTH_CONDITIONING=${ALLOW_GROUND_TRUTH_CONDITIONING:-0}
+if [[ ! "${MIN_TRACE_EXAMPLES}" =~ ^[0-9]+$ ]]; then
+    echo "MIN_TRACE_EXAMPLES must be a nonnegative integer: ${MIN_TRACE_EXAMPLES}" >&2
+    exit 1
+fi
+NUM_TRACE_EXAMPLES=$(awk 'NF { count += 1 } END { print count + 0 }' "${TRACE_JSONL}")
+if ((NUM_TRACE_EXAMPLES < MIN_TRACE_EXAMPLES)); then
+    echo "Refusing undersized value SFT: ${NUM_TRACE_EXAMPLES} traces < ${MIN_TRACE_EXAMPLES}." >&2
+    echo "Set MIN_TRACE_EXAMPLES=0 only for an explicit infrastructure smoke test." >&2
+    exit 1
+fi
+if [[ "${ALLOW_GROUND_TRUTH_CONDITIONING}" != "1" ]] && \
+    grep -Fq 'The correct answer is ' "${TRACE_JSONL}"; then
+    echo "Refusing answer-conditioned traces in the paper-style value SFT dataset." >&2
+    exit 1
+fi
+
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-4B-Base}
 NUM_GPUS=${NUM_GPUS:-4}
 MAX_SEQ_LENGTH=${MAX_SEQ_LENGTH:-32768}
