@@ -263,6 +263,35 @@ class TestGAEVariants(unittest.TestCase):
         self.assertAlmostEqual(bf, expected_frac, places=6)
         self.assertEqual(adv.shape, v.shape)
 
+    def test_sae_lambda_one_propagates_terminal_outcome_across_packed_sequences(self):
+        # Two episodes share one packed row. With gamma=lambda=1 and no intermediate
+        # rewards, every response action must receive exactly outcome - V(s),
+        # regardless of SAE boundaries or intervening prompt tokens.
+        values = np.array([[0.0, 0.0, 0.2, 0.4, 0.7, 0.0, 0.0, 0.3, 0.5, 0.6, 0.8]])
+        rewards = np.zeros_like(values)
+        rewards[0, 4] = 1.0
+        dones = np.zeros_like(values)
+        dones[0, [4, 10]] = 1.0
+        response_masks = np.zeros_like(values)
+        response_masks[0, [2, 3, 4, 7, 8, 9, 10]] = 1.0
+        logprobs = np.full_like(values, -0.1)
+        logprobs[0, [3, 8, 10]] = -2.5
+
+        advantages, _, boundary_fraction = calculate_advantages_packed_sae(
+            values,
+            rewards,
+            gamma=1.0,
+            lam=1.0,
+            dones=dones,
+            response_masks=response_masks,
+            logprobs=logprobs,
+            sae_threshold=0.2,
+        )
+
+        np.testing.assert_allclose(advantages[0, [2, 3, 4]], 1.0 - values[0, [2, 3, 4]])
+        np.testing.assert_allclose(advantages[0, [7, 8, 9, 10]], -values[0, [7, 8, 9, 10]])
+        self.assertGreater(boundary_fraction, 0.0)
+
     def test_sae_vapo_combines_variants(self):
         v, r, d, m, logp = self._inputs()
         pa, cr, metrics = calculate_advantages_packed_sae_vapo(
