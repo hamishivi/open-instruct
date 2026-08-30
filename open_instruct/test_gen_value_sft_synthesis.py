@@ -109,6 +109,19 @@ class TestGenValueSFTSynthesis(unittest.TestCase):
         self.assertEqual(request["body"]["chat_template_kwargs"], {"enable_thinking": True})
         self.assertEqual(request["body"]["max_tokens"], 4096)
 
+    def test_batch_request_accepts_custom_teacher_instructions(self):
+        request = make_batch_request(
+            "trace-1",
+            "critic prompt",
+            model="Qwen/Qwen3-32B",
+            reasoning_effort="medium",
+            max_output_tokens=1024,
+            request_format="chat_completions",
+            teacher_instructions="terminal calibration <answer>0</answer>",
+        )
+
+        self.assertEqual(request["body"]["messages"][0]["content"], "terminal calibration <answer>0</answer>")
+
     def test_extract_response_text_supports_local_reasoning_content(self):
         text = extract_response_text(
             {
@@ -205,6 +218,50 @@ class TestGenValueSFTSynthesis(unittest.TestCase):
             self.assertEqual(len(sft_rows), 2)
             self.assertEqual({row["teacher_prediction"] for row in sft_rows}, {0.1, 0.9})
             self.assertTrue(all(row["teacher_model"] == "gpt-5" for row in sft_rows))
+
+    def test_prepare_conditions_only_terminal_teacher_request_on_outcome(self):
+        examples = [
+            self._state(0.0, "early"),
+            self._state(0.0, "final_action"),
+            self._state(1.0, "early"),
+            self._state(1.0, "final_action"),
+        ]
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            reservoir = root / "reservoir.jsonl"
+            reservoir.write_text("".join(json.dumps(example) + "\n" for example in examples))
+            batch_path = root / "batch.jsonl"
+            metadata_path = root / "metadata.jsonl"
+            prepare(
+                argparse.Namespace(
+                    inputs=[reservoir],
+                    batch_output=batch_path,
+                    metadata_output=metadata_path,
+                    model="Qwen/Qwen3-32B",
+                    request_format="chat_completions",
+                    reasoning_effort="medium",
+                    max_output_tokens=1024,
+                    min_critic_version=25,
+                    max_examples_per_outcome=2,
+                    seed=0,
+                    allow_ground_truth_conditioning=False,
+                    condition_terminal_teacher_on_outcome=True,
+                )
+            )
+
+            metadata = [json.loads(line) for line in metadata_path.read_text().splitlines()]
+            batches = [json.loads(line) for line in batch_path.read_text().splitlines()]
+            for source_row, batch_row in zip(metadata, batches, strict=True):
+                source = source_row["source"]
+                instructions = batch_row["body"]["messages"][0]["content"]
+                self.assertEqual(batch_row["body"]["messages"][1]["content"], source["prompt"])
+                if source["state_kind"] == "final_action":
+                    expected_score = 10 if source["outcome"] > 0.5 else 0
+                    self.assertIn(f"<answer>{expected_score}</answer>", instructions)
+                    self.assertIn("outcome verifier", instructions)
+                else:
+                    self.assertNotIn("outcome verifier", instructions)
+                    self.assertIn("Do not assume knowledge", instructions)
 
     def test_collect_can_skip_an_invalid_score_explicitly(self):
         good = self._state(1.0, "final_action")

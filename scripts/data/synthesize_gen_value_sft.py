@@ -37,6 +37,13 @@ progress, errors, and remaining recovery opportunities, then estimate the probab
 will ultimately produce a verifier-correct answer within its remaining token budget. Do not assume knowledge of the
 sampled trajectory's eventual outcome. Respond with concise value-focused reasoning followed by exactly one final
 tag of the form <answer>N</answer>, where N is an integer from 0 to 10. Do not output anything after the tag."""
+TERMINAL_OUTCOME_TEACHER_INSTRUCTIONS = """
+
+For this terminal-boundary synthesis example only, an outcome verifier has established that the sampled transition
+completed with a {outcome_label} answer. Use that outcome to find concrete mathematical evidence in the response
+that supports the label. Do not mention the verifier, the supplied label, or access to external ground truth in the
+generated trace. Because this supervision applies only at the final sampled action, end with exactly
+<answer>{score}</answer>."""
 GROUND_TRUTH_CONDITIONING_MARKER = "\n\nThe correct answer is "
 PARTIAL_RESPONSE_MARKER = "\n\nPartial response:\n<rollout>"
 
@@ -121,6 +128,7 @@ def make_batch_request(
     max_output_tokens: int,
     request_format: str = "responses",
     enable_thinking: bool = False,
+    teacher_instructions: str = DEFAULT_TEACHER_INSTRUCTIONS,
 ) -> dict[str, Any]:
     if request_format == "chat_completions":
         return {
@@ -130,7 +138,7 @@ def make_batch_request(
             "body": {
                 "model": model,
                 "messages": [
-                    {"role": "system", "content": DEFAULT_TEACHER_INSTRUCTIONS},
+                    {"role": "system", "content": teacher_instructions},
                     {"role": "user", "content": prompt},
                 ],
                 # Qwen3's hidden-thinking mode can consume the entire 1,024-token
@@ -154,7 +162,7 @@ def make_batch_request(
         "url": "/v1/responses",
         "body": {
             "model": model,
-            "instructions": DEFAULT_TEACHER_INSTRUCTIONS,
+            "instructions": teacher_instructions,
             "input": prompt,
             "reasoning": {"effort": reasoning_effort},
             "max_output_tokens": max_output_tokens,
@@ -245,12 +253,23 @@ def prepare(args: argparse.Namespace) -> None:
 
     metadata_rows: list[dict[str, Any]] = []
     batch_rows: list[dict[str, Any]] = []
+    outcome_conditioned_terminal_examples = 0
     for index, example in enumerate(selected):
         prompt = example.get("prompt")
         if not isinstance(prompt, str) or not prompt:
             raise ValueError(f"Selected teacher state {index} has no prompt.")
         custom_id = f"gen-value-{index:06d}"
         metadata_rows.append({"custom_id": custom_id, "source": example})
+        teacher_instructions = DEFAULT_TEACHER_INSTRUCTIONS
+        if getattr(args, "condition_terminal_teacher_on_outcome", False) and example.get("state_kind") == "final_action":
+            outcome = float(example["outcome"])
+            score = 10 if outcome > 0.5 else 0
+            outcome_label = "verifier-correct" if score == 10 else "verifier-incorrect"
+            teacher_instructions += TERMINAL_OUTCOME_TEACHER_INSTRUCTIONS.format(
+                outcome_label=outcome_label,
+                score=score,
+            )
+            outcome_conditioned_terminal_examples += 1
         batch_rows.append(
             make_batch_request(
                 custom_id,
@@ -260,6 +279,7 @@ def prepare(args: argparse.Namespace) -> None:
                 max_output_tokens=args.max_output_tokens,
                 request_format=getattr(args, "request_format", "responses"),
                 enable_thinking=getattr(args, "enable_thinking", False),
+                teacher_instructions=teacher_instructions,
             )
         )
 
@@ -277,6 +297,7 @@ def prepare(args: argparse.Namespace) -> None:
                 "selected_examples": len(selected),
                 "selected_correct": sum(float(example["outcome"]) > 0.5 for example in selected),
                 "selected_incorrect": sum(float(example["outcome"]) <= 0.5 for example in selected),
+                "outcome_conditioned_terminal_examples": outcome_conditioned_terminal_examples,
             },
             indent=2,
             sort_keys=True,
@@ -552,6 +573,14 @@ def parse_args() -> argparse.Namespace:
         "--allow_ground_truth_conditioning",
         action="store_true",
         help="Allow answer-conditioned prompts for an explicit non-paper ablation.",
+    )
+    prepare_parser.add_argument(
+        "--condition_terminal_teacher_on_outcome",
+        action="store_true",
+        help=(
+            "Condition only final-action teacher synthesis on the sampled verifier outcome. The original critic "
+            "prompt remains unconditioned; this is an explicit terminal-calibration ablation."
+        ),
     )
     prepare_parser.set_defaults(function=prepare)
 
