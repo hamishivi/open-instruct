@@ -116,5 +116,5 @@ python open_instruct/grpo_fast_genvalue.py \
     --gen_value_sync_freq 5 \
     --gen_value_validation_freq 25 \
     --gen_value_validation_max_examples 128 \
-    --gen_value_trace_reservoir_size 512 \
+    --gen_value_trace_reservoir_size 4096 \
     "$@"
