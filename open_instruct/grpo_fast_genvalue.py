@@ -665,6 +665,7 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
     # its REINFORCE update. Rescore them at critic version 0 and each frequency multiple.
     gen_value_validation_freq: int = 0
     gen_value_validation_max_examples: int = 0
+    gen_value_validation_prompt_holdout_fraction: float = 0.125
     # Balanced, bounded reservoir of raw on-policy critic traces for inspection and an
     # optional later SFT stage. Zero disables collection.
     gen_value_trace_reservoir_size: int = 0
@@ -720,6 +721,11 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
         if self.gen_value_validation_max_examples < 0:
             raise ValueError(
                 f"--gen_value_validation_max_examples must be >= 0, got {self.gen_value_validation_max_examples}."
+            )
+        if not 0.0 < self.gen_value_validation_prompt_holdout_fraction <= 1.0:
+            raise ValueError(
+                "--gen_value_validation_prompt_holdout_fraction must be in (0, 1], got "
+                f"{self.gen_value_validation_prompt_holdout_fraction}."
             )
         if self.gen_value_trace_reservoir_size < 0:
             raise ValueError(
@@ -1028,6 +1034,7 @@ def _gen_value_reinforce_loop(
     progress_lock: threading.Lock,
     validation_max_examples: int,
     validation_seed: int,
+    validation_prompt_holdout_fraction: float,
     validation_state: dict[str, Any],
     validation_lock: threading.Lock,
 ) -> None:
@@ -1059,7 +1066,7 @@ def _gen_value_reinforce_loop(
                 should_capture_validation = validation_max_examples > 0 and not validation_state["captured"]
                 if should_capture_validation:
                     validation_examples, pairs = value_model_utils.build_gen_value_validation_holdout(
-                        rollouts, validation_max_examples, validation_seed
+                        rollouts, validation_max_examples, validation_seed, validation_prompt_holdout_fraction
                     )
                     validation_state["examples"] = validation_examples
                     validation_state["captured"] = True
@@ -1673,6 +1680,7 @@ def main():
             gen_value_progress_lock,
             args.gen_value_validation_max_examples,
             args.seed,
+            args.gen_value_validation_prompt_holdout_fraction,
             gen_value_validation_state,
             gen_value_validation_lock,
         )

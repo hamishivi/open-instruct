@@ -763,7 +763,7 @@ class TestValueLoss(unittest.TestCase):
         self.assertEqual(squared_error, 0.75**2)
         self.assertEqual(reward, 1.0 - 0.75**2)
 
-    def test_gen_value_validation_holdout_averages_initial_siblings_and_excludes_exact_pairs(self):
+    def test_gen_value_validation_holdout_averages_siblings_and_excludes_whole_trajectories(self):
         def pair(prompt_ids, outcome, used):
             return {
                 "request_output": SimpleNamespace(prompt_token_ids=prompt_ids),
@@ -784,7 +784,29 @@ class TestValueLoss(unittest.TestCase):
         self.assertEqual(len(initial), 1)
         self.assertEqual(initial[0]["target"], 0.5)
         self.assertEqual(len(examples), 3)
-        self.assertEqual(training_pairs, [middle])
+        self.assertEqual(training_pairs, [])
+
+    def test_gen_value_validation_holdout_keeps_nonheldout_prompt_groups_for_training(self):
+        def pair(prompt_ids, outcome, used):
+            return {
+                "request_output": SimpleNamespace(prompt_token_ids=prompt_ids),
+                "outcome": outcome,
+                "response_tokens_used": used,
+                "response_token_limit": 100,
+                "state_kind": "final_action" if used >= 90 else "segment_start",
+            }
+
+        rollouts = [
+            {"pairs": [pair([group_index, 0], 0.0, 0), pair([group_index, 1], 0.0, 95)]} for group_index in range(8)
+        ]
+
+        examples, training_pairs = build_gen_value_validation_holdout(rollouts, max_examples=16, seed=3)
+
+        initial = [example for example in examples if example["kind"] == "initial"]
+        self.assertEqual(len(initial), 1)
+        heldout_group = initial[0]["prompt_token_ids"][0]
+        self.assertEqual(len(training_pairs), 14)
+        self.assertTrue(all(pair_["request_output"].prompt_token_ids[0] != heldout_group for pair_ in training_pairs))
 
     def test_gen_value_validation_metrics_separate_terminal_failures(self):
         examples = [

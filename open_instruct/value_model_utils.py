@@ -310,56 +310,62 @@ def generative_value_reinforce_reward(outcome: float, prediction: float | None) 
 
 
 def build_gen_value_validation_holdout(
-    rollouts: list[dict[str, Any]], max_examples: int, seed: int = 0
+    rollouts: list[dict[str, Any]], max_examples: int, seed: int = 0, prompt_holdout_fraction: float = 0.125
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Hold out fixed generative-critic states from the first on-policy batch.
+    """Hold out fixed actor-prompt groups from the first on-policy batch.
 
     Initial states are grouped by their exact critic prompt and assigned the empirical
     success rate across sibling policy rollouts. Final-segment states retain their binary
-    observed outcome. Every selected prompt is removed from the REINFORCE pairs returned
-    to the caller, making repeated rescoring a held-out calibration diagnostic.
+    observed outcome. Every state from a selected actor-prompt group is removed from the
+    REINFORCE pairs returned to the caller, preventing trajectory-prefix leakage into the
+    repeated calibration diagnostic.
     """
+    if not 0.0 < prompt_holdout_fraction <= 1.0:
+        raise ValueError(f"prompt_holdout_fraction must be in (0, 1], got {prompt_holdout_fraction}.")
     all_pairs = [pair for rollout in rollouts for pair in rollout.get("pairs", [])]
     if max_examples <= 0 or not all_pairs:
         return [], all_pairs
 
-    initial_groups: dict[tuple[int, ...], list[dict[str, Any]]] = {}
-    final_candidates: list[dict[str, Any]] = []
+    rollout_groups: dict[tuple[int, ...], list[dict[str, Any]]] = {}
     for rollout in rollouts:
         pairs = rollout.get("pairs", [])
         if not pairs:
             continue
         first = pairs[0]
         prompt_ids = tuple(first["request_output"].prompt_token_ids)
-        initial_groups.setdefault(prompt_ids, []).append(first)
-        final_action = next((pair for pair in reversed(pairs) if pair.get("state_kind") == "final_action"), None)
-        if final_action is not None:
-            final_candidates.append(final_action)
-        elif len(pairs) > 1:
-            # Backward-compatible fallback for rollouts captured before explicit
-            # final-action states were added.
-            final_candidates.append(pairs[-1])
+        rollout_groups.setdefault(prompt_ids, []).append(rollout)
 
     rng = random.Random(seed)
-    grouped_initials = list(initial_groups.items())
-    rng.shuffle(grouped_initials)
-    # In the standard 32-prompt × 8-rollout setup this reserves all 32 initial
-    # states while leaving most of the validation budget for trajectory prefixes.
-    initial_budget = min(len(grouped_initials), max(1, max_examples // 4))
+    grouped_rollouts = list(rollout_groups.items())
+    rng.shuffle(grouped_rollouts)
+    holdout_group_count = min(
+        len(grouped_rollouts), max_examples, max(1, math.ceil(prompt_holdout_fraction * len(grouped_rollouts)))
+    )
+    heldout_groups = grouped_rollouts[:holdout_group_count]
+    heldout_rollout_ids = {id(rollout) for _, group in heldout_groups for rollout in group}
     validation_examples: list[dict[str, Any]] = []
-    heldout_pair_ids: set[int] = set()
-    for prompt_ids, group in grouped_initials[:initial_budget]:
-        outcomes = [float(pair["outcome"]) for pair in group]
+    final_candidates: list[dict[str, Any]] = []
+    for prompt_ids, group in heldout_groups:
+        first_pairs = [rollout["pairs"][0] for rollout in group]
+        outcomes = [float(pair["outcome"]) for pair in first_pairs]
         validation_examples.append(
             {
                 "prompt_token_ids": list(prompt_ids),
                 "target": sum(outcomes) / len(outcomes),
                 "kind": "initial",
                 "response_tokens_used": 0,
-                "response_token_limit": group[0].get("response_token_limit"),
+                "response_token_limit": first_pairs[0].get("response_token_limit"),
             }
         )
-        heldout_pair_ids.update(id(pair) for pair in group)
+        for rollout in group:
+            pairs = rollout["pairs"]
+            final_action = next((pair for pair in reversed(pairs) if pair.get("state_kind") == "final_action"), None)
+            if final_action is not None:
+                final_candidates.append(final_action)
+            elif len(pairs) > 1:
+                # Backward-compatible fallback for rollouts captured before explicit
+                # final-action states were added.
+                final_candidates.append(pairs[-1])
 
     remaining = max_examples - len(validation_examples)
     correct = [pair for pair in final_candidates if float(pair["outcome"]) > 0.5]
@@ -382,9 +388,10 @@ def build_gen_value_validation_holdout(
                 "response_token_limit": pair.get("response_token_limit"),
             }
         )
-        heldout_pair_ids.add(id(pair))
 
-    training_pairs = [pair for pair in all_pairs if id(pair) not in heldout_pair_ids]
+    training_pairs = [
+        pair for rollout in rollouts if id(rollout) not in heldout_rollout_ids for pair in rollout.get("pairs", [])
+    ]
     return validation_examples, training_pairs
 
 
