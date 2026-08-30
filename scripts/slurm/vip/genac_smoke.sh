@@ -14,6 +14,11 @@ REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." &&
 cd "${REPO_ROOT}"
 mkdir -p logs
 
+# Prepared container environments may be editable installs created from a
+# different worktree. Prefer the exact Slurm submission checkout so package
+# imports cannot silently mix source files across experiment snapshots.
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+
 export NCCL_CUMEM_ENABLE=0
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ALLOW_INSECURE_SERIALIZATION=1
