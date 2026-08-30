@@ -1093,7 +1093,8 @@ class PolicyTrainerRayProcess(RayProcess):
             # critic state could still be hundreds of actions from termination.
             # This is supervision/evaluation at an observed causal state, not an
             # EOS or response-length constraint on the actor.
-            if segment_starts[-1] == n_resp_sub - 1:
+            has_final_action_override = segment_starts[-1] != n_resp_sub - 1
+            if not has_final_action_override:
                 prompt_state_kinds[-1] = "final_action"
             else:
                 final_prefix_ids, final_response_tokens_used = value_model_utils.causal_final_action_prefix_token_ids(
@@ -1135,6 +1136,7 @@ class PolicyTrainerRayProcess(RayProcess):
                     "scores_start": scores_start,
                     "resp_shifted": resp_shifted,
                     "n_dropped_leading": n_resp_sub - int(valid_mask.sum().item()),
+                    "has_final_action_override": has_final_action_override,
                 }
             )
 
@@ -1206,6 +1208,11 @@ class PolicyTrainerRayProcess(RayProcess):
             # Each score was produced from the state before its segment's first
             # action, so carrying it forward is causal for every action below.
             values_flat = scores_t[idx]  # (n_resp_sub,)
+            if info.get("has_final_action_override", False):
+                # The extra score sees exactly the causal state before the last
+                # sampled action. Use it for that action only; applying it to
+                # earlier actions would leak future trajectory information.
+                values_flat[-1] = all_scores[start + len(boundaries)]
             resp_shifted = info["resp_shifted"]
             if resp_shifted is None or resp_shifted.numel() == 0:
                 continue

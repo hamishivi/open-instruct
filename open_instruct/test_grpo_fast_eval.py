@@ -97,7 +97,7 @@ class TestWarmupWindows(unittest.TestCase):
 
 
 class TestGenerativeValueBoundaryState(unittest.TestCase):
-    def test_final_action_probe_is_trained_but_not_used_to_baseline_prior_actions(self):
+    def test_final_action_probe_baselines_only_the_final_action(self):
         trainer_class = PolicyTrainerRayProcess.__ray_metadata__.modified_class
         trainer = object.__new__(trainer_class)
         trainer.args = SimpleNamespace(
@@ -133,7 +133,7 @@ class TestGenerativeValueBoundaryState(unittest.TestCase):
         ]
         values, training_pairs = trainer._finish_gen_value_scoring_request(request, request_outputs)
 
-        torch.testing.assert_close(values, torch.tensor([[0.0, 0.5, 0.5, 0.5, 0.5]]))
+        torch.testing.assert_close(values, torch.tensor([[0.0, 0.5, 0.5, 0.5, 0.0]]))
         self.assertEqual([pair["state_kind"] for pair in training_pairs], ["segment_start", "final_action"])
 
 
