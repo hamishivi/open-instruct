@@ -1035,7 +1035,7 @@ class PolicyTrainerRayProcess(RayProcess):
             first_resp_local = int(mask.long().argmax().item())
             problem_token_ids = ids[:first_resp_local].tolist()
             resp_token_ids = ids[mask].tolist()
-            problem_text = self.tokenizer.decode(problem_token_ids, skip_special_tokens=True)
+            problem_text = value_model_utils.decode_generative_value_problem(self.tokenizer, problem_token_ids)
 
             # Slice the pack's log-probs down to this sub-sequence's response tokens
             # (only needed for SAE segmentation).

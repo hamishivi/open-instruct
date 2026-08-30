@@ -1328,6 +1328,25 @@ def _build_rubric_context(ground_truth: str) -> str:
 _SCORE_RE = re.compile(r"<answer>\s*([-+]?[0-9]*\.?[0-9]+)\s*</answer>")
 
 
+def decode_generative_value_problem(
+    tokenizer: Any, prompt_token_ids: Sequence[int] | None, fallback_problem: str = ""
+) -> str:
+    """Recover the exact actor-prompt text used by online generative-value scoring.
+
+    Value-estimation parquet rows retain both the unformatted problem (for stable
+    problem identity) and the tokenized actor prompt (for exact critic inputs).
+    Online GenAC scores the latter after decoding it with special tokens removed,
+    so offline critic SFT and calibration must do the same rather than silently
+    substituting the plain problem string.
+    """
+    if prompt_token_ids is None:
+        return fallback_problem
+    token_ids = [int(token_id) for token_id in prompt_token_ids]
+    if not token_ids:
+        return fallback_problem
+    return tokenizer.decode(token_ids, skip_special_tokens=True)
+
+
 def build_generative_value_prompt(
     partial_response: str,
     conditioning: str,  # one of: "none", "gt", "correct_demo", "rollout_context"

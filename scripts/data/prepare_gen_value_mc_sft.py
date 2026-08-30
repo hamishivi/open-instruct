@@ -81,6 +81,11 @@ def build_mc_sft_examples(
         problem = str(row.get("problem", row.get("prompt", "")))
         if not problem:
             raise ValueError(f"Row {row_index} has no problem text.")
+        critic_problem = value_model_utils.decode_generative_value_problem(
+            tokenizer,
+            optional_sequence_as_list(row.get("prompt_token_ids")) or None,
+            fallback_problem=problem,
+        )
         ground_truth = str(row.get("ground_truth", ""))
         if gen_value_conditioning == "gt" and not ground_truth:
             raise ValueError(f"Row {row_index} has no ground truth for reference-answer conditioning.")
@@ -98,7 +103,7 @@ def build_mc_sft_examples(
                 partial_response,
                 conditioning=gen_value_conditioning,
                 ground_truth=ground_truth,
-                problem=problem,
+                problem=critic_problem,
                 actor_model_name=str(row.get("actor_model_name", "")) or None,
                 actor_success_rate=(
                     float(row["actor_success_rate"]) if row.get("actor_success_rate") is not None else None
@@ -131,6 +136,7 @@ def build_mc_sft_examples(
                     "trajectory_fraction": trajectory_fraction,
                     "num_continuations": num_continuations,
                     "problem": problem,
+                    "critic_problem": critic_problem,
                     "ground_truth": ground_truth,
                     "gen_value_conditioning": gen_value_conditioning,
                     "direct_mc_score_supervision": True,

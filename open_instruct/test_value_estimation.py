@@ -71,6 +71,30 @@ class TestValueEstimationStates(unittest.TestCase):
         self.assertEqual([example["response_tokens_used"] for example in repeated], [1, 3, 3, 5, 5, 5])
         self.assertEqual([example["horizon_repeat_index"] for example in repeated], [0, 0, 1, 0, 1, 2])
 
+    def test_mc_sft_uses_the_exact_decoded_actor_prompt_as_the_problem(self):
+        tokenizer = _FakeTokenizer()
+
+        examples = prepare_gen_value_mc_sft.build_mc_sft_examples(
+            [
+                {
+                    "problem": "Plain problem identity.",
+                    "prompt_token_ids": [1, 2, 3],
+                    "rollout_tokens": [10, 11],
+                    "probe_positions": [1],
+                    "mc_values": [0.25],
+                    "num_continuations": 16,
+                }
+            ],
+            tokenizer=tokenizer,
+            min_continuations=16,
+        )
+
+        self.assertIn("Problem:\n1:2:3\n\n", examples[0]["prompt"])
+        self.assertNotIn("Problem:\nPlain problem identity.\n\n", examples[0]["prompt"])
+        self.assertEqual(examples[0]["problem"], "Plain problem identity.")
+        self.assertEqual(examples[0]["critic_problem"], "1:2:3")
+        self.assertEqual(tokenizer.skip_special_tokens_calls, [True, False])
+
     def test_mc_sft_can_condition_on_the_reference_answer(self):
         examples = prepare_gen_value_mc_sft.build_mc_sft_examples(
             [

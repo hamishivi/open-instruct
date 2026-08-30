@@ -841,6 +841,10 @@ def _score_with_generative_value(df, cfg: ScoreDatasetConfig) -> list[list[float
     positions: list[tuple[int, int]] = []
     for idx, row in df.iterrows():
         rollout_tokens = list(row["rollout_tokens"])
+        prompt_token_ids = _optional_sequence_as_list(row.get("prompt_token_ids"))
+        critic_problem = value_model_utils.decode_generative_value_problem(
+            tokenizer, prompt_token_ids or None, fallback_problem=row.get("problem", row.get("prompt", ""))
+        )
         for p_idx, t in enumerate(row["probe_positions"]):
             # Online generative-value scoring preserves special response tokens
             # when decoding causal prefixes; use the identical representation in
@@ -853,7 +857,7 @@ def _score_with_generative_value(df, cfg: ScoreDatasetConfig) -> list[list[float
                 siblings=_optional_sequence_as_list(row.get("sibling_rollouts")),
                 score_min=cfg.gen_value_score_min,
                 score_max=cfg.gen_value_score_max,
-                problem=row.get("problem", row.get("prompt", "")),
+                problem=critic_problem,
                 actor_model_name=cfg.gen_value_actor_model_name or row.get("actor_model_name"),
                 actor_success_rate=(
                     cfg.gen_value_actor_success_rate
