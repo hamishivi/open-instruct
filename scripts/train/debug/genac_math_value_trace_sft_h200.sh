@@ -29,6 +29,11 @@ LEARNING_RATE=${LEARNING_RATE:-1e-6}
 NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS:-2}
 EXP_NAME=${EXP_NAME:-genac-math-value-teacher-sft}
 OUTPUT_DIR=${OUTPUT_DIR:-output/${EXP_NAME}}
+SAVE_MODEL_EACH_EPOCH=${SAVE_MODEL_EACH_EPOCH:-0}
+MODEL_CHECKPOINT_ARGS=()
+if [[ "${SAVE_MODEL_EACH_EPOCH}" == "1" ]]; then
+    MODEL_CHECKPOINT_ARGS+=(--save_model_each_epoch)
+fi
 
 accelerate launch \
     --mixed_precision bf16 \
@@ -54,6 +59,7 @@ accelerate launch \
     --dataset_skip_cache \
     --gradient_checkpointing \
     --packing \
+    "${MODEL_CHECKPOINT_ARGS[@]}" \
     --output_dir "${OUTPUT_DIR}" \
     --report_to wandb \
     --with_tracking \

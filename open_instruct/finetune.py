@@ -260,6 +260,13 @@ class FlatArguments:
             "help": "Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch."
         },
     )
+    save_model_each_epoch: bool = field(
+        default=False,
+        metadata={
+            "help": "Save a Hugging Face-loadable model snapshot at the end of every epoch. "
+            "Unlike checkpointing_steps, these snapshots omit optimizer state and are intended for evaluation."
+        },
+    )
     keep_last_n_checkpoints: int = field(
         default=3, metadata={"help": "How many checkpoints to keep in the output directory. -1 for all."}
     )
@@ -987,6 +994,13 @@ def main(args: FlatArguments, tc: TokenizerConfig):
                 f.write("COMPLETED")  # annoyingly, empty files arent uploaded by beaker.
             if accelerator.is_local_main_process:
                 clean_last_n_checkpoints(args.output_dir, args.keep_last_n_checkpoints)
+            accelerator.wait_for_everyone()
+
+        if args.save_model_each_epoch and args.output_dir is not None:
+            epoch_model_dir = os.path.join(args.output_dir, f"epoch_{epoch}_model")
+            save_with_accelerate(
+                accelerator, model, tokenizer, epoch_model_dir, args.use_lora, chat_template_name=tc.chat_template_name
+            )
             accelerator.wait_for_everyone()
 
     if args.output_dir is not None:
