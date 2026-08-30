@@ -462,9 +462,37 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
 # --------------------------------------------------------------------------------------------
 # score_dataset
 # --------------------------------------------------------------------------------------------
+def _average_ranks(values: Sequence[float]) -> np.ndarray:
+    """Return one-based ranks with tied values assigned their average rank."""
+    array = np.asarray(values, dtype=np.float64)
+    order = np.argsort(array, kind="stable")
+    ranks = np.empty(len(array), dtype=np.float64)
+    start = 0
+    while start < len(order):
+        end = start + 1
+        while end < len(order) and array[order[end]] == array[order[start]]:
+            end += 1
+        ranks[order[start:end]] = (start + 1 + end) / 2
+        start = end
+    return ranks
+
+
+def _pearson_correlation(left: Sequence[float], right: Sequence[float]) -> float:
+    left_array = np.asarray(left, dtype=np.float64)
+    right_array = np.asarray(right, dtype=np.float64)
+    if len(left_array) != len(right_array) or len(left_array) < 2:
+        return float("nan")
+    if np.ptp(left_array) == 0 or np.ptp(right_array) == 0:
+        return float("nan")
+    return float(np.corrcoef(left_array, right_array)[0, 1])
+
+
+def _spearman_correlation(left: Sequence[float], right: Sequence[float]) -> float:
+    return _pearson_correlation(_average_ranks(left), _average_ranks(right))
+
+
 def score_dataset(cfg: ScoreDatasetConfig) -> str:
     import pandas as pd  # noqa: PLC0415
-    from scipy.stats import pearsonr, spearmanr  # noqa: PLC0415
 
     # Accept either a local parquet path or a HuggingFace dataset name (org/repo).
     if os.path.exists(cfg.input_dataset_path):
@@ -558,11 +586,12 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
             metrics["mae"] = float(np.mean([abs(difference) for difference in diffs]))
             metrics["mse"] = float(np.mean([difference**2 for difference in diffs]))
         if len(parsed_preds) > 1:
-            try:
-                metrics["pearson"] = float(pearsonr(parsed_preds, parsed_mc)[0])
-                metrics["spearman"] = float(spearmanr(parsed_preds, parsed_mc).statistic)
-            except Exception:
-                pass
+            pearson = _pearson_correlation(parsed_preds, parsed_mc)
+            spearman = _spearman_correlation(parsed_preds, parsed_mc)
+            if np.isfinite(pearson):
+                metrics["pearson"] = pearson
+            if np.isfinite(spearman):
+                metrics["spearman"] = spearman
         # Calibration bins (deciles of predicted values).
         order = np.argsort(parsed_preds)
         bin_size = max(1, len(order) // 10)

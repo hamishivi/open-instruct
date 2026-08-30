@@ -1,5 +1,6 @@
 import argparse
 import dataclasses
+import math
 import unittest
 
 from open_instruct import value_estimation
@@ -73,6 +74,13 @@ class TestValueEstimationStates(unittest.TestCase):
         )
         self.assertEqual(len(positions), 4)
         self.assertEqual(positions[-1], 7999)
+
+    def test_numpy_correlations_do_not_require_scipy(self):
+        self.assertAlmostEqual(value_estimation._pearson_correlation([1, 2, 3], [2, 4, 6]), 1.0)
+        self.assertAlmostEqual(value_estimation._spearman_correlation([1, 2, 2, 3], [3, 2, 2, 1]), -1.0)
+
+    def test_constant_correlation_is_not_finite(self):
+        self.assertTrue(math.isnan(value_estimation._pearson_correlation([1, 1], [0, 1])))
 
 
 if __name__ == "__main__":
