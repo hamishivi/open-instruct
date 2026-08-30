@@ -107,4 +107,6 @@ python open_instruct/grpo_fast_genvalue.py \
     --gen_value_learning_rate 1e-6 \
     --gen_value_reinforce_coef 1.0 \
     --gen_value_sync_freq 5 \
+    --gen_value_validation_freq 25 \
+    --gen_value_validation_max_examples 128 \
     "$@"

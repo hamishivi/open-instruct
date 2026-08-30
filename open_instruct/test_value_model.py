@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -40,11 +41,13 @@ from open_instruct.value_model_utils import (
     balanced_accumulation_group_ids,
     bounded_value_prediction,
     build_conditioning_text,
+    build_gen_value_validation_holdout,
     build_generative_value_prompt,
     causal_segment_start_prefix_token_ids,
     causal_value_mask,
     compute_value_loss,
     flatten_gen_value_pack,
+    gen_value_validation_metrics,
     generative_value_reinforce_reward,
     grouped_token_counts,
     is_postfix_template,
@@ -718,6 +721,43 @@ class TestValueLoss(unittest.TestCase):
 
         self.assertEqual(squared_error, 0.75**2)
         self.assertEqual(reward, 1.0 - 0.75**2)
+
+    def test_gen_value_validation_holdout_averages_initial_siblings_and_excludes_exact_pairs(self):
+        def pair(prompt_ids, outcome, used):
+            return {
+                "request_output": SimpleNamespace(prompt_token_ids=prompt_ids),
+                "outcome": outcome,
+                "response_tokens_used": used,
+                "response_token_limit": 100,
+            }
+
+        a0, a1 = pair([1, 2], 0.0, 0), pair([1, 3], 0.0, 90)
+        b0, b1 = pair([1, 2], 1.0, 0), pair([1, 4], 1.0, 95)
+        middle = pair([9], 0.0, 50)
+        examples, training_pairs = build_gen_value_validation_holdout(
+            [{"pairs": [a0, middle, a1]}, {"pairs": [b0, b1]}], max_examples=3, seed=1
+        )
+
+        initial = [example for example in examples if example["kind"] == "initial"]
+        self.assertEqual(len(initial), 1)
+        self.assertEqual(initial[0]["target"], 0.5)
+        self.assertEqual(len(examples), 3)
+        self.assertEqual(training_pairs, [middle])
+
+    def test_gen_value_validation_metrics_separate_terminal_failures(self):
+        examples = [
+            {"kind": "initial", "target": 0.25, "response_tokens_used": 0, "response_token_limit": 1000},
+            {"kind": "final_segment", "target": 0.0, "response_tokens_used": 950, "response_token_limit": 1000},
+            {"kind": "final_segment", "target": 1.0, "response_tokens_used": 900, "response_token_limit": 1000},
+        ]
+
+        metrics = gen_value_validation_metrics(examples, [0.5, 0.4, None])
+
+        self.assertAlmostEqual(metrics["gen_value/validation_parse_rate"], 2 / 3)
+        self.assertAlmostEqual(metrics["gen_value/validation_mse"], (0.25**2 + 0.4**2) / 2)
+        self.assertAlmostEqual(metrics["gen_value/validation_penalized_mse"], (0.25**2 + 0.4**2 + 1.0) / 3)
+        self.assertEqual(metrics["gen_value/validation_final_incorrect_v_hat_mean"], 0.4)
+        self.assertEqual(metrics["gen_value/validation_near_horizon_incorrect_v_hat_mean"], 0.4)
 
     def test_classification_loss_preserves_continuous_targets(self):
         probabilities = torch.tensor([[[0.75, 0.25], [0.25, 0.75]]])

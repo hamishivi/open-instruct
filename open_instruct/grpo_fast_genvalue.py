@@ -591,6 +591,10 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
     # How often (in critic optimizer updates) to publish gen-value weights to vLLM.
     # Set to 0 to keep the serving critic frozen while its trainer continues updating.
     gen_value_sync_freq: int = 1
+    # Fixed held-out states captured from the first on-policy batch and excluded from
+    # its REINFORCE update. Rescore them at critic version 0 and each frequency multiple.
+    gen_value_validation_freq: int = 0
+    gen_value_validation_max_examples: int = 0
 
     def __post_init__(self):
         super().__post_init__()
@@ -638,6 +642,17 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
             raise ValueError(f"--gen_value_batch_size must be > 0, got {self.gen_value_batch_size}.")
         if self.gen_value_sync_freq < 0:
             raise ValueError(f"--gen_value_sync_freq must be >= 0, got {self.gen_value_sync_freq}.")
+        if self.gen_value_validation_freq < 0:
+            raise ValueError(f"--gen_value_validation_freq must be >= 0, got {self.gen_value_validation_freq}.")
+        if self.gen_value_validation_max_examples < 0:
+            raise ValueError(
+                f"--gen_value_validation_max_examples must be >= 0, got {self.gen_value_validation_max_examples}."
+            )
+        if (self.gen_value_validation_freq == 0) != (self.gen_value_validation_max_examples == 0):
+            raise ValueError(
+                "--gen_value_validation_freq and --gen_value_validation_max_examples must either both be zero "
+                "or both be positive."
+            )
         if self.gen_value_conditioning not in value_model_utils.GEN_VALUE_CONDITIONING_TYPES:
             raise ValueError(
                 f"--gen_value_conditioning must be one of "
@@ -934,6 +949,10 @@ def _gen_value_reinforce_loop(
     metrics_Q: Queue,
     progress_state: dict[str, Any],
     progress_lock: threading.Lock,
+    validation_max_examples: int,
+    validation_seed: int,
+    validation_state: dict[str, Any],
+    validation_lock: threading.Lock,
 ) -> None:
     """Pipe queued rollouts into fixed-size critic batches and update asynchronously."""
     logger.info("[GenValue] asynchronous critic trainer started.")
@@ -958,7 +977,23 @@ def _gen_value_reinforce_loop(
             rollouts = [pending_rollouts.popleft() for _ in range(batch_size)]
             trained_rollouts += len(rollouts)
 
-            pairs = [pair for rollout in rollouts for pair in rollout["pairs"]]
+            capture_metrics: dict[str, float] = {}
+            with validation_lock:
+                should_capture_validation = validation_max_examples > 0 and not validation_state["captured"]
+                if should_capture_validation:
+                    validation_examples, pairs = value_model_utils.build_gen_value_validation_holdout(
+                        rollouts, validation_max_examples, validation_seed
+                    )
+                    validation_state["examples"] = validation_examples
+                    validation_state["captured"] = True
+                    capture_metrics = {
+                        "gen_value/validation_examples": float(len(validation_examples)),
+                        "gen_value/validation_heldout_pairs": float(
+                            sum(len(rollout["pairs"]) for rollout in rollouts) - len(pairs)
+                        ),
+                    }
+                else:
+                    pairs = [pair for rollout in rollouts for pair in rollout["pairs"]]
             policy_training_steps = [int(rollout["policy_training_step"]) for rollout in rollouts]
             source_versions = [int(rollout["critic_version"]) for rollout in rollouts]
             batch_sequence_tokens = sum(
@@ -1013,6 +1048,7 @@ def _gen_value_reinforce_loop(
                     "gen_value/serving_version_lag": max(critic_version - synced_version, 0),
                 }
             )
+            metrics.update(capture_metrics)
             _put_gen_value_metrics(metrics_Q, metrics, "REINFORCE")
             logger.debug("[GenValue] REINFORCE step: %s", metrics)
 
@@ -1234,6 +1270,9 @@ def main():
         utils.ensure_hf_repo_cached(gen_value_model_path, revision=gen_value_model_revision)
     if gen_value_tokenizer_path != tc.tokenizer_name_or_path or gen_value_tokenizer_revision != tc.tokenizer_revision:
         utils.ensure_hf_repo_cached(gen_value_tokenizer_path, revision=gen_value_tokenizer_revision)
+    gen_value_tokenizer = AutoTokenizer.from_pretrained(
+        gen_value_tokenizer_path, revision=gen_value_tokenizer_revision
+    )
 
     # ── Step 3: create policy model, optimizer, and policy vLLM pool ──────────
     num_eval_prompts = len(eval_dataset) if eval_dataset is not None else 0
@@ -1516,6 +1555,8 @@ def main():
         "admitted_rollouts": 0,
         "trained_rollouts": 0,
     }
+    gen_value_validation_lock = threading.Lock()
+    gen_value_validation_state: dict[str, Any] = {"captured": False, "examples": []}
     gen_value_scoring_future: futures.Future | None = None
     gen_value_reinforce_future: futures.Future | None = None
 
@@ -1551,6 +1592,10 @@ def main():
             gen_value_metrics_Q,
             gen_value_progress_state,
             gen_value_progress_lock,
+            args.gen_value_validation_max_examples,
+            args.seed,
+            gen_value_validation_state,
+            gen_value_validation_lock,
         )
 
     # Wrap one_training_step to expose asynchronous critic progress and trigger diagnostics.
@@ -1575,6 +1620,7 @@ def main():
         _raise_if_gen_value_background_failed()
 
     last_gen_value_engine_health_check = 0.0
+    last_gen_value_validation_version: int | None = None
 
     def _one_training_step_with_genvalue(*step_args, **step_kwargs):
         _raise_if_gen_value_background_failed()
@@ -1597,6 +1643,7 @@ def main():
         existing_post_training_metrics_callback = step_kwargs.get("post_training_metrics_callback")
 
         def _critic_post_training_metrics_callback() -> dict[str, Any]:
+            nonlocal last_gen_value_validation_version
             # Drain critic updates exactly once per policy step. A second earlier drain
             # can split two updates across dictionaries and let the later one overwrite
             # the first when one_training_step merges its callback results.
@@ -1668,6 +1715,37 @@ def main():
                             ),
                         }
                     )
+                if args.gen_value_validation_freq > 0:
+                    with gen_value_validation_lock:
+                        validation_examples = list(gen_value_validation_state["examples"])
+                    if last_gen_value_validation_version is None:
+                        # The held-out buffer is captured by the first critic batch while
+                        # serving remains on version zero until the first publication.
+                        should_validate = bool(validation_examples)
+                    else:
+                        next_validation_version = (
+                            last_gen_value_validation_version // args.gen_value_validation_freq + 1
+                        ) * args.gen_value_validation_freq
+                        should_validate = bool(validation_examples) and synced_version >= next_validation_version
+                    if should_validate:
+                        prompts = [
+                            gen_value_tokenizer.decode(example["prompt_token_ids"], skip_special_tokens=False)
+                            for example in validation_examples
+                        ]
+                        with gen_value_engines_lock:
+                            predictions, _ = score_partial_rollout_batch(
+                                gen_value_vllm_engines,
+                                prompts,
+                                max_new_tokens=args.gen_value_max_new_tokens,
+                                temperature=args.gen_value_temperature,
+                                score_min=args.gen_value_score_min,
+                                score_max=args.gen_value_score_max,
+                            )
+                        progress_metrics.update(
+                            value_model_utils.gen_value_validation_metrics(validation_examples, predictions)
+                        )
+                        progress_metrics["gen_value/validation_version"] = float(synced_version)
+                        last_gen_value_validation_version = synced_version
             critic_metrics = _drain_gen_value_metrics(gen_value_metrics_Q)
             critic_metrics.update(progress_metrics)
             return critic_metrics

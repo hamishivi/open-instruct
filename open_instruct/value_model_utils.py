@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import re
 from collections.abc import Sequence
 from typing import Any, overload
@@ -305,6 +306,156 @@ def generative_value_reinforce_reward(outcome: float, prediction: float | None) 
         return 0.0, None
     squared_error = (outcome - prediction) ** 2
     return 1.0 - squared_error, squared_error
+
+
+def build_gen_value_validation_holdout(
+    rollouts: list[dict[str, Any]], max_examples: int, seed: int = 0
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Hold out fixed generative-critic states from the first on-policy batch.
+
+    Initial states are grouped by their exact critic prompt and assigned the empirical
+    success rate across sibling policy rollouts. Final-segment states retain their binary
+    observed outcome. Every selected prompt is removed from the REINFORCE pairs returned
+    to the caller, making repeated rescoring a held-out calibration diagnostic.
+    """
+    all_pairs = [pair for rollout in rollouts for pair in rollout.get("pairs", [])]
+    if max_examples <= 0 or not all_pairs:
+        return [], all_pairs
+
+    initial_groups: dict[tuple[int, ...], list[dict[str, Any]]] = {}
+    final_candidates: list[dict[str, Any]] = []
+    for rollout in rollouts:
+        pairs = rollout.get("pairs", [])
+        if not pairs:
+            continue
+        first = pairs[0]
+        prompt_ids = tuple(first["request_output"].prompt_token_ids)
+        initial_groups.setdefault(prompt_ids, []).append(first)
+        if len(pairs) > 1:
+            final_candidates.append(pairs[-1])
+
+    rng = random.Random(seed)
+    grouped_initials = list(initial_groups.items())
+    rng.shuffle(grouped_initials)
+    # In the standard 32-prompt × 8-rollout setup this reserves all 32 initial
+    # states while leaving most of the validation budget for trajectory prefixes.
+    initial_budget = min(len(grouped_initials), max(1, max_examples // 4))
+    validation_examples: list[dict[str, Any]] = []
+    heldout_pair_ids: set[int] = set()
+    for prompt_ids, group in grouped_initials[:initial_budget]:
+        outcomes = [float(pair["outcome"]) for pair in group]
+        validation_examples.append(
+            {
+                "prompt_token_ids": list(prompt_ids),
+                "target": sum(outcomes) / len(outcomes),
+                "kind": "initial",
+                "response_tokens_used": 0,
+                "response_token_limit": group[0].get("response_token_limit"),
+            }
+        )
+        heldout_pair_ids.update(id(pair) for pair in group)
+
+    remaining = max_examples - len(validation_examples)
+    correct = [pair for pair in final_candidates if float(pair["outcome"]) > 0.5]
+    incorrect = [pair for pair in final_candidates if float(pair["outcome"]) <= 0.5]
+    rng.shuffle(correct)
+    rng.shuffle(incorrect)
+    selected_correct = correct[: min(len(correct), remaining // 2)]
+    selected_incorrect = incorrect[: remaining - len(selected_correct)]
+    selected = selected_correct + selected_incorrect
+    if len(selected) < remaining:
+        selected.extend(correct[len(selected_correct) : len(selected_correct) + remaining - len(selected)])
+
+    for pair in selected:
+        validation_examples.append(
+            {
+                "prompt_token_ids": list(pair["request_output"].prompt_token_ids),
+                "target": float(pair["outcome"]),
+                "kind": "final_segment",
+                "response_tokens_used": pair.get("response_tokens_used"),
+                "response_token_limit": pair.get("response_token_limit"),
+            }
+        )
+        heldout_pair_ids.add(id(pair))
+
+    training_pairs = [pair for pair in all_pairs if id(pair) not in heldout_pair_ids]
+    return validation_examples, training_pairs
+
+
+def gen_value_validation_metrics(
+    examples: list[dict[str, Any]], predictions: Sequence[float | None]
+) -> dict[str, float]:
+    """Compute held-out calibration metrics for fixed generative-critic states."""
+    if len(examples) != len(predictions):
+        raise ValueError(
+            f"Validation examples and predictions differ in length ({len(examples)} != {len(predictions)})."
+        )
+    if not examples:
+        return {}
+
+    parsed = [
+        (example, float(prediction)) for example, prediction in zip(examples, predictions) if prediction is not None
+    ]
+    metrics: dict[str, float] = {
+        "gen_value/validation_examples": float(len(examples)),
+        "gen_value/validation_parse_rate": len(parsed) / len(examples),
+        # Parse failure is maximally bad here, rather than being mistaken for a prediction of zero.
+        "gen_value/validation_penalized_mse": sum(
+            1.0 if prediction is None else (float(example["target"]) - float(prediction)) ** 2
+            for example, prediction in zip(examples, predictions)
+        )
+        / len(examples),
+        "gen_value/validation_target_mean": sum(float(example["target"]) for example in examples) / len(examples),
+    }
+    if parsed:
+        metrics["gen_value/validation_mse"] = sum(
+            (float(example["target"]) - prediction) ** 2 for example, prediction in parsed
+        ) / len(parsed)
+        metrics["gen_value/validation_v_hat_mean"] = sum(prediction for _, prediction in parsed) / len(parsed)
+
+    def add_group(prefix: str, rows: list[tuple[dict[str, Any], float]]) -> None:
+        if not rows:
+            return
+        metrics[f"gen_value/validation_{prefix}_examples"] = float(len(rows))
+        metrics[f"gen_value/validation_{prefix}_v_hat_mean"] = sum(prediction for _, prediction in rows) / len(rows)
+        metrics[f"gen_value/validation_{prefix}_target_mean"] = sum(
+            float(example["target"]) for example, _ in rows
+        ) / len(rows)
+        metrics[f"gen_value/validation_{prefix}_mse"] = sum(
+            (float(example["target"]) - prediction) ** 2 for example, prediction in rows
+        ) / len(rows)
+
+    initial = [(example, prediction) for example, prediction in parsed if example["kind"] == "initial"]
+    final_correct = [
+        (example, prediction)
+        for example, prediction in parsed
+        if example["kind"] == "final_segment" and float(example["target"]) > 0.5
+    ]
+    final_incorrect = [
+        (example, prediction)
+        for example, prediction in parsed
+        if example["kind"] == "final_segment" and float(example["target"]) <= 0.5
+    ]
+    near_horizon_incorrect = []
+    for example, prediction in final_incorrect:
+        used = example.get("response_tokens_used")
+        limit = example.get("response_token_limit")
+        if used is None or limit is None:
+            continue
+        threshold = max(512, math.ceil(0.1 * int(limit)))
+        if int(limit) - int(used) <= threshold:
+            near_horizon_incorrect.append((example, prediction))
+
+    add_group("initial", initial)
+    add_group("final_correct", final_correct)
+    add_group("final_incorrect", final_incorrect)
+    add_group("near_horizon_incorrect", near_horizon_incorrect)
+    if final_correct and final_incorrect:
+        metrics["gen_value/validation_final_value_gap"] = (
+            metrics["gen_value/validation_final_correct_v_hat_mean"]
+            - metrics["gen_value/validation_final_incorrect_v_hat_mean"]
+        )
+    return metrics
 
 
 def pack_gen_value_examples(examples: list[dict[str, Any]], target_tokens: int) -> list[list[dict[str, Any]]]:
