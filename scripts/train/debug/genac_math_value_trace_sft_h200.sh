@@ -18,7 +18,8 @@ AUDIT_ARGS=("${TRACE_JSONL}" --min_examples "${MIN_TRACE_EXAMPLES}")
 if [[ "${ALLOW_GROUND_TRUTH_CONDITIONING}" == "1" ]]; then
     AUDIT_ARGS+=(--allow_ground_truth_conditioning)
 fi
-uv run python scripts/data/synthesize_gen_value_sft.py audit "${AUDIT_ARGS[@]}"
+PYTHON_EXECUTABLE=${PYTHON_EXECUTABLE:-python}
+"${PYTHON_EXECUTABLE}" scripts/data/synthesize_gen_value_sft.py audit "${AUDIT_ARGS[@]}"
 
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-4B-Base}
 NUM_GPUS=${NUM_GPUS:-4}
