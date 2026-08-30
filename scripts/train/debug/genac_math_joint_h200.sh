@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Joint 300-step actor/critic run using a separately validated generative critic.
-# The critic path must be the final `gen_value_model` directory produced by
-# genac_math_value_pretrain_h200.sh.
+# Joint actor/critic run using the paired scalar and generative critics produced
+# by genac_math_value_pretrain_h200.sh.  The scalar value head is required: GAE
+# consumes it directly, so silently reinitializing it would discard half of the
+# value-pretraining stage even when the generative critic was restored correctly.
 #
 # GPU layout: one learner, one policy vLLM, one critic vLLM, one critic trainer.
-# total_episodes = 300 joint steps * 32 prompts * 8 samples = 76,800
+# By default total_episodes = 300 joint steps * 32 prompts * 8 samples = 76,800.
+# Optional critic-only warmup steps are added before those 300 policy updates;
+# they do not reduce the requested number of joint-training steps.
 # Two half-rate actor epochs make DAPO clipping active on the second pass while
 # keeping the nominal per-rollout update scale close to one 1e-6 pass.
 # Continue the replay-safe, outcome-stratified leave-one-out critic objective
@@ -17,6 +20,15 @@ if [[ -z "${GEN_VALUE_MODEL_PATH:-}" ]]; then
 fi
 if [[ ! -d "${GEN_VALUE_MODEL_PATH}" ]]; then
     echo "ERROR: GEN_VALUE_MODEL_PATH does not exist: ${GEN_VALUE_MODEL_PATH}" >&2
+    exit 1
+fi
+
+# A normal value-pretraining export stores the two loadable artifacts as sibling
+# directories: `gen_value_model/` and `value_model/value_model.bin`.
+VALUE_MODEL_CHECKPOINT_PATH="${VALUE_MODEL_CHECKPOINT_PATH:-$(dirname "${GEN_VALUE_MODEL_PATH}")/value_model}"
+if [[ ! -f "${VALUE_MODEL_CHECKPOINT_PATH}/value_model.bin" ]]; then
+    echo "ERROR: pretrained scalar value model does not exist: ${VALUE_MODEL_CHECKPOINT_PATH}/value_model.bin" >&2
+    echo "Set VALUE_MODEL_CHECKPOINT_PATH to the value_model directory from value pretraining." >&2
     exit 1
 fi
 
@@ -50,6 +62,21 @@ RUN_OUTPUT_DIR="${RUN_OUTPUT_DIR:-${PWD}/outputs/${EXP_NAME}}"
 CHECKPOINT_STATE_DIR="${CHECKPOINT_STATE_DIR:-${RUN_OUTPUT_DIR}/checkpoint_states}"
 GEN_VALUE_CONDITIONING="${GEN_VALUE_CONDITIONING:-none}"
 GEN_VALUE_REINFORCE_BASELINE="${GEN_VALUE_REINFORCE_BASELINE:-leave_one_out_by_outcome}"
+JOINT_TRAINING_STEPS="${JOINT_TRAINING_STEPS:-300}"
+VALUE_WARMUP_STEPS="${VALUE_WARMUP_STEPS:-0}"
+NUM_UNIQUE_PROMPTS_ROLLOUT=32
+NUM_SAMPLES_PER_PROMPT_ROLLOUT=8
+
+if [[ ! "${JOINT_TRAINING_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: JOINT_TRAINING_STEPS must be at least 1" >&2
+    exit 1
+fi
+if [[ ! "${VALUE_WARMUP_STEPS}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: VALUE_WARMUP_STEPS must be a nonnegative integer" >&2
+    exit 1
+fi
+TOTAL_TRAINING_STEPS=$((VALUE_WARMUP_STEPS + JOINT_TRAINING_STEPS))
+TOTAL_EPISODES=$((TOTAL_TRAINING_STEPS * NUM_UNIQUE_PROMPTS_ROLLOUT * NUM_SAMPLES_PER_PROMPT_ROLLOUT))
 
 python open_instruct/grpo_fast_genvalue.py \
     --exp_name "${EXP_NAME}" \
@@ -64,8 +91,8 @@ python open_instruct/grpo_fast_genvalue.py \
     --response_length 8192 \
     --pack_length 10240 \
     --per_device_train_batch_size 1 \
-    --num_unique_prompts_rollout 32 \
-    --num_samples_per_prompt_rollout 8 \
+    --num_unique_prompts_rollout "${NUM_UNIQUE_PROMPTS_ROLLOUT}" \
+    --num_samples_per_prompt_rollout "${NUM_SAMPLES_PER_PROMPT_ROLLOUT}" \
     --active_sampling false \
     --filter_zero_std_samples false \
     --model_name_or_path Qwen/Qwen3-4B-Base \
@@ -83,7 +110,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --learning_rate 5e-7 \
     --weight_decay 0.01 \
     --lr_scheduler_type constant \
-    --total_episodes 76800 \
+    --total_episodes "${TOTAL_EPISODES}" \
     --num_epochs 2 \
     --num_mini_batches 1 \
     --deepspeed_stage 3 \
@@ -108,7 +135,8 @@ python open_instruct/grpo_fast_genvalue.py \
     --with_tracking \
     --push_to_hub false \
     --use_value_model \
-    --value_warmup_steps 0 \
+    --init_value_from_pretrained_checkpoint "${VALUE_MODEL_CHECKPOINT_PATH}" \
+    --value_warmup_steps "${VALUE_WARMUP_STEPS}" \
     --gae_lambda 1.0 \
     --gamma 1.0 \
     --use_sae \
