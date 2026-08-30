@@ -99,7 +99,9 @@ def build_mc_sft_examples(
             prompts_seen.add(prompt)
             score = quantize_mc_value(mc_value, score_max=score_max)
             state_kind = "final_action" if probe_position == len(rollout_tokens) - 1 else "segment_start"
-            trajectory_fraction = probe_position / max(len(rollout_tokens), 1)
+            # Match online critic metadata: zero at the first action and one at
+            # the causal state immediately before the sampled final action.
+            trajectory_fraction = probe_position / max(len(rollout_tokens) - 1, 1)
             examples.append(
                 {
                     "prompt": prompt,

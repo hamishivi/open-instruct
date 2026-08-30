@@ -45,7 +45,7 @@ class TestValueEstimationStates(unittest.TestCase):
         self.assertIn("<rollout>10</rollout>", examples[0]["prompt"])
         self.assertIn("<rollout>10:11</rollout>", examples[1]["prompt"])
         self.assertTrue(all(example["direct_mc_score_supervision"] for example in examples))
-        self.assertEqual([example["trajectory_fraction"] for example in examples], [1 / 3, 2 / 3])
+        self.assertEqual([example["trajectory_fraction"] for example in examples], [0.5, 1.0])
         self.assertEqual(tokenizer.skip_special_tokens_calls, [False, False])
 
     def test_mc_sft_can_upweight_late_and_final_states(self):
