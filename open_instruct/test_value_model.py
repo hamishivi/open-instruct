@@ -808,6 +808,38 @@ class TestValueLoss(unittest.TestCase):
         self.assertEqual(len(training_pairs), 14)
         self.assertTrue(all(pair_["request_output"].prompt_token_ids[0] != heldout_group for pair_ in training_pairs))
 
+    def test_gen_value_validation_holdout_covers_trajectory_prefixes_and_final_action(self):
+        def pair(prompt_ids, outcome, used, kind="segment_start"):
+            return {
+                "request_output": SimpleNamespace(prompt_token_ids=prompt_ids),
+                "outcome": outcome,
+                "response_tokens_used": used,
+                "response_token_limit": 100,
+                "state_kind": kind,
+            }
+
+        pairs = [
+            pair([1, 0], 0.0, 0),
+            pair([1, 1], 0.0, 20),
+            pair([1, 2], 0.0, 45),
+            pair([1, 3], 0.0, 70),
+            pair([1, 4], 0.0, 95, "final_action"),
+        ]
+
+        examples, training_pairs = build_gen_value_validation_holdout([{"pairs": pairs}], max_examples=8, seed=2)
+
+        self.assertEqual(training_pairs, [])
+        self.assertEqual([example["kind"] for example in examples].count("initial"), 1)
+        self.assertEqual([example["kind"] for example in examples].count("segment_start"), 3)
+        self.assertEqual([example["kind"] for example in examples].count("final_action"), 1)
+        self.assertEqual(
+            sorted(example["response_tokens_used"] for example in examples if example["kind"] == "segment_start"),
+            [20, 45, 70],
+        )
+        self.assertEqual(
+            [example["trajectory_fraction"] for example in examples if example["kind"] == "final_action"], [1.0]
+        )
+
     def test_gen_value_validation_metrics_separate_terminal_failures(self):
         examples = [
             {"kind": "initial", "target": 0.25, "response_tokens_used": 0, "response_token_limit": 1000},
@@ -823,6 +855,20 @@ class TestValueLoss(unittest.TestCase):
         self.assertEqual(metrics["gen_value/validation_final_incorrect_v_hat_mean"], 0.4)
         self.assertEqual(metrics["gen_value/validation_final_action_incorrect_v_hat_mean"], 0.4)
         self.assertEqual(metrics["gen_value/validation_near_horizon_incorrect_v_hat_mean"], 0.4)
+
+    def test_gen_value_validation_metrics_measure_prefix_ranking_and_near_horizon_failures(self):
+        examples = [
+            {"kind": "segment_start", "target": 1.0, "response_tokens_used": 4000, "response_token_limit": 8192},
+            {"kind": "segment_start", "target": 0.0, "response_tokens_used": 5000, "response_token_limit": 8192},
+            {"kind": "segment_start", "target": 0.0, "response_tokens_used": 8000, "response_token_limit": 8192},
+        ]
+
+        metrics = gen_value_validation_metrics(examples, [0.8, 0.3, 0.1])
+
+        self.assertAlmostEqual(metrics["gen_value/validation_prefix_correct_v_hat_mean"], 0.8)
+        self.assertAlmostEqual(metrics["gen_value/validation_prefix_incorrect_v_hat_mean"], 0.2)
+        self.assertAlmostEqual(metrics["gen_value/validation_prefix_value_gap"], 0.6)
+        self.assertAlmostEqual(metrics["gen_value/validation_near_horizon_incorrect_v_hat_mean"], 0.1)
 
     def test_gen_value_validation_snapshot_preserves_inspectable_outputs(self):
         examples = [

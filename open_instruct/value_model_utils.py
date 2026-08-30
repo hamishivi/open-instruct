@@ -315,10 +315,10 @@ def build_gen_value_validation_holdout(
     """Hold out fixed actor-prompt groups from the first on-policy batch.
 
     Initial states are grouped by their exact critic prompt and assigned the empirical
-    success rate across sibling policy rollouts. Final-segment states retain their binary
-    observed outcome. Every state from a selected actor-prompt group is removed from the
-    REINFORCE pairs returned to the caller, preventing trajectory-prefix leakage into the
-    repeated calibration diagnostic.
+    success rate across sibling policy rollouts. Spread-out trajectory prefixes and final
+    actions retain their binary observed outcome. Every state from a selected actor-prompt
+    group is removed from the REINFORCE pairs returned to the caller, preventing prefix
+    leakage into the repeated calibration diagnostic.
     """
     if not 0.0 < prompt_holdout_fraction <= 1.0:
         raise ValueError(f"prompt_holdout_fraction must be in (0, 1], got {prompt_holdout_fraction}.")
@@ -345,6 +345,8 @@ def build_gen_value_validation_holdout(
     heldout_rollout_ids = {id(rollout) for _, group in heldout_groups for rollout in group}
     validation_examples: list[dict[str, Any]] = []
     final_candidates: list[dict[str, Any]] = []
+    prefix_candidates: list[dict[str, Any]] = []
+    trajectory_fractions: dict[int, float] = {}
     for prompt_ids, group in heldout_groups:
         first_pairs = [rollout["pairs"][0] for rollout in group]
         outcomes = [float(pair["outcome"]) for pair in first_pairs]
@@ -365,18 +367,49 @@ def build_gen_value_validation_holdout(
             elif len(pairs) > 1:
                 # Backward-compatible fallback for rollouts captured before explicit
                 # final-action states were added.
-                final_candidates.append(pairs[-1])
+                final_action = pairs[-1]
+                final_candidates.append(final_action)
+            if final_action is None:
+                continue
+            trajectory_fractions[id(final_action)] = 1.0
+            final_tokens_used = max(int(final_action.get("response_tokens_used") or 0), 1)
+            eligible_prefixes = [
+                pair for pair in pairs[1:] if pair is not final_action and pair.get("response_tokens_used") is not None
+            ]
+            selected_prefix_ids: set[int] = set()
+            for target_fraction in (0.25, 0.5, 0.75):
+                if not eligible_prefixes:
+                    break
+                prefix = min(
+                    eligible_prefixes,
+                    key=lambda pair: abs(int(pair["response_tokens_used"]) / final_tokens_used - target_fraction),
+                )
+                if id(prefix) in selected_prefix_ids:
+                    continue
+                selected_prefix_ids.add(id(prefix))
+                prefix_candidates.append(prefix)
+                trajectory_fractions[id(prefix)] = min(int(prefix["response_tokens_used"]) / final_tokens_used, 1.0)
 
     remaining = max_examples - len(validation_examples)
-    correct = [pair for pair in final_candidates if float(pair["outcome"]) > 0.5]
-    incorrect = [pair for pair in final_candidates if float(pair["outcome"]) <= 0.5]
-    rng.shuffle(correct)
-    rng.shuffle(incorrect)
-    selected_correct = correct[: min(len(correct), remaining // 2)]
-    selected_incorrect = incorrect[: remaining - len(selected_correct)]
-    selected = selected_correct + selected_incorrect
-    if len(selected) < remaining:
-        selected.extend(correct[len(selected_correct) : len(selected_correct) + remaining - len(selected)])
+
+    def balanced_select(candidates: list[dict[str, Any]], count: int) -> list[dict[str, Any]]:
+        correct = [pair for pair in candidates if float(pair["outcome"]) > 0.5]
+        incorrect = [pair for pair in candidates if float(pair["outcome"]) <= 0.5]
+        rng.shuffle(correct)
+        rng.shuffle(incorrect)
+        selected_correct = correct[: min(len(correct), count // 2)]
+        selected_incorrect = incorrect[: min(len(incorrect), count - len(selected_correct))]
+        selected = selected_correct + selected_incorrect
+        leftovers = correct[len(selected_correct) :] + incorrect[len(selected_incorrect) :]
+        rng.shuffle(leftovers)
+        selected.extend(leftovers[: count - len(selected)])
+        return selected
+
+    # Preserve final-action coverage first; use the rest of the fixed budget for
+    # intermediate states spread across each held-out trajectory.
+    selected = balanced_select(final_candidates, min(len(final_candidates), remaining))
+    remaining -= len(selected)
+    selected.extend(balanced_select(prefix_candidates, remaining))
 
     for pair in selected:
         validation_examples.append(
@@ -386,6 +419,7 @@ def build_gen_value_validation_holdout(
                 "kind": pair.get("state_kind", "final_segment"),
                 "response_tokens_used": pair.get("response_tokens_used"),
                 "response_token_limit": pair.get("response_token_limit"),
+                "trajectory_fraction": trajectory_fractions.get(id(pair)),
             }
         )
 
@@ -460,8 +494,13 @@ def gen_value_validation_metrics(
         for example, prediction in parsed
         if example["kind"] == "final_action" and float(example["target"]) <= 0.5
     ]
+    prefixes = [(example, prediction) for example, prediction in parsed if example["kind"] == "segment_start"]
+    prefix_correct = [(example, prediction) for example, prediction in prefixes if float(example["target"]) > 0.5]
+    prefix_incorrect = [(example, prediction) for example, prediction in prefixes if float(example["target"]) <= 0.5]
     near_horizon_incorrect = []
-    for example, prediction in final_incorrect:
+    for example, prediction in parsed:
+        if example["kind"] == "initial" or float(example["target"]) > 0.5:
+            continue
         used = example.get("response_tokens_used")
         limit = example.get("response_token_limit")
         if used is None or limit is None:
@@ -475,11 +514,18 @@ def gen_value_validation_metrics(
     add_group("final_incorrect", final_incorrect)
     add_group("final_action_correct", final_action_correct)
     add_group("final_action_incorrect", final_action_incorrect)
+    add_group("prefix_correct", prefix_correct)
+    add_group("prefix_incorrect", prefix_incorrect)
     add_group("near_horizon_incorrect", near_horizon_incorrect)
     if final_correct and final_incorrect:
         metrics["gen_value/validation_final_value_gap"] = (
             metrics["gen_value/validation_final_correct_v_hat_mean"]
             - metrics["gen_value/validation_final_incorrect_v_hat_mean"]
+        )
+    if prefix_correct and prefix_incorrect:
+        metrics["gen_value/validation_prefix_value_gap"] = (
+            metrics["gen_value/validation_prefix_correct_v_hat_mean"]
+            - metrics["gen_value/validation_prefix_incorrect_v_hat_mean"]
         )
     return metrics
 
