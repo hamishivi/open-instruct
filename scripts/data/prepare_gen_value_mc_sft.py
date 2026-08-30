@@ -46,11 +46,21 @@ def quantize_mc_value(value: float, *, score_max: int = 10) -> int:
 
 
 def build_mc_sft_examples(
-    rows: Sequence[dict[str, Any]], *, tokenizer: Any, min_continuations: int, score_max: int = 10
+    rows: Sequence[dict[str, Any]],
+    *,
+    tokenizer: Any,
+    min_continuations: int,
+    score_max: int = 10,
+    gen_value_conditioning: str = "none",
 ) -> list[dict[str, Any]]:
     """Build prompt/completion examples from value-estimation parquet rows."""
     if min_continuations <= 0:
         raise ValueError(f"min_continuations must be positive, got {min_continuations}.")
+    if gen_value_conditioning not in {"none", "gt"}:
+        raise ValueError(
+            "Direct MC value SFT supports only unconditioned or reference-answer-conditioned prompts; "
+            f"got {gen_value_conditioning!r}."
+        )
 
     examples: list[dict[str, Any]] = []
     prompts_seen: set[str] = set()
@@ -71,6 +81,9 @@ def build_mc_sft_examples(
         problem = str(row.get("problem", row.get("prompt", "")))
         if not problem:
             raise ValueError(f"Row {row_index} has no problem text.")
+        ground_truth = str(row.get("ground_truth", ""))
+        if gen_value_conditioning == "gt" and not ground_truth:
+            raise ValueError(f"Row {row_index} has no ground truth for reference-answer conditioning.")
 
         for probe_position, mc_value in zip(probe_positions, mc_values):
             if not 0 <= probe_position <= len(rollout_tokens):
@@ -83,7 +96,8 @@ def build_mc_sft_examples(
             partial_response = tokenizer.decode(rollout_tokens[:probe_position], skip_special_tokens=False)
             prompt = value_model_utils.build_generative_value_prompt(
                 partial_response,
-                conditioning="none",
+                conditioning=gen_value_conditioning,
+                ground_truth=ground_truth,
                 problem=problem,
                 actor_model_name=str(row.get("actor_model_name", "")) or None,
                 actor_success_rate=(
@@ -117,6 +131,8 @@ def build_mc_sft_examples(
                     "trajectory_fraction": trajectory_fraction,
                     "num_continuations": num_continuations,
                     "problem": problem,
+                    "ground_truth": ground_truth,
+                    "gen_value_conditioning": gen_value_conditioning,
                     "direct_mc_score_supervision": True,
                 }
             )
@@ -186,6 +202,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_continuations", type=int, default=16)
     parser.add_argument("--min_examples", type=int, default=256)
     parser.add_argument("--score_max", type=int, default=10)
+    parser.add_argument("--gen_value_conditioning", choices=("none", "gt"), default="none")
     parser.add_argument("--final_action_repeat", type=int, default=1)
     parser.add_argument("--late_state_repeat", type=int, default=1)
     parser.add_argument("--late_state_fraction", type=float, default=0.75)
@@ -205,7 +222,11 @@ def main() -> None:
         raise ValueError(f"MC SFT input overlaps {len(overlaps)} held-out calibration problems.")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name_or_path)
     raw_examples = build_mc_sft_examples(
-        rows, tokenizer=tokenizer, min_continuations=args.min_continuations, score_max=args.score_max
+        rows,
+        tokenizer=tokenizer,
+        min_continuations=args.min_continuations,
+        score_max=args.score_max,
+        gen_value_conditioning=args.gen_value_conditioning,
     )
     if len(raw_examples) < args.min_examples:
         raise ValueError(f"MC SFT dataset has {len(raw_examples)} examples; at least {args.min_examples} required.")
@@ -229,6 +250,7 @@ def main() -> None:
                 "output": str(args.output),
                 "score_counts": score_counts,
                 "unique_problems": len({example["problem"] for example in examples}),
+                "gen_value_conditioning": args.gen_value_conditioning,
                 "final_action_examples": sum(example["state_kind"] == "final_action" for example in examples),
                 "late_state_examples": sum(
                     example["state_kind"] != "final_action"

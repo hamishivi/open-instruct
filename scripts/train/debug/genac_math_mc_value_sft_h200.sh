@@ -30,6 +30,7 @@ MIN_MC_EXAMPLES="${MIN_MC_EXAMPLES:-512}"
 FINAL_ACTION_REPEAT="${FINAL_ACTION_REPEAT:-4}"
 LATE_STATE_REPEAT="${LATE_STATE_REPEAT:-2}"
 LATE_STATE_FRACTION="${LATE_STATE_FRACTION:-0.75}"
+GEN_VALUE_CONDITIONING="${GEN_VALUE_CONDITIONING:-none}"
 
 "${PYTHON_EXECUTABLE}" scripts/data/prepare_gen_value_mc_sft.py \
     "${MC_VALUE_PARQUET}" \
@@ -38,6 +39,7 @@ LATE_STATE_FRACTION="${LATE_STATE_FRACTION:-0.75}"
     --exclude_problem_dataset_path "${HELDOUT_VALUE_PARQUET}" \
     --min_continuations "${MIN_CONTINUATIONS}" \
     --min_examples "${MIN_MC_EXAMPLES}" \
+    --gen_value_conditioning "${GEN_VALUE_CONDITIONING}" \
     --final_action_repeat "${FINAL_ACTION_REPEAT}" \
     --late_state_repeat "${LATE_STATE_REPEAT}" \
     --late_state_fraction "${LATE_STATE_FRACTION}"
@@ -50,6 +52,9 @@ export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-4}"
 export LEARNING_RATE="${LEARNING_RATE:-5e-7}"
 export NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-4}"
 export SAVE_MODEL_EACH_EPOCH="${SAVE_MODEL_EACH_EPOCH:-1}"
+if [[ "${GEN_VALUE_CONDITIONING}" == "gt" ]]; then
+    export ALLOW_GROUND_TRUTH_CONDITIONING=1
+fi
 export EXP_NAME="${EXP_NAME:-genac-math-value-direct-mc-sft}"
 export OUTPUT_DIR="${OUTPUT_DIR:-${PWD}/outputs/${EXP_NAME}}"
 

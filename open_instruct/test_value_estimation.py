@@ -71,6 +71,45 @@ class TestValueEstimationStates(unittest.TestCase):
         self.assertEqual([example["response_tokens_used"] for example in repeated], [1, 3, 3, 5, 5, 5])
         self.assertEqual([example["horizon_repeat_index"] for example in repeated], [0, 0, 1, 0, 1, 2])
 
+    def test_mc_sft_can_condition_on_the_reference_answer(self):
+        examples = prepare_gen_value_mc_sft.build_mc_sft_examples(
+            [
+                {
+                    "problem": "Compute the answer.",
+                    "ground_truth": "42",
+                    "rollout_tokens": [10, 11],
+                    "probe_positions": [1],
+                    "mc_values": [0.0],
+                    "num_continuations": 16,
+                }
+            ],
+            tokenizer=_FakeTokenizer(),
+            min_continuations=16,
+            gen_value_conditioning="gt",
+        )
+
+        self.assertIn("The correct answer is 42.", examples[0]["prompt"])
+        self.assertEqual(examples[0]["ground_truth"], "42")
+        self.assertEqual(examples[0]["gen_value_conditioning"], "gt")
+        self.assertTrue(synthesize_gen_value_sft.prompt_has_ground_truth_conditioning(examples[0]["prompt"]))
+
+    def test_mc_sft_rejects_missing_reference_answer(self):
+        with self.assertRaisesRegex(ValueError, "no ground truth"):
+            prepare_gen_value_mc_sft.build_mc_sft_examples(
+                [
+                    {
+                        "problem": "Compute the answer.",
+                        "rollout_tokens": [10],
+                        "probe_positions": [0],
+                        "mc_values": [0.0],
+                        "num_continuations": 16,
+                    }
+                ],
+                tokenizer=_FakeTokenizer(),
+                min_continuations=16,
+                gen_value_conditioning="gt",
+            )
+
     def test_mc_sft_rejects_invalid_horizon_repeat_configuration(self):
         with self.assertRaisesRegex(ValueError, "positive integers"):
             prepare_gen_value_mc_sft.repeat_examples_for_horizon(
