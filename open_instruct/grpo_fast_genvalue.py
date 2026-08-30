@@ -1733,7 +1733,7 @@ def main():
                             for example in validation_examples
                         ]
                         with gen_value_engines_lock:
-                            predictions, _ = score_partial_rollout_batch(
+                            predictions, generations = score_partial_rollout_batch(
                                 gen_value_vllm_engines,
                                 prompts,
                                 max_new_tokens=args.gen_value_max_new_tokens,
@@ -1741,6 +1741,14 @@ def main():
                                 score_min=args.gen_value_score_min,
                                 score_max=args.gen_value_score_max,
                             )
+                        snapshot_path = value_model_utils.write_gen_value_validation_snapshot(
+                            args.output_dir, synced_version, validation_examples, predictions, prompts, generations
+                        )
+                        logger.info(
+                            "Saved held-out generative-critic predictions for version %d to %s",
+                            synced_version,
+                            snapshot_path,
+                        )
                         progress_metrics.update(
                             value_model_utils.gen_value_validation_metrics(validation_examples, predictions)
                         )

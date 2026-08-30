@@ -19,7 +19,9 @@ laptop and in CI. They focus on:
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -67,6 +69,7 @@ from open_instruct.value_model_utils import (
     value_clipped_mse_loss,
     value_metric_sums,
     value_metrics_from_sums,
+    write_gen_value_validation_snapshot,
 )
 
 
@@ -761,6 +764,34 @@ class TestValueLoss(unittest.TestCase):
         self.assertEqual(metrics["gen_value/validation_final_incorrect_v_hat_mean"], 0.4)
         self.assertEqual(metrics["gen_value/validation_final_action_incorrect_v_hat_mean"], 0.4)
         self.assertEqual(metrics["gen_value/validation_near_horizon_incorrect_v_hat_mean"], 0.4)
+
+    def test_gen_value_validation_snapshot_preserves_inspectable_outputs(self):
+        examples = [
+            {
+                "prompt_token_ids": [1, 2, 3],
+                "kind": "final_action",
+                "target": 0.0,
+                "response_tokens_used": 99,
+                "response_token_limit": 100,
+            }
+        ]
+        with tempfile.TemporaryDirectory() as output_dir:
+            snapshot_path = write_gen_value_validation_snapshot(
+                output_dir,
+                version=25,
+                examples=examples,
+                predictions=[0.2],
+                prompts=["critic prompt"],
+                generations=["reasoning <answer>2</answer>"],
+            )
+
+            self.assertEqual(snapshot_path, Path(output_dir) / "gen_value_validation/version_000025.jsonl")
+            row = json.loads(snapshot_path.read_text())
+            self.assertNotIn("prompt_token_ids", row)
+            self.assertEqual(row["version"], 25)
+            self.assertEqual(row["prediction"], 0.2)
+            self.assertEqual(row["prompt"], "critic prompt")
+            self.assertEqual(row["generation"], "reasoning <answer>2</answer>")
 
     def test_final_action_prefix_retains_observations_and_is_causal(self):
         prefix, response_tokens_used = causal_final_action_prefix_token_ids(

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import math
+import pathlib
 import random
 import re
 from collections.abc import Sequence
@@ -474,6 +475,43 @@ def gen_value_validation_metrics(
             - metrics["gen_value/validation_final_incorrect_v_hat_mean"]
         )
     return metrics
+
+
+def write_gen_value_validation_snapshot(
+    output_dir: str,
+    version: int,
+    examples: list[dict[str, Any]],
+    predictions: Sequence[float | None],
+    prompts: Sequence[str],
+    generations: Sequence[str],
+) -> pathlib.Path:
+    """Persist inspectable held-out critic predictions for one published version."""
+    lengths = {len(examples), len(predictions), len(prompts), len(generations)}
+    if len(lengths) != 1:
+        raise ValueError(
+            "Validation snapshot fields differ in length: "
+            f"examples={len(examples)}, predictions={len(predictions)}, "
+            f"prompts={len(prompts)}, generations={len(generations)}."
+        )
+
+    snapshot_dir = pathlib.Path(output_dir) / "gen_value_validation"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_path = snapshot_dir / f"version_{int(version):06d}.jsonl"
+    temporary_path = snapshot_path.with_suffix(".jsonl.tmp")
+    with temporary_path.open("w", encoding="utf-8") as snapshot_file:
+        for example, prediction, prompt, generation in zip(examples, predictions, prompts, generations, strict=True):
+            row = {key: value for key, value in example.items() if key != "prompt_token_ids"}
+            row.update(
+                {
+                    "version": int(version),
+                    "prediction": None if prediction is None else float(prediction),
+                    "prompt": prompt,
+                    "generation": generation,
+                }
+            )
+            snapshot_file.write(json.dumps(row, ensure_ascii=False) + "\n")
+    temporary_path.replace(snapshot_path)
+    return snapshot_path
 
 
 def pack_gen_value_examples(examples: list[dict[str, Any]], target_tokens: int) -> list[list[dict[str, Any]]]:
