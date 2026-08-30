@@ -96,9 +96,10 @@ class TestValueEstimationStates(unittest.TestCase):
 
         self.assertEqual(metrics["final_action_examples"], 4.0)
         self.assertAlmostEqual(metrics["final_action_parse_rate"], 0.5)
+        self.assertAlmostEqual(metrics["final_action_target_mean"], 0.5)
         self.assertAlmostEqual(metrics["final_action_penalized_mse"], (0.01 + 1.0 + 1.0 + 0.01) / 4)
         self.assertAlmostEqual(metrics["final_action_pred_mean"], 0.5)
-        self.assertAlmostEqual(metrics["final_action_mc_mean"], 0.5)
+        self.assertAlmostEqual(metrics["final_action_parsed_target_mean"], 0.5)
         self.assertAlmostEqual(metrics["final_action_mse"], 0.01)
 
     def test_prediction_group_metrics_reject_length_mismatch(self):

@@ -526,6 +526,7 @@ def _prediction_group_metrics(
     metrics = {
         f"{prefix}_examples": float(len(predictions)),
         f"{prefix}_parse_rate": len(parsed_indices) / len(predictions),
+        f"{prefix}_target_mean": float(np.mean([float(target) for target in targets])),
         f"{prefix}_penalized_mse": float(
             np.mean(
                 [
@@ -539,7 +540,7 @@ def _prediction_group_metrics(
         parsed_predictions = [float(normalized_predictions[index]) for index in parsed_indices]
         parsed_targets = [float(targets[index]) for index in parsed_indices]
         metrics[f"{prefix}_pred_mean"] = float(np.mean(parsed_predictions))
-        metrics[f"{prefix}_mc_mean"] = float(np.mean(parsed_targets))
+        metrics[f"{prefix}_parsed_target_mean"] = float(np.mean(parsed_targets))
         metrics[f"{prefix}_mse"] = float(
             np.mean([(prediction - target) ** 2 for prediction, target in zip(parsed_predictions, parsed_targets)])
         )
