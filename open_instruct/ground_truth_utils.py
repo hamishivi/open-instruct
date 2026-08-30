@@ -284,6 +284,54 @@ class MathVerifier(VerifierFunction):
         return VerificationResult(score=0.0)
 
 
+_FINAL_BOXED_SUFFIX_RE = re.compile(
+    r"(?:"
+    r"\s|[.$,;:!?]|\\[\]\)]|"
+    r"\\end\{(?:equation\*?|align\*?|displaymath|gather\*?)\}|"
+    r"</answer>|<\|endoftext\|>|<\|im_end\|>"
+    r")*\Z"
+)
+
+
+class FinalBoxedMathVerifier(VerifierFunction):
+    """Verify a boxed math answer only when no substantive content follows it.
+
+    This is intentionally a final-answer integrity check rather than a stopping or
+    length constraint. A response may stop through EOS, a stop string, or its token
+    budget, but it cannot receive credit for an earlier correct box followed by a
+    different answer or an arbitrarily long unrelated continuation.
+    """
+
+    def __init__(self, verifier_config: VerifierConfig | None = None) -> None:
+        super().__init__("final_boxed_math", verifier_config=verifier_config, weight=1.0)
+
+    def __call__(
+        self,
+        tokenized_prediction: list[int],
+        prediction: str,
+        label: str,
+        query: str | None = None,
+        rollout_state: dict | None = None,
+    ) -> VerificationResult:
+        boxed_answer = last_boxed_only_string(prediction)
+        if boxed_answer is None:
+            return VerificationResult(score=0.0)
+
+        boxed_start = prediction.rfind(boxed_answer)
+        if boxed_start < 0:
+            return VerificationResult(score=0.0)
+        suffix = prediction[boxed_start + len(boxed_answer) :]
+        if _FINAL_BOXED_SUFFIX_RE.fullmatch(suffix) is None:
+            return VerificationResult(score=0.0)
+
+        try:
+            answer = remove_boxed(boxed_answer)
+        except AssertionError:
+            return VerificationResult(score=0.0)
+        score = float(is_equiv(answer, label) or hendrycks_is_equiv(answer, label))
+        return VerificationResult(score=score)
+
+
 class StrictMathVerifier(VerifierFunction):
     """
     Strict verifier for math problems using only the Minerva format extraction.

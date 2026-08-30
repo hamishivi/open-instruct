@@ -59,6 +59,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --temperature 1.0 \
     --apply_verifiable_reward true \
     --verification_reward 1.0 \
+    --remap_verifier math=final_boxed_math \
     --non_stop_penalty false \
     --beta 0.0 \
     --loss_fn dapo \

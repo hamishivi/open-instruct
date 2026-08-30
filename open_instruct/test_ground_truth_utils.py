@@ -12,6 +12,7 @@ from parameterized import parameterized
 
 from open_instruct.ground_truth_utils import (
     F1Verifier,
+    FinalBoxedMathVerifier,
     GSM8KVerifier,
     IFEvalVerifier,
     LMJudgeVerifier,
@@ -19,6 +20,24 @@ from open_instruct.ground_truth_utils import (
     PuzzleMatcherVerifier,
     cleanup_all_llm_judge_clients,
 )
+
+
+class TestFinalBoxedMathVerifier(unittest.TestCase):
+    def setUp(self):
+        self.verifier = FinalBoxedMathVerifier()
+
+    @parameterized.expand(
+        [
+            ("no_eos_required", r"Reasoning. Therefore, \boxed{42}", "42", 1.0),
+            ("common_math_closers_and_eos", "Reasoning.\n\\[\\boxed{42}\n\\]<|endoftext|>", "42", 1.0),
+            ("substantive_trailing_text", r"Reasoning. \boxed{42} unrelated continuation", "42", 0.0),
+            ("final_box_wins", r"First \boxed{0}, finally \boxed{42}.", "42", 1.0),
+            ("later_wrong_box", r"First \boxed{42}, finally \boxed{0}.", "42", 0.0),
+            ("boxed_answer_required", "The final answer is 42.", "42", 0.0),
+        ]
+    )
+    def test_final_answer_integrity(self, _name, prediction, label, expected_score):
+        self.assertEqual(self.verifier([], prediction, label).score, expected_score)
 
 
 class TestIFEvalVerifier(unittest.TestCase):
