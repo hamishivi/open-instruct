@@ -45,7 +45,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --dataset_mixer_list_splits train \
     --dataset_mixer_eval_list mnoukhov/aime_2025_openinstruct 1.0 \
     --dataset_mixer_eval_list_splits train \
-    --remap_verifier math_aime_2025=math \
+    --remap_verifier math=final_boxed_math,math_aime_2025=final_boxed_math \
     --max_prompt_token_length 2048 \
     --response_length 8192 \
     --pack_length 10240 \
@@ -59,7 +59,6 @@ python open_instruct/grpo_fast_genvalue.py \
     --temperature 1.0 \
     --apply_verifiable_reward true \
     --verification_reward 1.0 \
-    --remap_verifier math=final_boxed_math \
     --non_stop_penalty false \
     --beta 0.01 \
     --loss_fn dapo \

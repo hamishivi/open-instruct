@@ -17,7 +17,9 @@ from open_instruct.ground_truth_utils import (
     IFEvalVerifier,
     LMJudgeVerifier,
     LMJudgeVerifierConfig,
+    MathVerifier,
     PuzzleMatcherVerifier,
+    apply_verifier_remaps,
     cleanup_all_llm_judge_clients,
 )
 
@@ -38,6 +40,26 @@ class TestFinalBoxedMathVerifier(unittest.TestCase):
     )
     def test_final_answer_integrity(self, _name, prediction, label, expected_score):
         self.assertEqual(self.verifier([], prediction, label).score, expected_score)
+
+
+class TestVerifierRemaps(unittest.TestCase):
+    def test_applies_multiple_aliases_to_the_same_verifier(self):
+        math_verifier = MathVerifier()
+        final_verifier = FinalBoxedMathVerifier()
+        registry = {"math": math_verifier, "final_boxed_math": final_verifier}
+
+        result = apply_verifier_remaps(registry, "math=final_boxed_math, math_aime_2025=final_boxed_math")
+
+        self.assertIs(result["math"], final_verifier)
+        self.assertIs(result["math_aime_2025"], final_verifier)
+
+    def test_rejects_malformed_or_unknown_remaps(self):
+        registry = {"math": MathVerifier()}
+
+        with self.assertRaisesRegex(ValueError, "source=target"):
+            apply_verifier_remaps(registry, "math")
+        with self.assertRaisesRegex(ValueError, "was not found"):
+            apply_verifier_remaps(registry, "math=missing")
 
 
 class TestIFEvalVerifier(unittest.TestCase):
