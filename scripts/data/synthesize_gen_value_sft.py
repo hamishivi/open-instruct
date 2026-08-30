@@ -11,9 +11,10 @@ critic prompts, validates every response, parses its scalar estimate, and writes
 the prompt/completion JSONL consumed by ``genac_math_value_trace_sft_h200.sh``.
 
 The ``consensus`` command keeps a concise primary teacher trace only when its
-score agrees with independent judge teachers.  The sampled rollout outcome is
-used as a calibration gate only at the exact final action: an intermediate state
-can have high continuation value even when one sampled continuation later fails.
+score agrees with independent judge teachers. A single sampled rollout outcome
+is used only to balance trajectory coverage, never as a per-state calibration
+gate: even immediately before the sampled final token, the actor can choose a
+different action and continue when response budget remains.
 """
 
 from __future__ import annotations
@@ -342,20 +343,14 @@ def select_teacher_consensus(
     judge_example_groups: Sequence[Sequence[dict[str, Any]]],
     *,
     max_teacher_range: float,
-    max_final_teacher_squared_error: float,
     max_examples_per_outcome: int | None,
     seed: int,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Select balanced SFT traces using teacher agreement and a final-only outcome gate."""
+    """Select balanced SFT traces using independent teacher agreement."""
     if not judge_example_groups:
         raise ValueError("Teacher consensus requires at least one independent judge.")
     if max_teacher_range < 0:
         raise ValueError(f"max_teacher_range must be nonnegative, got {max_teacher_range}.")
-    if max_final_teacher_squared_error < 0:
-        raise ValueError(
-            "max_final_teacher_squared_error must be nonnegative, "
-            f"got {max_final_teacher_squared_error}."
-        )
 
     primary_by_prompt = index_teacher_rows(primary_examples, source="primary")
     judges_by_prompt = [
@@ -367,7 +362,6 @@ def select_teacher_consensus(
         "primary_examples": len(primary_examples),
         "missing_judge": 0,
         "teacher_disagreement": 0,
-        "final_outcome_disagreement": 0,
         "consensus_candidates": 0,
     }
     for prompt, primary in primary_by_prompt.items():
@@ -389,13 +383,6 @@ def select_teacher_consensus(
             raise ValueError(f"Primary teacher row for prompt {prompt!r} has no valid outcome.")
         state_kind = primary.get("state_kind", primary.get("kind"))
         primary_prediction = predictions[0]
-        # At an exact completed action, the verifier outcome is the value target.
-        # Earlier prefixes are deliberately *not* gated by one sampled future.
-        if state_kind == "final_action" and (float(outcome) - primary_prediction) ** 2 > (
-            max_final_teacher_squared_error + 1e-12
-        ):
-            stats["final_outcome_disagreement"] += 1
-            continue
 
         candidate = dict(primary)
         candidate.update(
@@ -437,7 +424,6 @@ def consensus(args: argparse.Namespace) -> None:
         primary_examples,
         judge_example_groups,
         max_teacher_range=args.max_teacher_range,
-        max_final_teacher_squared_error=args.max_final_teacher_squared_error,
         max_examples_per_outcome=args.max_examples_per_outcome,
         seed=args.seed,
     )
@@ -499,7 +485,6 @@ def parse_args() -> argparse.Namespace:
     consensus_parser.add_argument("--judges", required=True, nargs="+", type=pathlib.Path)
     consensus_parser.add_argument("--output", required=True, type=pathlib.Path)
     consensus_parser.add_argument("--max_teacher_range", type=float, default=0.2)
-    consensus_parser.add_argument("--max_final_teacher_squared_error", type=float, default=0.04)
     consensus_parser.add_argument("--max_examples_per_outcome", type=int, default=512)
     consensus_parser.add_argument("--seed", type=int, default=0)
     consensus_parser.set_defaults(function=consensus)
@@ -513,8 +498,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max_teacher_squared_error must be nonnegative.")
     if args.command == "consensus" and args.max_teacher_range < 0:
         parser.error("--max_teacher_range must be nonnegative.")
-    if args.command == "consensus" and args.max_final_teacher_squared_error < 0:
-        parser.error("--max_final_teacher_squared_error must be nonnegative.")
     if args.command == "consensus" and args.max_examples_per_outcome <= 0:
         parser.error("--max_examples_per_outcome must be positive.")
     return args

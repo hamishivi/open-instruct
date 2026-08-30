@@ -265,7 +265,7 @@ class TestGenValueSFTSynthesis(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["prompt"], good["prompt"])
 
-    def test_consensus_uses_outcome_only_for_exact_final_action(self):
+    def test_consensus_never_treats_sampled_final_action_as_terminal(self):
         primary = []
         judge_one = []
         judge_two = []
@@ -281,20 +281,15 @@ class TestGenValueSFTSynthesis(unittest.TestCase):
                 judge_two.append({**row, "generation": "judge two", "teacher_prediction": prediction})
 
         selected, stats = select_teacher_consensus(
-            primary,
-            [judge_one, judge_two],
-            max_teacher_range=0.2,
-            max_final_teacher_squared_error=0.04,
-            max_examples_per_outcome=2,
-            seed=0,
+            primary, [judge_one, judge_two], max_teacher_range=0.2, max_examples_per_outcome=2, seed=0
         )
 
         selected_keys = {
             (example["outcome"], example["state_kind"], example["trajectory_fraction"]) for example in selected
         }
         self.assertIn((0.0, "segment_start", 0.25), selected_keys)
-        self.assertNotIn((0.0, "final_action", 1.0), selected_keys)
-        self.assertEqual(stats["final_outcome_disagreement"], 1)
+        self.assertIn((0.0, "final_action", 1.0), selected_keys)
+        self.assertEqual(stats["consensus_candidates"], 4)
 
     def test_consensus_requires_all_teachers_and_rejects_score_disagreement(self):
         agreed = self._state(1.0, "final_action")
@@ -310,12 +305,7 @@ class TestGenValueSFTSynthesis(unittest.TestCase):
         judge_two = [{**agreed, "generation": "judge", "teacher_prediction": 1.0}]
 
         selected, stats = select_teacher_consensus(
-            primary,
-            [judge_one, judge_two],
-            max_teacher_range=0.2,
-            max_final_teacher_squared_error=0.04,
-            max_examples_per_outcome=1,
-            seed=0,
+            primary, [judge_one, judge_two], max_teacher_range=0.2, max_examples_per_outcome=1, seed=0
         )
 
         # The incorrect prompt is absent from judge two, while the correct prompt
