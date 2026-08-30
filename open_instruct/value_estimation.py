@@ -233,9 +233,9 @@ def _fixed_probe_positions(
     use the rest of the 8,192-token budget. The old selector incorrectly filtered
     such states using ``rollout_length - probe``.
     """
-    if rollout_length < 0 or response_token_limit <= 0:
+    if rollout_length < 0 or response_token_limit <= 0 or rollout_length > response_token_limit:
         raise ValueError(
-            f"rollout_length must be nonnegative and response_token_limit positive, got "
+            "rollout_length must be nonnegative and no larger than the positive response_token_limit, got "
             f"{rollout_length} and {response_token_limit}."
         )
     if probe_interval <= 0 or min_remaining_tokens < 0 or max_probes <= 0:
@@ -248,8 +248,10 @@ def _fixed_probe_positions(
     ]
     if include_final_action_probe and rollout_length > 0:
         final_action_probe = rollout_length - 1
-        if response_token_limit - final_action_probe >= min_remaining_tokens:
-            positions.append(final_action_probe)
+        # The final-action state needs only the sampled final token's remaining
+        # budget. Keeping the generic intermediate-probe floor here discards
+        # exactly the near-budget states where terminal calibration matters.
+        positions.append(final_action_probe)
     positions = sorted(set(positions))
     if len(positions) <= max_probes:
         return positions
@@ -419,8 +421,10 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
                 ]
                 if cfg.include_final_action_probe and length > 0:
                     final_action_probe = length - 1
-                    if cfg.max_response_length - final_action_probe >= cfg.min_probe_remaining_tokens:
-                        probe_positions.append(final_action_probe)
+                    # Always retain the causal state immediately before the
+                    # sampled final action. It has at least one token of budget,
+                    # even when ordinary probes require a larger continuation.
+                    probe_positions.append(final_action_probe)
                 probe_positions = sorted(set(probe_positions))
                 if len(probe_positions) > cfg.max_probes:
                     selected_indices = np.linspace(0, len(probe_positions) - 1, num=cfg.max_probes, dtype=int)

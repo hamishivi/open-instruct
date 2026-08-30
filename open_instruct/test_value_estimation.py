@@ -115,7 +115,7 @@ class TestValueEstimationStates(unittest.TestCase):
         )
         self.assertEqual(positions, [999])
 
-    def test_near_budget_final_state_requires_room_to_continue(self):
+    def test_near_budget_final_state_uses_its_true_remaining_budget(self):
         positions = value_estimation._fixed_probe_positions(
             rollout_length=8190,
             response_token_limit=8192,
@@ -124,8 +124,18 @@ class TestValueEstimationStates(unittest.TestCase):
             max_probes=16,
             include_final_action_probe=True,
         )
-        self.assertEqual(positions[-1], 8000)
-        self.assertNotIn(8189, positions)
+        self.assertEqual(positions[-1], 8189)
+
+    def test_rollout_cannot_exceed_response_budget(self):
+        with self.assertRaisesRegex(ValueError, "no larger than"):
+            value_estimation._fixed_probe_positions(
+                rollout_length=8193,
+                response_token_limit=8192,
+                probe_interval=1000,
+                min_remaining_tokens=64,
+                max_probes=16,
+                include_final_action_probe=True,
+            )
 
     def test_probe_cap_preserves_latest_state(self):
         positions = value_estimation._fixed_probe_positions(
