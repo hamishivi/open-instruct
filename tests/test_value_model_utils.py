@@ -113,3 +113,23 @@ def test_gen_value_validation_reports_early_to_late_value_deltas():
     assert metrics["gen_value/validation_prefix_correct_early_to_late_delta"] == pytest.approx(0.6)
     assert metrics["gen_value/validation_prefix_incorrect_early_to_late_delta"] == pytest.approx(-0.4)
     assert metrics["gen_value/validation_prefix_value_gap_early_to_late_delta"] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("threshold", "observed", "expected"),
+    [
+        (None, 0.0, False),
+        (0.2, None, False),
+        (0.2, 0.3, False),
+        (0.2, 0.2, False),
+        (0.2, 0.19, True),
+        (0.2, float("nan"), True),
+    ],
+)
+def test_gen_value_policy_guard(threshold: float | None, observed: float | None, expected: bool):
+    assert value_model_utils.gen_value_policy_guard_active(threshold, observed) is expected
+
+
+def test_gen_value_policy_guard_rejects_invalid_threshold():
+    with pytest.raises(ValueError, match="min_advantage_gap"):
+        value_model_utils.gen_value_policy_guard_active(-0.1, 0.3)

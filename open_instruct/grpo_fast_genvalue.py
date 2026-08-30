@@ -707,6 +707,11 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
     # How often (in critic optimizer updates) to publish gen-value weights to vLLM.
     # Set to 0 to keep the serving critic frozen while its trainer continues updating.
     gen_value_sync_freq: int = 1
+    # Freeze only the actor update when the observed correct-vs-incorrect GAE
+    # advantage gap falls below this threshold. Critic sampling/training continues,
+    # providing an adaptive value re-warmup instead of allowing a weak critic signal
+    # to push the policy into a length exploit. None disables the guard.
+    gen_value_min_advantage_gap_for_policy_update: float | None = None
     # Optional four-prompt qualitative diagnostic. Full-length critic generations
     # monopolize the shared vLLM lock, so keep this disabled when fixed held-out
     # validation already measures calibration.
@@ -784,6 +789,14 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
             raise ValueError(f"--gen_value_batch_size must be > 0, got {self.gen_value_batch_size}.")
         if self.gen_value_sync_freq < 0:
             raise ValueError(f"--gen_value_sync_freq must be >= 0, got {self.gen_value_sync_freq}.")
+        if self.gen_value_min_advantage_gap_for_policy_update is not None and (
+            not math.isfinite(self.gen_value_min_advantage_gap_for_policy_update)
+            or self.gen_value_min_advantage_gap_for_policy_update < 0.0
+        ):
+            raise ValueError(
+                "--gen_value_min_advantage_gap_for_policy_update must be finite and >= 0 when set, got "
+                f"{self.gen_value_min_advantage_gap_for_policy_update}."
+            )
         if self.gen_value_diagnostic_scoring_freq < 0:
             raise ValueError(
                 f"--gen_value_diagnostic_scoring_freq must be >= 0, got {self.gen_value_diagnostic_scoring_freq}."

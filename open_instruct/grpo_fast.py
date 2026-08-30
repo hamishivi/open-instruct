@@ -2498,6 +2498,15 @@ class PolicyTrainerRayProcess(RayProcess):
             incorrect_advantage = sae_step_metrics.get("gen_value/advantage_incorrect_mean")
             if correct_advantage is not None and incorrect_advantage is not None:
                 sae_step_metrics["gen_value/advantage_gap"] = correct_advantage - incorrect_advantage
+            min_advantage_gap = getattr(self.args, "gen_value_min_advantage_gap_for_policy_update", None)
+            policy_guard_active = value_model_utils.gen_value_policy_guard_active(
+                min_advantage_gap, sae_step_metrics.get("gen_value/advantage_gap")
+            )
+            if min_advantage_gap is not None:
+                sae_step_metrics["gen_value/min_advantage_gap_for_policy_update"] = float(min_advantage_gap)
+                sae_step_metrics["gen_value/policy_update_guard_active"] = float(policy_guard_active)
+            if policy_guard_active:
+                self._skip_policy_update = True
             correct_vhat = sae_step_metrics.get("gen_value/terminal_vhat_correct_mean")
             incorrect_vhat = sae_step_metrics.get("gen_value/terminal_vhat_incorrect_mean")
             if correct_vhat is not None and incorrect_vhat is not None:

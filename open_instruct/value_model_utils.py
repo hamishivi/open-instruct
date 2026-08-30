@@ -111,6 +111,20 @@ def gen_value_sampled_version_metrics(rollouts: list[dict]) -> dict[str, float]:
     }
 
 
+def gen_value_policy_guard_active(min_advantage_gap: float | None, observed_advantage_gap: float | None) -> bool:
+    """Whether an unreliable critic signal should freeze this actor update.
+
+    Missing gaps occur when a batch has only one outcome class, so they cannot
+    support a correct-vs-incorrect comparison and do not activate the guard.
+    Non-finite observed gaps are unsafe and do activate it.
+    """
+    if min_advantage_gap is None or observed_advantage_gap is None:
+        return False
+    if not math.isfinite(min_advantage_gap) or min_advantage_gap < 0.0:
+        raise ValueError(f"min_advantage_gap must be finite and nonnegative when set, got {min_advantage_gap}.")
+    return not math.isfinite(observed_advantage_gap) or observed_advantage_gap < min_advantage_gap
+
+
 def update_gen_value_success_rate_ema(
     previous_rate: float | None, batch_success_rate: float, momentum: float
 ) -> float:
