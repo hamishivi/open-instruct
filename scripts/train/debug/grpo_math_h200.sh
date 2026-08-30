@@ -3,7 +3,10 @@
 #
 # This deliberately keeps the policy/data/evaluation configuration identical to
 # genac_math_joint_h200.sh while removing the value model and generative critic.
-# On four GPUs it uses two policy learners and two policy vLLM engines.
+# Use the same one-policy-learner/one-policy-vLLM topology as the GenAC run.
+# The prior two-learner control deadlocked after step 1 in the ZeRO-3/NCCL
+# weight-transfer collective, so changing only this parallel topology gives a
+# usable value-free comparison without changing its data or optimization recipe.
 set -euo pipefail
 
 if [[ "${PRESERVE_LD_LIBRARY_PATH:-0}" != "1" ]]; then
@@ -23,9 +26,19 @@ CHECKPOINT_STATE_DIR="${CHECKPOINT_STATE_DIR:-${RUN_OUTPUT_DIR}/checkpoint_state
 CONTROL_STEPS="${CONTROL_STEPS:-300}"
 NUM_UNIQUE_PROMPTS_ROLLOUT=32
 NUM_SAMPLES_PER_PROMPT_ROLLOUT=8
+NUM_POLICY_LEARNERS="${NUM_POLICY_LEARNERS:-1}"
+NUM_POLICY_VLLM_ENGINES="${NUM_POLICY_VLLM_ENGINES:-1}"
 
 if [[ ! "${CONTROL_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: CONTROL_STEPS must be at least 1" >&2
+    exit 1
+fi
+if [[ ! "${NUM_POLICY_LEARNERS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: NUM_POLICY_LEARNERS must be at least 1" >&2
+    exit 1
+fi
+if [[ ! "${NUM_POLICY_VLLM_ENGINES}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: NUM_POLICY_VLLM_ENGINES must be at least 1" >&2
     exit 1
 fi
 TOTAL_EPISODES=$((CONTROL_STEPS * NUM_UNIQUE_PROMPTS_ROLLOUT * NUM_SAMPLES_PER_PROMPT_ROLLOUT))
@@ -74,9 +87,9 @@ python open_instruct/grpo_fast.py \
     --num_mini_batches 1 \
     --deepspeed_stage 3 \
     --deepspeed_offload_optimizer \
-    --num_learners_per_node 2 \
+    --num_learners_per_node "${NUM_POLICY_LEARNERS}" \
     --sequence_parallel_size 1 \
-    --vllm_num_engines 2 \
+    --vllm_num_engines "${NUM_POLICY_VLLM_ENGINES}" \
     --vllm_tensor_parallel_size 1 \
     --vllm_gpu_memory_utilization 0.85 \
     --vllm_top_p 1.0 \
