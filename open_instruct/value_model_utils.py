@@ -331,7 +331,12 @@ def build_gen_value_validation_holdout(
         first = pairs[0]
         prompt_ids = tuple(first["request_output"].prompt_token_ids)
         initial_groups.setdefault(prompt_ids, []).append(first)
-        if len(pairs) > 1:
+        final_action = next((pair for pair in reversed(pairs) if pair.get("state_kind") == "final_action"), None)
+        if final_action is not None:
+            final_candidates.append(final_action)
+        elif len(pairs) > 1:
+            # Backward-compatible fallback for rollouts captured before explicit
+            # final-action states were added.
             final_candidates.append(pairs[-1])
 
     rng = random.Random(seed)
@@ -371,7 +376,7 @@ def build_gen_value_validation_holdout(
             {
                 "prompt_token_ids": list(pair["request_output"].prompt_token_ids),
                 "target": float(pair["outcome"]),
-                "kind": "final_segment",
+                "kind": pair.get("state_kind", "final_segment"),
                 "response_tokens_used": pair.get("response_tokens_used"),
                 "response_token_limit": pair.get("response_token_limit"),
             }
@@ -426,15 +431,26 @@ def gen_value_validation_metrics(
         ) / len(rows)
 
     initial = [(example, prediction) for example, prediction in parsed if example["kind"] == "initial"]
+    final_kinds = {"final_segment", "final_action"}
     final_correct = [
         (example, prediction)
         for example, prediction in parsed
-        if example["kind"] == "final_segment" and float(example["target"]) > 0.5
+        if example["kind"] in final_kinds and float(example["target"]) > 0.5
     ]
     final_incorrect = [
         (example, prediction)
         for example, prediction in parsed
-        if example["kind"] == "final_segment" and float(example["target"]) <= 0.5
+        if example["kind"] in final_kinds and float(example["target"]) <= 0.5
+    ]
+    final_action_correct = [
+        (example, prediction)
+        for example, prediction in parsed
+        if example["kind"] == "final_action" and float(example["target"]) > 0.5
+    ]
+    final_action_incorrect = [
+        (example, prediction)
+        for example, prediction in parsed
+        if example["kind"] == "final_action" and float(example["target"]) <= 0.5
     ]
     near_horizon_incorrect = []
     for example, prediction in final_incorrect:
@@ -449,6 +465,8 @@ def gen_value_validation_metrics(
     add_group("initial", initial)
     add_group("final_correct", final_correct)
     add_group("final_incorrect", final_incorrect)
+    add_group("final_action_correct", final_action_correct)
+    add_group("final_action_incorrect", final_action_incorrect)
     add_group("near_horizon_incorrect", near_horizon_incorrect)
     if final_correct and final_incorrect:
         metrics["gen_value/validation_final_value_gap"] = (
@@ -653,6 +671,30 @@ def causal_segment_start_prefix_token_ids(
         original_start_position = response_positions[response_start]
         prefixes.append(list(sequence_token_ids[first_response_position:original_start_position]))
     return prefixes
+
+
+def causal_final_action_prefix_token_ids(
+    sequence_token_ids: Sequence[int], response_mask: Sequence[bool]
+) -> tuple[list[int], int]:
+    """Return the trajectory state immediately before the final policy action.
+
+    Unlike the start of the final *segment*, this state is at most one sampled
+    action from the observed terminal boundary. Masked tool/environment tokens
+    are retained, and prompt tokens are omitted because the original problem is
+    supplied separately to the generative critic.
+    """
+    if len(sequence_token_ids) != len(response_mask):
+        raise ValueError(
+            "sequence_token_ids and response_mask must have the same length "
+            f"({len(sequence_token_ids)} != {len(response_mask)})."
+        )
+    response_positions = [idx for idx, is_response in enumerate(response_mask) if is_response]
+    if not response_positions:
+        raise ValueError("Cannot build a final-action state without response tokens.")
+
+    first_response_position = response_positions[0]
+    final_response_position = response_positions[-1]
+    return list(sequence_token_ids[first_response_position:final_response_position]), len(response_positions) - 1
 
 
 def rescale_gen_value_score(parsed: float, score_min: float, score_max: float) -> float:

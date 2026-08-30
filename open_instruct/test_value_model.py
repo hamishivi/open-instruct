@@ -43,6 +43,7 @@ from open_instruct.value_model_utils import (
     build_conditioning_text,
     build_gen_value_validation_holdout,
     build_generative_value_prompt,
+    causal_final_action_prefix_token_ids,
     causal_segment_start_prefix_token_ids,
     causal_value_mask,
     compute_value_loss,
@@ -729,6 +730,7 @@ class TestValueLoss(unittest.TestCase):
                 "outcome": outcome,
                 "response_tokens_used": used,
                 "response_token_limit": 100,
+                "state_kind": "final_action" if used >= 90 else "segment_start",
             }
 
         a0, a1 = pair([1, 2], 0.0, 0), pair([1, 3], 0.0, 90)
@@ -747,8 +749,8 @@ class TestValueLoss(unittest.TestCase):
     def test_gen_value_validation_metrics_separate_terminal_failures(self):
         examples = [
             {"kind": "initial", "target": 0.25, "response_tokens_used": 0, "response_token_limit": 1000},
-            {"kind": "final_segment", "target": 0.0, "response_tokens_used": 950, "response_token_limit": 1000},
-            {"kind": "final_segment", "target": 1.0, "response_tokens_used": 900, "response_token_limit": 1000},
+            {"kind": "final_action", "target": 0.0, "response_tokens_used": 950, "response_token_limit": 1000},
+            {"kind": "final_action", "target": 1.0, "response_tokens_used": 900, "response_token_limit": 1000},
         ]
 
         metrics = gen_value_validation_metrics(examples, [0.5, 0.4, None])
@@ -757,7 +759,16 @@ class TestValueLoss(unittest.TestCase):
         self.assertAlmostEqual(metrics["gen_value/validation_mse"], (0.25**2 + 0.4**2) / 2)
         self.assertAlmostEqual(metrics["gen_value/validation_penalized_mse"], (0.25**2 + 0.4**2 + 1.0) / 3)
         self.assertEqual(metrics["gen_value/validation_final_incorrect_v_hat_mean"], 0.4)
+        self.assertEqual(metrics["gen_value/validation_final_action_incorrect_v_hat_mean"], 0.4)
         self.assertEqual(metrics["gen_value/validation_near_horizon_incorrect_v_hat_mean"], 0.4)
+
+    def test_final_action_prefix_retains_observations_and_is_causal(self):
+        prefix, response_tokens_used = causal_final_action_prefix_token_ids(
+            [10, 11, 20, 21, 30, 31, 22], [False, False, True, True, False, False, True]
+        )
+
+        self.assertEqual(prefix, [20, 21, 30, 31])
+        self.assertEqual(response_tokens_used, 2)
 
     def test_classification_loss_preserves_continuous_targets(self):
         probabilities = torch.tensor([[[0.75, 0.25], [0.25, 0.75]]])

@@ -1013,6 +1013,7 @@ class PolicyTrainerRayProcess(RayProcess):
         prompts: list[str] = []
         prompt_subseq_idx: list[int] = []
         prompt_response_tokens_used: list[int] = []
+        prompt_state_kinds: list[str] = []
         per_subseq_info: list[dict] = []
 
         for s_idx, sub in enumerate(subseqs):
@@ -1085,6 +1086,38 @@ class PolicyTrainerRayProcess(RayProcess):
                 prompts.append(p)
                 prompt_subseq_idx.append(s_idx)
                 prompt_response_tokens_used.append(response_tokens_used)
+                prompt_state_kinds.append("segment_start")
+
+            # Add a high-resolution boundary state immediately before the final
+            # sampled action. With fixed 512-token segments, the old "final"
+            # critic state could still be hundreds of actions from termination.
+            # This is supervision/evaluation at an observed causal state, not an
+            # EOS or response-length constraint on the actor.
+            if segment_starts[-1] == n_resp_sub - 1:
+                prompt_state_kinds[-1] = "final_action"
+            else:
+                final_prefix_ids, final_response_tokens_used = value_model_utils.causal_final_action_prefix_token_ids(
+                    ids.tolist(), mask.tolist()
+                )
+                final_partial_text = self.tokenizer.decode(final_prefix_ids, skip_special_tokens=False)
+                prompts.append(
+                    value_model_utils.build_generative_value_prompt(
+                        partial_response=final_partial_text,
+                        conditioning=conditioning,
+                        ground_truth=gt_str if conditioning != "none" else "",
+                        siblings=siblings,
+                        score_min=score_min,
+                        score_max=score_max,
+                        problem=problem_text,
+                        actor_model_name=actor_model_name,
+                        actor_success_rate=actor_success_rate,
+                        response_tokens_used=final_response_tokens_used,
+                        response_token_limit=response_token_limit,
+                    )
+                )
+                prompt_subseq_idx.append(s_idx)
+                prompt_response_tokens_used.append(final_response_tokens_used)
+                prompt_state_kinds.append("final_action")
 
             # Shifted indices for this subseq's response tokens in the pack's (seq_len-1) layout.
             # Pack position of each response token is offset + k; the shifted index is (pack_pos-1).
@@ -1111,6 +1144,7 @@ class PolicyTrainerRayProcess(RayProcess):
             "prompts": prompts,
             "prompt_subseq_idx": prompt_subseq_idx,
             "prompt_response_tokens_used": prompt_response_tokens_used,
+            "prompt_state_kinds": prompt_state_kinds,
             "response_token_limit": response_token_limit,
             "per_subseq_info": per_subseq_info,
         }
@@ -1125,6 +1159,7 @@ class PolicyTrainerRayProcess(RayProcess):
         prompts: list[str] = request["prompts"]
         prompt_subseq_idx: list[int] = request["prompt_subseq_idx"]
         prompt_response_tokens_used: list[int] = request["prompt_response_tokens_used"]
+        prompt_state_kinds: list[str] = request["prompt_state_kinds"]
         response_token_limit: int | None = request["response_token_limit"]
         per_subseq_info: list[dict] = request["per_subseq_info"]
         score_min: float = getattr(args, "gen_value_score_min", 0.0)
@@ -1187,6 +1222,7 @@ class PolicyTrainerRayProcess(RayProcess):
                     "subseq_idx": prompt_subseq_idx[k],
                     "response_tokens_used": prompt_response_tokens_used[k],
                     "response_token_limit": response_token_limit,
+                    "state_kind": prompt_state_kinds[k],
                 }
             )
         return values_BT, training_pairs

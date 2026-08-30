@@ -96,6 +96,47 @@ class TestWarmupWindows(unittest.TestCase):
         self.assertFalse(_is_in_warmup_window(args, 61))
 
 
+class TestGenerativeValueBoundaryState(unittest.TestCase):
+    def test_final_action_probe_is_trained_but_not_used_to_baseline_prior_actions(self):
+        trainer_class = PolicyTrainerRayProcess.__ray_metadata__.modified_class
+        trainer = object.__new__(trainer_class)
+        trainer.args = SimpleNamespace(
+            gen_value_segmentation="fixed",
+            gen_value_chunk_size=512,
+            gen_value_max_segments=16,
+            sae_threshold=0.2,
+            gen_value_score_min=0.0,
+            gen_value_score_max=10.0,
+            gen_value_conditioning="none",
+            gen_value_use_icc=False,
+            value_reward_min=0.0,
+            value_reward_max=1.0,
+        )
+        trainer.streaming_config = SimpleNamespace(response_length=8192)
+        trainer.tokenizer = Mock()
+        trainer.tokenizer.decode.side_effect = lambda token_ids, **_: " ".join(map(str, token_ids))
+
+        query_responses = torch.tensor([[10, 11, 20, 21, 22, 23]])
+        position_ids = torch.arange(6).unsqueeze(0)
+        response_mask = torch.tensor([[False, False, True, True, True, True]])
+        request = trainer._build_gen_value_scoring_request(
+            query_responses, position_ids, response_mask, ground_truths_pack=["42"]
+        )
+
+        self.assertEqual(request["prompt_state_kinds"], ["segment_start", "final_action"])
+        self.assertEqual(request["prompt_response_tokens_used"], [0, 3])
+        self.assertIn("Partial response:\n<rollout>20 21 22</rollout>", request["prompts"][1])
+
+        request_outputs = [
+            SimpleNamespace(outputs=[SimpleNamespace(text="<answer>5</answer>")]),
+            SimpleNamespace(outputs=[SimpleNamespace(text="<answer>0</answer>")]),
+        ]
+        values, training_pairs = trainer._finish_gen_value_scoring_request(request, request_outputs)
+
+        torch.testing.assert_close(values, torch.tensor([[0.0, 0.5, 0.5, 0.5, 0.5]]))
+        self.assertEqual([pair["state_kind"] for pair in training_pairs], ["segment_start", "final_action"])
+
+
 class TestValueRewardRangeSetup(unittest.TestCase):
     def test_requires_explicit_bounds_for_summed_rewards(self):
         args = grpo_utils.GRPOExperimentConfig(use_value_model=True)
