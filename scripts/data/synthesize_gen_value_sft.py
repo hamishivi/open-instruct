@@ -84,6 +84,24 @@ def prompt_has_ground_truth_conditioning(prompt: str) -> bool:
     return GROUND_TRUTH_CONDITIONING_MARKER in (prefix if delimiter else prompt)
 
 
+def is_declared_horizon_repeat_group(examples: Sequence[dict[str, Any]]) -> bool:
+    """Return whether duplicate prompts are one complete intentional repeat group."""
+    if len(examples) <= 1:
+        return False
+    repeat_count = examples[0].get("horizon_repeat_count")
+    if isinstance(repeat_count, bool) or not isinstance(repeat_count, int) or repeat_count != len(examples):
+        return False
+    repeat_indices = [example.get("horizon_repeat_index") for example in examples]
+    if any(isinstance(index, bool) or not isinstance(index, int) for index in repeat_indices):
+        return False
+    if sorted(repeat_indices) != list(range(repeat_count)):
+        return False
+    canonical_examples = [
+        {key: value for key, value in example.items() if key != "horizon_repeat_index"} for example in examples
+    ]
+    return all(example == canonical_examples[0] for example in canonical_examples[1:])
+
+
 def select_teacher_states(
     examples: Sequence[dict[str, Any]], *, min_critic_version: int, max_examples_per_outcome: int | None, seed: int
 ) -> list[dict[str, Any]]:
@@ -379,14 +397,14 @@ def audit(args: argparse.Namespace) -> None:
     missing_generation = 0
     invalid_score = 0
     leaked_answer_conditioning = 0
-    prompts: list[str] = []
+    prompt_groups: dict[str, list[dict[str, Any]]] = {}
     for example in examples:
         prompt = example.get("prompt")
         generation = example.get("generation")
         if not isinstance(prompt, str) or not prompt:
             missing_prompt += 1
         else:
-            prompts.append(prompt)
+            prompt_groups.setdefault(prompt, []).append(example)
             if prompt_has_ground_truth_conditioning(prompt):
                 leaked_answer_conditioning += 1
         if not isinstance(generation, str) or not generation:
@@ -394,12 +412,22 @@ def audit(args: argparse.Namespace) -> None:
         elif parse_generative_value_score(generation, score_min=0.0, score_max=10.0) is None:
             invalid_score += 1
 
-    duplicate_prompts = len(prompts) - len(set(prompts))
+    accidental_duplicate_prompts = 0
+    intentional_horizon_repeat_rows = 0
+    for prompt_examples in prompt_groups.values():
+        if len(prompt_examples) <= 1:
+            continue
+        if is_declared_horizon_repeat_group(prompt_examples):
+            intentional_horizon_repeat_rows += len(prompt_examples) - 1
+        else:
+            accidental_duplicate_prompts += len(prompt_examples) - 1
+    unique_prompt_shortfall = max(args.min_examples - len(prompt_groups), 0)
     failures = {
         "missing_prompt": missing_prompt,
         "missing_generation": missing_generation,
         "invalid_score": invalid_score,
-        "duplicate_prompts": duplicate_prompts,
+        "duplicate_prompts": accidental_duplicate_prompts,
+        "unique_prompt_shortfall": unique_prompt_shortfall,
     }
     if leaked_answer_conditioning and not args.allow_ground_truth_conditioning:
         failures["answer_conditioned_prompt"] = leaked_answer_conditioning
@@ -413,7 +441,8 @@ def audit(args: argparse.Namespace) -> None:
                 "answer_conditioned_prompts": leaked_answer_conditioning,
                 "examples": len(examples),
                 "inputs": [str(path) for path in args.inputs],
-                "unique_prompts": len(set(prompts)),
+                "intentional_horizon_repeat_rows": intentional_horizon_repeat_rows,
+                "unique_prompts": len(prompt_groups),
             },
             indent=2,
             sort_keys=True,

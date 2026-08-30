@@ -4,7 +4,7 @@ import math
 import unittest
 
 import numpy as np
-from scripts.data import prepare_gen_value_mc_sft
+from scripts.data import prepare_gen_value_mc_sft, synthesize_gen_value_sft
 
 from open_instruct import value_estimation
 
@@ -75,6 +75,22 @@ class TestValueEstimationStates(unittest.TestCase):
             prepare_gen_value_mc_sft.repeat_examples_for_horizon(
                 [], final_action_repeat=1, late_state_repeat=1, late_state_fraction=1.1
             )
+
+    def test_sft_audit_recognizes_only_complete_declared_horizon_repeats(self):
+        repeated = [
+            {
+                "prompt": "same state",
+                "generation": " <answer>0</answer>",
+                "horizon_repeat_count": 3,
+                "horizon_repeat_index": index,
+            }
+            for index in range(3)
+        ]
+
+        self.assertTrue(synthesize_gen_value_sft.is_declared_horizon_repeat_group(repeated))
+        self.assertFalse(synthesize_gen_value_sft.is_declared_horizon_repeat_group(repeated[:-1]))
+        repeated[-1]["generation"] = " <answer>1</answer>"
+        self.assertFalse(synthesize_gen_value_sft.is_declared_horizon_repeat_group(repeated))
 
     def test_mc_sft_rejects_under_sampled_targets(self):
         with self.assertRaisesRegex(ValueError, "only 8 continuations"):
