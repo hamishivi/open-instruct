@@ -491,6 +491,19 @@ def _spearman_correlation(left: Sequence[float], right: Sequence[float]) -> floa
     return _pearson_correlation(_average_ranks(left), _average_ranks(right))
 
 
+def _optional_sequence_as_list(value: Any) -> list[Any]:
+    """Normalize optional parquet list columns without truth-testing NumPy arrays."""
+    if value is None:
+        return []
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        return list(value)
+    if isinstance(value, float) and np.isnan(value):
+        return []
+    return [value]
+
+
 def score_dataset(cfg: ScoreDatasetConfig) -> str:
     import pandas as pd  # noqa: PLC0415
 
@@ -687,8 +700,7 @@ def _score_with_scalar_value(df, cfg: ScoreDatasetConfig) -> list[list[float]]:
             prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
             cond_ids: list[int] = []
             if cfg.value_model_ground_truth_conditioning:
-                sibs = row.get("sibling_rollouts")
-                sibs = list(sibs) if sibs is not None else []
+                sibs = _optional_sequence_as_list(row.get("sibling_rollouts"))
                 cond_text = value_model_utils.build_conditioning_text(
                     cfg.gt_conditioning_template, row["ground_truth"], siblings=sibs
                 )
@@ -739,7 +751,7 @@ def _score_with_generative_value(df, cfg: ScoreDatasetConfig) -> list[list[float
                 partial,
                 conditioning=cfg.gen_value_conditioning,
                 ground_truth=row["ground_truth"],
-                siblings=row.get("sibling_rollouts") or [],
+                siblings=_optional_sequence_as_list(row.get("sibling_rollouts")),
                 score_min=cfg.gen_value_score_min,
                 score_max=cfg.gen_value_score_max,
                 problem=row.get("problem", row.get("prompt", "")),

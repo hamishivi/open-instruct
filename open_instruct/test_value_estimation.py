@@ -3,6 +3,8 @@ import dataclasses
 import math
 import unittest
 
+import numpy as np
+
 from open_instruct import value_estimation
 
 
@@ -81,6 +83,11 @@ class TestValueEstimationStates(unittest.TestCase):
 
     def test_constant_correlation_is_not_finite(self):
         self.assertTrue(math.isnan(value_estimation._pearson_correlation([1, 1], [0, 1])))
+
+    def test_parquet_array_column_is_normalized_without_truth_testing(self):
+        self.assertEqual(value_estimation._optional_sequence_as_list(np.array(["a", "b"])), ["a", "b"])
+        self.assertEqual(value_estimation._optional_sequence_as_list(None), [])
+        self.assertEqual(value_estimation._optional_sequence_as_list(float("nan")), [])
 
 
 if __name__ == "__main__":
