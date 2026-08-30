@@ -550,8 +550,8 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
     # Generative value model: its own weights + its own vLLM pool.
     gen_value_model_name_or_path: str | None = None
     gen_value_model_revision: str | None = None
-    # Defaults to the policy tokenizer and revision, but can be overridden for an
-    # independently initialized critic.
+    # Defaults to the generative critic model's tokenizer and revision. This matters
+    # when the actor and critic are different variants with distinct EOS/chat tokens.
     gen_value_tokenizer_name_or_path: str | None = None
     gen_value_tokenizer_revision: str | None = None
     gen_value_vllm_num_engines: int = 1
@@ -649,16 +649,20 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
 
 
 def _resolve_gen_value_tokenizer(args: GenValueExperimentConfig, tc: TokenizerConfig) -> tuple[str, str | None]:
-    """Default to the policy tokenizer, or use a fully independent tokenizer override."""
-    tokenizer_path = args.gen_value_tokenizer_name_or_path or tc.tokenizer_name_or_path
-    if tokenizer_path is None:
-        raise ValueError("The policy or generative critic tokenizer path must be configured.")
-    if args.gen_value_tokenizer_name_or_path is None:
-        tokenizer_revision = args.gen_value_tokenizer_revision or tc.tokenizer_revision
-    else:
+    """Resolve a tokenizer that matches the critic model unless explicitly overridden."""
+    if args.gen_value_tokenizer_name_or_path is not None:
+        tokenizer_path = args.gen_value_tokenizer_name_or_path
         # A different repository must not inherit a revision belonging to the
         # policy tokenizer. None intentionally means that repository's default.
         tokenizer_revision = args.gen_value_tokenizer_revision
+    elif args.gen_value_model_name_or_path is not None:
+        tokenizer_path = args.gen_value_model_name_or_path
+        tokenizer_revision = args.gen_value_tokenizer_revision or args.gen_value_model_revision
+    else:
+        tokenizer_path = tc.tokenizer_name_or_path
+        tokenizer_revision = args.gen_value_tokenizer_revision or tc.tokenizer_revision
+    if tokenizer_path is None:
+        raise ValueError("The policy or generative critic tokenizer path must be configured.")
     return tokenizer_path, tokenizer_revision
 
 
