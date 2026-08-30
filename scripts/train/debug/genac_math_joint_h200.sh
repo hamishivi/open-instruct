@@ -34,7 +34,7 @@ trap 'ray stop --force' EXIT
 mkdir -p "${HOME}/.triton/autotune"
 
 EXP_NAME="${EXP_NAME:-genac-math-joint-h200}"
-RUN_OUTPUT_DIR="${RUN_OUTPUT_DIR:-/tmp/genac_math_joint_h200_output}"
+RUN_OUTPUT_DIR="${RUN_OUTPUT_DIR:-${PWD}/outputs/${EXP_NAME}}"
 CHECKPOINT_STATE_DIR="${CHECKPOINT_STATE_DIR:-${RUN_OUTPUT_DIR}/checkpoint_states}"
 
 python open_instruct/grpo_fast_genvalue.py \
