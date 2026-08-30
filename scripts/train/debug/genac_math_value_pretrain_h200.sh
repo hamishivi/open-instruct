@@ -32,6 +32,7 @@ RUN_OUTPUT_DIR="${RUN_OUTPUT_DIR:-${PWD}/outputs/${EXP_NAME}}"
 CHECKPOINT_STATE_DIR="${CHECKPOINT_STATE_DIR:-${RUN_OUTPUT_DIR}/checkpoint_states}"
 VALUE_PRETRAIN_STEPS="${VALUE_PRETRAIN_STEPS:-100}"
 GEN_VALUE_MODEL_PATH="${GEN_VALUE_MODEL_PATH:-Qwen/Qwen3-4B-Instruct-2507}"
+GEN_VALUE_CONDITIONING="${GEN_VALUE_CONDITIONING:-none}"
 NUM_UNIQUE_PROMPTS_ROLLOUT=32
 NUM_SAMPLES_PER_PROMPT_ROLLOUT=8
 
@@ -116,7 +117,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --gen_value_max_new_tokens 1024 \
     --gen_value_max_model_len 32768 \
     --gen_value_temperature 1.0 \
-    --gen_value_conditioning gt \
+    --gen_value_conditioning "${GEN_VALUE_CONDITIONING}" \
     --gen_value_use_icc true \
     --gen_value_icc_momentum 0.9 \
     --gen_value_learning_rate 1e-6 \

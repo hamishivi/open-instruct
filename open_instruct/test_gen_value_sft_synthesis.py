@@ -46,6 +46,24 @@ class TestGenValueSFTSynthesis(unittest.TestCase):
         self.assertEqual(sum(example["outcome"] == 0.0 for example in selected), 4)
         self.assertEqual(sum(example["outcome"] == 1.0 for example in selected), 4)
 
+    def test_teacher_state_selection_accepts_fixed_validation_snapshot(self):
+        snapshot = {
+            "target": 0.0,
+            "kind": "final_action",
+            "version": 25,
+            "trajectory_fraction": 1.0,
+            "prediction": 0.9,
+            "prompt": "held-out critic prompt",
+            "generation": "source critic output",
+        }
+
+        selected = select_teacher_states([snapshot], min_critic_version=25, max_examples_per_outcome=1, seed=0)
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["outcome"], 0.0)
+        self.assertEqual(selected[0]["state_kind"], "final_action")
+        self.assertEqual(selected[0]["source_critic_version"], 25)
+
     def test_batch_request_uses_paper_teacher_and_responses_endpoint(self):
         request = make_batch_request(
             "trace-1", "critic prompt", model="gpt-5", reasoning_effort="medium", max_output_tokens=1024
@@ -82,6 +100,7 @@ class TestGenValueSFTSynthesis(unittest.TestCase):
                     min_critic_version=25,
                     max_examples_per_outcome=1,
                     seed=0,
+                    allow_ground_truth_conditioning=False,
                 )
             )
 
@@ -129,6 +148,30 @@ class TestGenValueSFTSynthesis(unittest.TestCase):
             self.assertEqual(len(sft_rows), 2)
             self.assertEqual({row["teacher_prediction"] for row in sft_rows}, {0.1, 0.9})
             self.assertTrue(all(row["teacher_model"] == "gpt-5" for row in sft_rows))
+
+    def test_prepare_rejects_answer_conditioned_prompt_by_default(self):
+        example = self._state(0.0, "final_action")
+        example["prompt"] = "critic header\n\nThe correct answer is 42. \nPartial response: wrong"
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            input_path = root / "snapshot.jsonl"
+            input_path.write_text(json.dumps(example) + "\n")
+
+            with self.assertRaisesRegex(ValueError, "answer-conditioned critic prompts"):
+                prepare(
+                    argparse.Namespace(
+                        inputs=[input_path],
+                        batch_output=root / "batch.jsonl",
+                        metadata_output=root / "metadata.jsonl",
+                        model="gpt-5",
+                        reasoning_effort="medium",
+                        max_output_tokens=1024,
+                        min_critic_version=25,
+                        max_examples_per_outcome=1,
+                        seed=0,
+                        allow_ground_truth_conditioning=False,
+                    )
+                )
 
 
 if __name__ == "__main__":

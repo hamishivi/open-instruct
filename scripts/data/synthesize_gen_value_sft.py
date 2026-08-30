@@ -31,6 +31,7 @@ progress, errors, and remaining recovery opportunities, then estimate the probab
 will ultimately produce a verifier-correct answer within its remaining token budget. Do not assume knowledge of the
 sampled trajectory's eventual outcome. Respond with concise value-focused reasoning followed by exactly one final
 tag of the form <answer>N</answer>, where N is an integer from 0 to 10. Do not output anything after the tag."""
+GROUND_TRUTH_CONDITIONING_MARKER = "\n\nThe correct answer is "
 
 
 def read_jsonl(paths: Sequence[pathlib.Path]) -> list[dict[str, Any]]:
@@ -62,8 +63,18 @@ def select_teacher_states(
     """Select outcome/position-balanced raw states independently of critic quality."""
     candidates: list[dict[str, Any]] = []
     for example in examples:
-        outcome = example.get("outcome")
         candidate = dict(example)
+        # Fixed validation snapshots use target/kind/version, while training-trace
+        # reservoirs use outcome/state_kind/source_critic_version. Normalize both
+        # into the reservoir schema so an already-held-out state set can seed SFT
+        # without being regenerated or moved into critic training.
+        if candidate.get("outcome") is None and candidate.get("target") is not None:
+            candidate["outcome"] = candidate["target"]
+        if candidate.get("state_kind") is None and candidate.get("kind") is not None:
+            candidate["state_kind"] = candidate["kind"]
+        if candidate.get("source_critic_version") is None and candidate.get("version") is not None:
+            candidate["source_critic_version"] = candidate["version"]
+        outcome = candidate.get("outcome")
         # The generic trace selector's accuracy gate is intentionally neutralized
         # here. It still validates/deduplicates prompts and performs the exact same
         # outcome/position balancing used by the self-trace fallback.
@@ -136,6 +147,19 @@ def prepare(args: argparse.Namespace) -> None:
     )
     if not selected:
         raise RuntimeError("No raw critic states passed the teacher-state selection criteria.")
+    if not args.allow_ground_truth_conditioning:
+        leaked_answer_prompts = [
+            example
+            for example in selected
+            if GROUND_TRUTH_CONDITIONING_MARKER in str(example.get("prompt", ""))
+        ]
+        if leaked_answer_prompts:
+            raise ValueError(
+                f"Refusing to synthesize paper-style teacher traces from {len(leaked_answer_prompts)} "
+                "answer-conditioned critic prompts. GenAC's critic prompt does not reveal the ground-truth answer. "
+                "Collect states with --gen_value_conditioning=none, or pass "
+                "--allow_ground_truth_conditioning only for an intentional answer-conditioned ablation."
+            )
 
     metadata_rows: list[dict[str, Any]] = []
     batch_rows: list[dict[str, Any]] = []
@@ -245,6 +269,11 @@ def parse_args() -> argparse.Namespace:
     prepare_parser.add_argument("--min_critic_version", type=int, default=0)
     prepare_parser.add_argument("--max_examples_per_outcome", type=int, default=512)
     prepare_parser.add_argument("--seed", type=int, default=0)
+    prepare_parser.add_argument(
+        "--allow_ground_truth_conditioning",
+        action="store_true",
+        help="Allow answer-conditioned prompts for an explicit non-paper ablation.",
+    )
     prepare_parser.set_defaults(function=prepare)
 
     collect_parser = subparsers.add_parser("collect", help="Create SFT JSONL from completed Batch API results.")
