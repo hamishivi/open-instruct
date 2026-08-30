@@ -45,9 +45,15 @@ TOTAL_EPISODES=$((CONTROL_STEPS * NUM_UNIQUE_PROMPTS_ROLLOUT * NUM_SAMPLES_PER_P
 
 RAY_PORT="${RAY_PORT:-$((8000 + ${SLURM_JOB_ID:-0} % 1000))}"
 RAY_TEMP_DIR="${RAY_TEMP_DIR:-/tmp/ray-${USER}-${SLURM_JOB_ID:-local}}"
-ray stop --force 2>/dev/null || true
+# `ray stop` is user-global on a host. Slurm can colocate two jobs owned by the
+# same user, so invoking it here would kill the other job's Ray cluster. Slurm
+# tears down this job's processes with its cgroup; retain explicit cleanup only
+# for local runs where there is no scheduler-owned process boundary.
+if [[ -z "${SLURM_JOB_ID:-}" ]]; then
+    ray stop --force 2>/dev/null || true
+    trap 'ray stop --force' EXIT
+fi
 ray start --head --port="${RAY_PORT}" --temp-dir="${RAY_TEMP_DIR}" --dashboard-host=0.0.0.0
-trap 'ray stop --force' EXIT
 
 mkdir -p "${HOME}/.triton/autotune"
 
