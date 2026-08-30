@@ -2453,6 +2453,9 @@ class PolicyTrainerRayProcess(RayProcess):
             # Pipe complete rollouts to the independent critic loop. The bounded
             # queue provides backpressure instead of silently dropping critic data.
             if _use_gen_value and self._gen_value_training_queue is not None and _gen_value_training_rollouts:
+                sae_step_metrics.update(
+                    value_model_utils.gen_value_sampled_version_metrics(_gen_value_training_rollouts)
+                )
                 self._gen_value_training_queue.put(_gen_value_training_rollouts)
                 self._gen_value_latest_enqueued_policy_training_step = training_step
                 sae_step_metrics["gen_value/enqueued_rollouts"] = float(len(_gen_value_training_rollouts))

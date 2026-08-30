@@ -51,6 +51,7 @@ from open_instruct.value_model_utils import (
     causal_value_mask,
     compute_value_loss,
     flatten_gen_value_pack,
+    gen_value_sampled_version_metrics,
     gen_value_validation_metrics,
     generative_value_reinforce_reward,
     generative_value_reinforce_weights,
@@ -617,6 +618,20 @@ class TestScoreParsing(unittest.TestCase):
 
 
 class TestValueLoss(unittest.TestCase):
+    def test_gen_value_sampled_version_metrics(self):
+        metrics = gen_value_sampled_version_metrics(
+            [{"critic_version": 5}, {"critic_version": 5}, {"critic_version": 6}]
+        )
+
+        self.assertEqual(metrics["gen_value/sampled_value_version_min"], 5.0)
+        self.assertEqual(metrics["gen_value/sampled_value_version_max"], 6.0)
+        self.assertEqual(metrics["gen_value/sampled_value_version_spread"], 1.0)
+        self.assertEqual(gen_value_sampled_version_metrics([]), {})
+
+    def test_gen_value_sampled_version_metrics_rejects_negative_versions(self):
+        with self.assertRaisesRegex(ValueError, "must be nonnegative"):
+            gen_value_sampled_version_metrics([{"critic_version": -1}])
+
     def test_defaults(self):
         config = grpo_utils.GRPOExperimentConfig()
         self.assertEqual(config.value_loss, "mse")

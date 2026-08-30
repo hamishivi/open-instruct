@@ -90,6 +90,27 @@ def reward_to_unit_value(value: float, value_min: float, value_max: float) -> fl
     return max(0.0, min(1.0, (value - value_min) / (value_max - value_min)))
 
 
+def gen_value_sampled_version_metrics(rollouts: list[dict]) -> dict[str, float]:
+    """Summarize the critic versions that produced one actor step's values.
+
+    Critic training reports source versions only after the asynchronous queue is
+    consumed. These actor-side metrics expose publication lag at the policy step
+    where the values are actually used.
+    """
+    if not rollouts:
+        return {}
+    versions = [int(rollout["critic_version"]) for rollout in rollouts]
+    if any(version < 0 for version in versions):
+        raise ValueError(f"Generative-value critic versions must be nonnegative, got {versions}.")
+    minimum = min(versions)
+    maximum = max(versions)
+    return {
+        "gen_value/sampled_value_version_min": float(minimum),
+        "gen_value/sampled_value_version_max": float(maximum),
+        "gen_value/sampled_value_version_spread": float(maximum - minimum),
+    }
+
+
 def missing_value_fallback(value_min: float, value_max: float) -> float:
     """Return the reward-support value closest to zero for a missing prediction."""
     validate_value_bounds(value_min, value_max)
