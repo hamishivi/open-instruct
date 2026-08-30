@@ -842,6 +842,14 @@ class TestValueLoss(unittest.TestCase):
         initial = [example for example in examples if example["kind"] == "initial"]
         self.assertEqual(len(initial), 1)
         self.assertEqual(initial[0]["target"], 0.5)
+        self.assertEqual(initial[0]["target_source"], "sibling_empirical_return")
+        self.assertTrue(
+            all(
+                example["target_source"] == "single_sample_return"
+                for example in examples
+                if example["kind"] != "initial"
+            )
+        )
         self.assertEqual(len(examples), 3)
         self.assertEqual(training_pairs, [])
 
@@ -940,6 +948,19 @@ class TestValueLoss(unittest.TestCase):
         self.assertEqual(metrics["gen_value/validation_final_incorrect_v_hat_mean"], 0.4)
         self.assertEqual(metrics["gen_value/validation_final_action_incorrect_v_hat_mean"], 0.4)
         self.assertEqual(metrics["gen_value/validation_near_horizon_incorrect_v_hat_mean"], 0.4)
+
+    def test_gen_value_validation_metrics_distinguish_empirical_and_sampled_targets(self):
+        examples = [
+            {"kind": "initial", "target": 0.25, "target_source": "sibling_empirical_return"},
+            {"kind": "segment_start", "target": 0.0, "target_source": "single_sample_return"},
+        ]
+
+        metrics = gen_value_validation_metrics(examples, [0.5, 0.4])
+
+        self.assertEqual(metrics["gen_value/validation_empirical_return_examples"], 1.0)
+        self.assertEqual(metrics["gen_value/validation_single_sample_return_examples"], 1.0)
+        self.assertAlmostEqual(metrics["gen_value/validation_empirical_return_mse"], 0.25**2)
+        self.assertAlmostEqual(metrics["gen_value/validation_single_sample_return_mse"], 0.4**2)
 
     def test_gen_value_validation_metrics_measure_prefix_ranking_and_near_horizon_failures(self):
         examples = [

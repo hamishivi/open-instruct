@@ -417,9 +417,11 @@ def build_gen_value_validation_holdout(
 
     Initial states are grouped by their exact critic prompt and assigned the empirical
     success rate across sibling policy rollouts. Spread-out trajectory prefixes and final
-    actions retain their binary observed outcome. Every state from a selected actor-prompt
-    group is removed from the REINFORCE pairs returned to the caller, preventing prefix
-    leakage into the repeated calibration diagnostic.
+    actions retain their single sampled return. The latter are useful unbiased Bernoulli
+    diagnostics in aggregate, but they are not low-variance state-value targets: precise
+    per-state calibration requires multiple fresh continuations from each fixed prefix.
+    Every state from a selected actor-prompt group is removed from the REINFORCE pairs
+    returned to the caller, preventing prefix leakage into the repeated diagnostic.
     """
     if not 0.0 < prompt_holdout_fraction <= 1.0:
         raise ValueError(f"prompt_holdout_fraction must be in (0, 1], got {prompt_holdout_fraction}.")
@@ -471,6 +473,7 @@ def build_gen_value_validation_holdout(
             {
                 "prompt_token_ids": list(prompt_ids),
                 "target": sum(outcomes) / len(outcomes),
+                "target_source": "sibling_empirical_return",
                 "kind": "initial",
                 "response_tokens_used": 0,
                 "response_token_limit": first_pairs[0].get("response_token_limit"),
@@ -534,6 +537,7 @@ def build_gen_value_validation_holdout(
             {
                 "prompt_token_ids": list(pair["request_output"].prompt_token_ids),
                 "target": float(pair["outcome"]),
+                "target_source": "single_sample_return",
                 "kind": pair.get("state_kind", "final_segment"),
                 "response_tokens_used": pair.get("response_tokens_used"),
                 "response_token_limit": pair.get("response_token_limit"),
@@ -591,6 +595,16 @@ def gen_value_validation_metrics(
         ) / len(rows)
 
     initial = [(example, prediction) for example, prediction in parsed if example["kind"] == "initial"]
+    empirical_return = [
+        (example, prediction)
+        for example, prediction in parsed
+        if example.get("target_source") == "sibling_empirical_return"
+    ]
+    single_sample_return = [
+        (example, prediction)
+        for example, prediction in parsed
+        if example.get("target_source") == "single_sample_return"
+    ]
     final_kinds = {"final_segment", "final_action"}
     final_correct = [
         (example, prediction)
@@ -644,6 +658,8 @@ def gen_value_validation_metrics(
     ]
 
     add_group("initial", initial)
+    add_group("empirical_return", empirical_return)
+    add_group("single_sample_return", single_sample_return)
     add_group("final_correct", final_correct)
     add_group("final_incorrect", final_incorrect)
     add_group("final_action_correct", final_action_correct)

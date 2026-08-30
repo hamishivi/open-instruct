@@ -28,16 +28,18 @@ import argparse
 import contextlib
 import dataclasses
 import json
-import logging
 import os
 import pathlib
 import random
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
+from open_instruct import logger_utils
+
+logger = logger_utils.setup_logger(__name__)
 
 
 # --------------------------------------------------------------------------------------------
@@ -60,6 +62,13 @@ class MakeDatasetConfig:
     probe_mode: str = "fixed"
     sae_threshold: float = 0.2
     max_probes: int = 16
+    include_final_action_probe: bool = True
+    """Also probe the state immediately before the sampled rollout's final token.
+
+    This is not assigned the sampled rollout's binary outcome: fresh continuations
+    may choose a different next token and recover, especially when much of the
+    configured response budget remains.
+    """
     # Chat template applied to each prompt before rollout. If set and registered in
     # dataset_transformation.CHAT_TEMPLATES, that template is used; otherwise the model's
     # built-in template is used. None skips templating (raw-string completion).
@@ -117,13 +126,13 @@ class ConvertCheckpointConfig:
 # make_dataset
 # --------------------------------------------------------------------------------------------
 def _run_rollouts(
-    prompts: list[str],
+    prompts: list[str | list[int]],
     *,
     model_name_or_path: str,
     n: int,
     temperature: float,
     top_p: float,
-    max_tokens: int,
+    max_tokens: int | Sequence[int],
     tensor_parallel_size: int,
     gpu_memory_utilization: float,
     logprobs: bool = False,
@@ -138,9 +147,25 @@ def _run_rollouts(
         tensor_parallel_size=tensor_parallel_size,
         gpu_memory_utilization=gpu_memory_utilization,
     )
-    sampling = SamplingParams(
-        n=n, temperature=temperature, top_p=top_p, max_tokens=max_tokens, logprobs=1 if logprobs else None
-    )
+    if isinstance(max_tokens, int):
+        sampling: SamplingParams | list[SamplingParams] = SamplingParams(
+            n=n, temperature=temperature, top_p=top_p, max_tokens=max_tokens, logprobs=1 if logprobs else None
+        )
+    else:
+        if len(max_tokens) != len(prompts):
+            raise ValueError(
+                f"max_tokens must be one integer or one value per prompt ({len(max_tokens)} != {len(prompts)})."
+            )
+        sampling = [
+            SamplingParams(
+                n=n,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=int(prompt_max_tokens),
+                logprobs=1 if logprobs else None,
+            )
+            for prompt_max_tokens in max_tokens
+        ]
     raw = llm.generate(prompts, sampling)
     result: list[list[dict[str, Any]]] = []
     for out in raw:
@@ -149,12 +174,77 @@ def _run_rollouts(
             lp = None
             if logprobs and getattr(c, "logprobs", None) is not None:
                 lp = [next(iter(p.values())).logprob if p else 0.0 for p in c.logprobs]
-            cands.append({"token_ids": list(c.token_ids), "text": c.text, "logprobs": lp})
+            cands.append(
+                {
+                    "prompt_token_ids": list(out.prompt_token_ids),
+                    "token_ids": list(c.token_ids),
+                    "text": c.text,
+                    "logprobs": lp,
+                }
+            )
         result.append(cands)
     # Cleanly shut down the LLM engine so the next call can re-init without leaks.
     with contextlib.suppress(Exception):
         del llm
     return result
+
+
+def _actor_state_token_ids(prompt_token_ids: Sequence[int], rollout_token_ids: Sequence[int], probe: int) -> list[int]:
+    """Return the exact actor state used to sample continuations at ``probe``.
+
+    Reusing token IDs avoids the lossy token-to-character approximation that can
+    otherwise move a probe into a different reasoning state after decode/re-encode.
+    """
+    if not 0 <= probe <= len(rollout_token_ids):
+        raise ValueError(f"Probe {probe} must be in [0, {len(rollout_token_ids)}].")
+    return [*prompt_token_ids, *rollout_token_ids[:probe]]
+
+
+def _decode_full_continuation(
+    tokenizer: Any, rollout_prefix_token_ids: Sequence[int], continuation_token_ids: Sequence[int]
+) -> str:
+    """Decode the complete candidate response that the verifier must grade."""
+    return tokenizer.decode([*rollout_prefix_token_ids, *continuation_token_ids], skip_special_tokens=True)
+
+
+def _fixed_probe_positions(
+    rollout_length: int,
+    response_token_limit: int,
+    probe_interval: int,
+    min_remaining_tokens: int,
+    max_probes: int,
+    include_final_action_probe: bool,
+) -> list[int]:
+    """Choose states using the configured response horizon, not sampled EOS.
+
+    A rollout ending at token 1,000 does not imply only zero tokens remain: from
+    the state before its sampled EOS, another continuation can decline to stop and
+    use the rest of the 8,192-token budget. The old selector incorrectly filtered
+    such states using ``rollout_length - probe``.
+    """
+    if rollout_length < 0 or response_token_limit <= 0:
+        raise ValueError(
+            f"rollout_length must be nonnegative and response_token_limit positive, got "
+            f"{rollout_length} and {response_token_limit}."
+        )
+    if probe_interval <= 0 or min_remaining_tokens < 0 or max_probes <= 0:
+        raise ValueError("probe_interval and max_probes must be positive; min_remaining_tokens must be nonnegative.")
+
+    positions = [
+        probe
+        for probe in range(probe_interval, rollout_length, probe_interval)
+        if response_token_limit - probe >= min_remaining_tokens
+    ]
+    if include_final_action_probe and rollout_length > 0:
+        final_action_probe = rollout_length - 1
+        if response_token_limit - final_action_probe >= min_remaining_tokens:
+            positions.append(final_action_probe)
+    positions = sorted(set(positions))
+    if len(positions) <= max_probes:
+        return positions
+    # Retain broad horizon coverage and always preserve the latest selected state.
+    selected_indices = np.linspace(0, len(positions) - 1, num=max_probes, dtype=int)
+    return [positions[index] for index in sorted(set(selected_indices.tolist()))]
 
 
 _VERIFIER_CACHE: dict[str, Any] = {}
@@ -174,6 +264,7 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
     """Build the value-estimation dataset described in the plan."""
     import pandas as pd  # noqa: PLC0415
     from datasets import load_dataset  # noqa: PLC0415
+    from transformers import AutoTokenizer  # noqa: PLC0415
 
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
@@ -198,13 +289,11 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
 
     prompts = [_extract_prompt(r) for r in records]
     ground_truths = [_extract_gt(r) for r in records]
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name_or_path)
 
     if cfg.chat_template_name is not None:
-        from transformers import AutoTokenizer  # noqa: PLC0415
-
         from open_instruct.dataset_transformation import CHAT_TEMPLATES  # noqa: PLC0415
 
-        tokenizer = AutoTokenizer.from_pretrained(cfg.model_name_or_path)
         if cfg.chat_template_name == "builtin":
             if not getattr(tokenizer, "chat_template", None):
                 raise ValueError(
@@ -254,7 +343,8 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
     # Build rows: for each kept prompt, pick the first correct + first incorrect rollout.
     # The other rollouts become the sibling_rollouts pool for conditioning variants.
     rows: list[dict[str, Any]] = []
-    continuation_prompts: list[str] = []
+    continuation_prompts: list[list[int]] = []
+    continuation_max_tokens: list[int] = []
     continuation_indices: list[tuple[int, int]] = []  # (row_idx, probe_idx)
     for orig_idx, cands, verdicts in kept:
         gt = ground_truths[orig_idx]
@@ -278,15 +368,33 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
                     sae_threshold=cfg.sae_threshold,
                     max_segments=cfg.max_probes,
                 )
-                probe_positions = [t for t in raw_boundaries if (length - t) >= cfg.min_probe_remaining_tokens]
-            else:
                 probe_positions = [
                     t
-                    for t in range(cfg.probe_interval, length, cfg.probe_interval)
-                    if (length - t) >= cfg.min_probe_remaining_tokens
+                    for t in raw_boundaries
+                    if 0 <= t < length and cfg.max_response_length - t >= cfg.min_probe_remaining_tokens
                 ]
+                if cfg.include_final_action_probe and length > 0:
+                    final_action_probe = length - 1
+                    if cfg.max_response_length - final_action_probe >= cfg.min_probe_remaining_tokens:
+                        probe_positions.append(final_action_probe)
+                probe_positions = sorted(set(probe_positions))
+                if len(probe_positions) > cfg.max_probes:
+                    selected_indices = np.linspace(0, len(probe_positions) - 1, num=cfg.max_probes, dtype=int)
+                    probe_positions = [probe_positions[index] for index in sorted(set(selected_indices.tolist()))]
+            else:
+                if cfg.probe_mode != "fixed":
+                    raise ValueError(f"Unknown probe_mode: {cfg.probe_mode!r}; expected 'fixed' or 'sae'.")
+                probe_positions = _fixed_probe_positions(
+                    rollout_length=length,
+                    response_token_limit=cfg.max_response_length,
+                    probe_interval=cfg.probe_interval,
+                    min_remaining_tokens=cfg.min_probe_remaining_tokens,
+                    max_probes=cfg.max_probes,
+                    include_final_action_probe=cfg.include_final_action_probe,
+                )
             row = {
                 "prompt": prompt,
+                "prompt_token_ids": main["prompt_token_ids"],
                 "ground_truth": gt,
                 "verifier_name": cfg.verifier_name,
                 "rollout_text": main["text"],
@@ -296,11 +404,13 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
                 "probe_positions": probe_positions,
                 "mc_values": [],  # filled in below
                 "num_continuations": cfg.continuations_per_probe,
+                "response_token_limit": cfg.max_response_length,
             }
             row_idx = len(rows)
             rows.append(row)
             for p_idx, t in enumerate(probe_positions):
-                continuation_prompts.append(prompt + main["text"][: _token_to_char_offset(main, t)])
+                continuation_prompts.append(_actor_state_token_ids(main["prompt_token_ids"], main["token_ids"], t))
+                continuation_max_tokens.append(cfg.max_response_length - t)
                 continuation_indices.append((row_idx, p_idx))
 
     # Compute MC values per probe by generating 32 continuations in one big vLLM batch.
@@ -315,39 +425,25 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
             n=cfg.continuations_per_probe,
             temperature=cfg.temperature,
             top_p=cfg.top_p,
-            max_tokens=cfg.max_response_length,
+            max_tokens=continuation_max_tokens,
             tensor_parallel_size=cfg.tensor_parallel_size,
             gpu_memory_utilization=cfg.gpu_memory_utilization,
         )
-        for (row_idx, _p_idx), cands in zip(continuation_indices, conts):
+        for (row_idx, p_idx), cands in zip(continuation_indices, conts):
             gt = rows[row_idx]["ground_truth"]
-            # Reconstruct the partial-response text we spliced (stored in row["rollout_text"] + probe offset).
-            # For MC value we need the FULL text after the partial prefix; the continuation's `text` is the
-            # model output from the prefix; verify each continuation concatenated with the partial prefix.
-            # For simplicity here we treat the continuation.text alone as the "rest of the answer",
-            # which is what vLLM returns for a completion-style call.
-            verdicts = [_verify(c["text"], gt, rows[row_idx]["verifier_name"]) for c in cands]
+            probe = rows[row_idx]["probe_positions"][p_idx]
+            rollout_prefix = rows[row_idx]["rollout_tokens"][:probe]
+            full_responses = [_decode_full_continuation(tokenizer, rollout_prefix, c["token_ids"]) for c in cands]
+            verdicts = [_verify(response, gt, rows[row_idx]["verifier_name"]) for response in full_responses]
             mc = sum(1 for v in verdicts if v) / max(len(verdicts), 1)
             rows[row_idx]["mc_values"].append(float(mc))
+            if cfg.keep_continuation_texts:
+                rows[row_idx].setdefault("continuation_texts", []).append(full_responses)
 
     pathlib.Path(os.path.dirname(cfg.output_path) or ".").mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_parquet(cfg.output_path, index=False)
     logger.info(f"Wrote {len(rows)} rows to {cfg.output_path}")
     return cfg.output_path
-
-
-def _token_to_char_offset(rollout: dict[str, Any], num_tokens: int) -> int:
-    """Approximate char offset for the first ``num_tokens`` of a rollout by proportional split.
-
-    This is a reasonable approximation when the tokenizer is BPE-like. For better fidelity,
-    callers can decode via a tokenizer and sum surface forms; we keep this cheap/fast for
-    dataset building purposes.
-    """
-    total_tokens = len(rollout.get("token_ids", []))
-    total_chars = len(rollout.get("text", ""))
-    if total_tokens == 0 or total_chars == 0:
-        return 0
-    return min(total_chars, int(total_chars * num_tokens / max(total_tokens, 1)))
 
 
 # --------------------------------------------------------------------------------------------
@@ -388,6 +484,7 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
     preds_per_row: list[list[float]] = []
     all_preds: list[float] = []
     all_mc: list[float] = []
+    all_horizon_fractions: list[float] = []
 
     if cfg.value_model_type == "scalar":
         preds_per_row = _score_with_scalar_value(df, cfg)
@@ -401,9 +498,12 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
     probe_rows = []
     for i, row in df.iterrows():
         is_correct = bool(row.get("rollout_is_correct"))
+        response_token_limit = int(row.get("response_token_limit", 8192))
         for pos, p, mc in zip(row["probe_positions"], preds_per_row[i], row["mc_values"]):
             all_preds.append(float(p))
             all_mc.append(float(mc))
+            horizon_fraction = int(pos) / max(response_token_limit, 1)
+            all_horizon_fractions.append(horizon_fraction)
             if is_correct:
                 correct_preds.append(float(p))
             else:
@@ -414,6 +514,8 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
                     "rollout_idx": i,
                     "rollout_is_correct": is_correct,
                     "probe_position": int(pos),
+                    "response_tokens_remaining": response_token_limit - int(pos),
+                    "horizon_fraction": horizon_fraction,
                     "predicted_value": float(p),
                     "mc_value": float(mc),
                 }
@@ -440,6 +542,23 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
                 continue
             metrics[f"calib_bin_{b}_pred_mean"] = float(np.mean([all_preds[j] for j in chunk]))
             metrics[f"calib_bin_{b}_mc_mean"] = float(np.mean([all_mc[j] for j in chunk]))
+
+        horizon_buckets = {
+            "early": [j for j, fraction in enumerate(all_horizon_fractions) if fraction < 0.25],
+            "middle": [j for j, fraction in enumerate(all_horizon_fractions) if 0.25 <= fraction < 0.75],
+            "late": [j for j, fraction in enumerate(all_horizon_fractions) if fraction >= 0.75],
+        }
+        for name, indices in horizon_buckets.items():
+            if not indices:
+                continue
+            bucket_preds = [all_preds[j] for j in indices]
+            bucket_mc = [all_mc[j] for j in indices]
+            metrics[f"horizon_{name}_examples"] = float(len(indices))
+            metrics[f"horizon_{name}_pred_mean"] = float(np.mean(bucket_preds))
+            metrics[f"horizon_{name}_mc_mean"] = float(np.mean(bucket_mc))
+            metrics[f"horizon_{name}_mse"] = float(
+                np.mean([(prediction - target) ** 2 for prediction, target in zip(bucket_preds, bucket_mc)])
+            )
 
     if correct_preds:
         metrics["correct_pred_mean"] = float(np.mean(correct_preds))
@@ -554,6 +673,8 @@ def _score_with_generative_value(df, cfg: ScoreDatasetConfig) -> list[list[float
                 score_min=cfg.gen_value_score_min,
                 score_max=cfg.gen_value_score_max,
                 problem=row.get("prompt", ""),
+                response_tokens_used=int(t),
+                response_token_limit=int(row.get("response_token_limit", 8192)),
             )
             prompts.append(prompt)
             positions.append((idx, p_idx))
@@ -680,7 +801,6 @@ def _cfg_from_args(cfg_cls, args_ns) -> Any:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
