@@ -13,7 +13,9 @@
 #
 # By default total_episodes = 100 critic-only steps * 32 prompts * 8 samples = 25,600.
 # VALUE_PRETRAIN_STEPS and GEN_VALUE_MODEL_PATH can be overridden to continue
-# critic-only training from a previously exported Hugging Face model.
+# critic-only training from a previously exported Hugging Face model.  The default
+# seed intentionally differs from the seed-1 rollout stream used to build the SFT
+# trace reservoir, so the post-SFT calibration stage exercises unseen prompts.
 set -euo pipefail
 
 if [[ "${PRESERVE_LD_LIBRARY_PATH:-0}" != "1" ]]; then
@@ -36,11 +38,16 @@ VALUE_PRETRAIN_STEPS="${VALUE_PRETRAIN_STEPS:-100}"
 # critic checkpoint.
 GEN_VALUE_MODEL_PATH="${GEN_VALUE_MODEL_PATH:-Qwen/Qwen3-4B-Base}"
 GEN_VALUE_CONDITIONING="${GEN_VALUE_CONDITIONING:-none}"
+SEED="${SEED:-17}"
 NUM_UNIQUE_PROMPTS_ROLLOUT=32
 NUM_SAMPLES_PER_PROMPT_ROLLOUT=8
 
 if [[ ! "${VALUE_PRETRAIN_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: VALUE_PRETRAIN_STEPS must be at least 1" >&2
+    exit 1
+fi
+if [[ ! "${SEED}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: SEED must be a nonnegative integer" >&2
     exit 1
 fi
 TOTAL_EPISODES=$((VALUE_PRETRAIN_STEPS * NUM_UNIQUE_PROMPTS_ROLLOUT * NUM_SAMPLES_PER_PROMPT_ROLLOUT))
@@ -95,7 +102,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --vllm_enable_prefix_caching \
     --inflight_updates true \
     --async_steps 8 \
-    --seed 1 \
+    --seed "${SEED}" \
     --local_eval_every -1 \
     --save_freq 100 \
     --checkpoint_state_freq 25 \
