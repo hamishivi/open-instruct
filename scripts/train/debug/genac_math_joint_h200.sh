@@ -5,6 +5,8 @@
 #
 # GPU layout: one learner, one policy vLLM, one critic vLLM, one critic trainer.
 # total_episodes = 300 joint steps * 32 prompts * 8 samples = 76,800
+# Two half-rate actor epochs make DAPO clipping active on the second pass while
+# keeping the nominal per-rollout update scale close to one 1e-6 pass.
 set -euo pipefail
 
 if [[ -z "${GEN_VALUE_MODEL_PATH:-}" ]]; then
@@ -52,6 +54,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --per_device_train_batch_size 1 \
     --num_unique_prompts_rollout 32 \
     --num_samples_per_prompt_rollout 8 \
+    --active_sampling false \
     --filter_zero_std_samples false \
     --model_name_or_path Qwen/Qwen3-4B-Base \
     --chat_template_name qwen_instruct_user_boxed_math \
@@ -65,10 +68,10 @@ python open_instruct/grpo_fast_genvalue.py \
     --use_vllm_logprobs \
     --truncated_importance_sampling_ratio_cap 0.0 \
     --advantage_normalization_type centered \
-    --learning_rate 1e-6 \
+    --learning_rate 5e-7 \
     --lr_scheduler_type constant \
     --total_episodes 76800 \
-    --num_epochs 1 \
+    --num_epochs 2 \
     --num_mini_batches 1 \
     --deepspeed_stage 3 \
     --deepspeed_offload_optimizer \
