@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Joint actor/critic run using the paired scalar and generative critics produced
-# by genac_math_value_pretrain_h200.sh.  The scalar value head is required: GAE
-# consumes it directly, so silently reinitializing it would discard half of the
-# value-pretraining stage even when the generative critic was restored correctly.
+# Joint actor/critic run using a separately validated generative critic. The
+# critic path must be the final `gen_value_model` directory produced by
+# genac_math_value_pretrain_h200.sh.
 #
 # GPU layout: one learner, one policy vLLM, one critic vLLM, one critic trainer.
 # By default total_episodes = 300 joint steps * 32 prompts * 8 samples = 76,800.
@@ -20,15 +19,6 @@ if [[ -z "${GEN_VALUE_MODEL_PATH:-}" ]]; then
 fi
 if [[ ! -d "${GEN_VALUE_MODEL_PATH}" ]]; then
     echo "ERROR: GEN_VALUE_MODEL_PATH does not exist: ${GEN_VALUE_MODEL_PATH}" >&2
-    exit 1
-fi
-
-# A normal value-pretraining export stores the two loadable artifacts as sibling
-# directories: `gen_value_model/` and `value_model/value_model.bin`.
-VALUE_MODEL_CHECKPOINT_PATH="${VALUE_MODEL_CHECKPOINT_PATH:-$(dirname "${GEN_VALUE_MODEL_PATH}")/value_model}"
-if [[ ! -f "${VALUE_MODEL_CHECKPOINT_PATH}/value_model.bin" ]]; then
-    echo "ERROR: pretrained scalar value model does not exist: ${VALUE_MODEL_CHECKPOINT_PATH}/value_model.bin" >&2
-    echo "Set VALUE_MODEL_CHECKPOINT_PATH to the value_model directory from value pretraining." >&2
     exit 1
 fi
 
@@ -66,15 +56,6 @@ JOINT_TRAINING_STEPS="${JOINT_TRAINING_STEPS:-300}"
 VALUE_WARMUP_STEPS="${VALUE_WARMUP_STEPS:-0}"
 NUM_UNIQUE_PROMPTS_ROLLOUT=32
 NUM_SAMPLES_PER_PROMPT_ROLLOUT=8
-VALUE_MODEL_CONDITIONING_ARGS=(--gt_conditioning_template answer_prefix)
-if [[ "${GEN_VALUE_CONDITIONING}" == "gt" ]]; then
-    # Restore the scalar critic under the same privileged answer-prefix input
-    # construction used during paired value pretraining.
-    VALUE_MODEL_CONDITIONING_ARGS+=(
-        --value_model_ground_truth_conditioning
-        --gt_conditioning_template answer_prefix
-    )
-fi
 
 if [[ ! "${JOINT_TRAINING_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: JOINT_TRAINING_STEPS must be at least 1" >&2
@@ -144,9 +125,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --with_tracking \
     --push_to_hub false \
     --use_value_model \
-    --init_value_from_pretrained_checkpoint "${VALUE_MODEL_CHECKPOINT_PATH}" \
     --value_warmup_steps "${VALUE_WARMUP_STEPS}" \
-    "${VALUE_MODEL_CONDITIONING_ARGS[@]}" \
     --gae_lambda 1.0 \
     --gamma 1.0 \
     --use_sae \
