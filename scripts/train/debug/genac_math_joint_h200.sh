@@ -52,8 +52,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --per_device_train_batch_size 1 \
     --num_unique_prompts_rollout 32 \
     --num_samples_per_prompt_rollout 8 \
-    --active_sampling \
-    --no_resampling_pass_rate 0.875 \
+    --filter_zero_std_samples false \
     --model_name_or_path Qwen/Qwen3-4B-Base \
     --chat_template_name qwen_instruct_user_boxed_math \
     --temperature 1.0 \
@@ -81,7 +80,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --vllm_top_p 1.0 \
     --vllm_enable_prefix_caching \
     --inflight_updates false \
-    --async_steps 2 \
+    --async_steps 1 \
     --seed 1 \
     --local_eval_every 25 \
     --eval_on_step_0 true \
