@@ -97,7 +97,8 @@ class TestWarmupWindows(unittest.TestCase):
 
 
 class TestGenerativeValueBoundaryState(unittest.TestCase):
-    def test_final_action_probe_baselines_only_the_final_action(self):
+    @staticmethod
+    def _trainer():
         trainer_class = PolicyTrainerRayProcess.__ray_metadata__.modified_class
         trainer = object.__new__(trainer_class)
         trainer.args = SimpleNamespace(
@@ -115,6 +116,10 @@ class TestGenerativeValueBoundaryState(unittest.TestCase):
         trainer.streaming_config = SimpleNamespace(response_length=8192)
         trainer.tokenizer = Mock()
         trainer.tokenizer.decode.side_effect = lambda token_ids, **_: " ".join(map(str, token_ids))
+        return trainer
+
+    def test_final_action_probe_baselines_only_the_final_action(self):
+        trainer = self._trainer()
 
         query_responses = torch.tensor([[10, 11, 20, 21, 22, 23]])
         position_ids = torch.arange(6).unsqueeze(0)
@@ -135,6 +140,29 @@ class TestGenerativeValueBoundaryState(unittest.TestCase):
 
         torch.testing.assert_close(values, torch.tensor([[0.0, 0.5, 0.5, 0.5, 0.0]]))
         self.assertEqual([pair["state_kind"] for pair in training_pairs], ["segment_start", "final_action"])
+
+    def test_packed_final_action_probes_do_not_cross_subsequences(self):
+        trainer = self._trainer()
+        query_responses = torch.tensor([[10, 11, 20, 21, 30, 31, 40, 41, 42]])
+        position_ids = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3, 4]])
+        response_mask = torch.tensor([[False, False, True, True, False, False, True, True, True]])
+        request = trainer._build_gen_value_scoring_request(
+            query_responses, position_ids, response_mask, ground_truths_pack=["2", "3"]
+        )
+
+        self.assertEqual(
+            request["prompt_state_kinds"], ["segment_start", "final_action", "segment_start", "final_action"]
+        )
+        self.assertEqual(request["prompt_subseq_idx"], [0, 0, 1, 1])
+        self.assertEqual(request["prompt_response_tokens_used"], [0, 1, 0, 2])
+
+        request_outputs = [
+            SimpleNamespace(outputs=[SimpleNamespace(text=f"<answer>{score}</answer>")]) for score in (5, 1, 6, 2)
+        ]
+        values, training_pairs = trainer._finish_gen_value_scoring_request(request, request_outputs)
+
+        torch.testing.assert_close(values, torch.tensor([[0.0, 0.5, 0.1, 0.0, 0.0, 0.6, 0.6, 0.2]]))
+        self.assertEqual([pair["subseq_idx"] for pair in training_pairs], [0, 0, 1, 1])
 
 
 class TestValueRewardRangeSetup(unittest.TestCase):
