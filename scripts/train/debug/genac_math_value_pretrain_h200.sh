@@ -46,6 +46,16 @@ GEN_VALUE_REINFORCE_BASELINE="${GEN_VALUE_REINFORCE_BASELINE:-leave_one_out_by_o
 SEED="${SEED:-17}"
 NUM_UNIQUE_PROMPTS_ROLLOUT=32
 NUM_SAMPLES_PER_PROMPT_ROLLOUT=8
+VALUE_MODEL_CONDITIONING_ARGS=(--gt_conditioning_template answer_prefix)
+if [[ "${GEN_VALUE_CONDITIONING}" == "gt" ]]; then
+    # Both critics are training-only and may use the privileged reference answer.
+    # Keep their information sets aligned so the scalar GAE critic is not asked
+    # to imitate an answer-conditioned generative critic without seeing the answer.
+    VALUE_MODEL_CONDITIONING_ARGS+=(
+        --value_model_ground_truth_conditioning
+        --gt_conditioning_template answer_prefix
+    )
+fi
 
 if [[ ! "${VALUE_PRETRAIN_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: VALUE_PRETRAIN_STEPS must be at least 1" >&2
@@ -123,6 +133,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --push_to_hub false \
     --use_value_model \
     --value_warmup_steps "${VALUE_PRETRAIN_STEPS}" \
+    "${VALUE_MODEL_CONDITIONING_ARGS[@]}" \
     --gae_lambda 1.0 \
     --gamma 1.0 \
     --use_sae \

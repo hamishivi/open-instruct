@@ -66,6 +66,15 @@ JOINT_TRAINING_STEPS="${JOINT_TRAINING_STEPS:-300}"
 VALUE_WARMUP_STEPS="${VALUE_WARMUP_STEPS:-0}"
 NUM_UNIQUE_PROMPTS_ROLLOUT=32
 NUM_SAMPLES_PER_PROMPT_ROLLOUT=8
+VALUE_MODEL_CONDITIONING_ARGS=(--gt_conditioning_template answer_prefix)
+if [[ "${GEN_VALUE_CONDITIONING}" == "gt" ]]; then
+    # Restore the scalar critic under the same privileged answer-prefix input
+    # construction used during paired value pretraining.
+    VALUE_MODEL_CONDITIONING_ARGS+=(
+        --value_model_ground_truth_conditioning
+        --gt_conditioning_template answer_prefix
+    )
+fi
 
 if [[ ! "${JOINT_TRAINING_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: JOINT_TRAINING_STEPS must be at least 1" >&2
@@ -137,6 +146,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --use_value_model \
     --init_value_from_pretrained_checkpoint "${VALUE_MODEL_CHECKPOINT_PATH}" \
     --value_warmup_steps "${VALUE_WARMUP_STEPS}" \
+    "${VALUE_MODEL_CONDITIONING_ARGS[@]}" \
     --gae_lambda 1.0 \
     --gamma 1.0 \
     --use_sae \
