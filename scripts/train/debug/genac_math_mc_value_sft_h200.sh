@@ -32,6 +32,12 @@ FINAL_ACTION_REPEAT="${FINAL_ACTION_REPEAT:-4}"
 LATE_STATE_REPEAT="${LATE_STATE_REPEAT:-2}"
 LATE_STATE_FRACTION="${LATE_STATE_FRACTION:-0.75}"
 GEN_VALUE_CONDITIONING="${GEN_VALUE_CONDITIONING:-none}"
+GEN_VALUE_SCORE_MAX="${GEN_VALUE_SCORE_MAX:-10}"
+
+if [[ ! "${GEN_VALUE_SCORE_MAX}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: GEN_VALUE_SCORE_MAX must be a positive integer" >&2
+    exit 1
+fi
 
 "${PYTHON_EXECUTABLE}" scripts/data/prepare_gen_value_mc_sft.py \
     "${MC_VALUE_PARQUET}" \
@@ -41,6 +47,7 @@ GEN_VALUE_CONDITIONING="${GEN_VALUE_CONDITIONING:-none}"
     --min_continuations "${MIN_CONTINUATIONS}" \
     --min_examples "${MIN_MC_EXAMPLES}" \
     --min_early_middle_fraction "${MIN_EARLY_MIDDLE_FRACTION}" \
+    --score_max "${GEN_VALUE_SCORE_MAX}" \
     --gen_value_conditioning "${GEN_VALUE_CONDITIONING}" \
     --final_action_repeat "${FINAL_ACTION_REPEAT}" \
     --late_state_repeat "${LATE_STATE_REPEAT}" \

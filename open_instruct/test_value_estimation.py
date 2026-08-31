@@ -97,6 +97,28 @@ class TestValueEstimationStates(unittest.TestCase):
         self.assertEqual([example["trajectory_fraction"] for example in examples], [0.5, 1.0])
         self.assertEqual(tokenizer.skip_special_tokens_calls, [False, False])
 
+    def test_mc_sft_score_grid_can_match_sixteen_continuation_targets_exactly(self):
+        examples = prepare_gen_value_mc_sft.build_mc_sft_examples(
+            [
+                {
+                    "problem": "Compute the answer.",
+                    "rollout_tokens": [10, 11],
+                    "probe_positions": [0, 1],
+                    "mc_values": [1 / 16, 15 / 16],
+                    "num_continuations": 16,
+                }
+            ],
+            tokenizer=_FakeTokenizer(),
+            min_continuations=16,
+            score_max=16,
+        )
+
+        self.assertEqual(
+            [example["generation"] for example in examples], [" <answer>1</answer>", " <answer>15</answer>"]
+        )
+        self.assertEqual([example["prediction"] for example in examples], [1 / 16, 15 / 16])
+        self.assertEqual([example["squared_error"] for example in examples], [0.0, 0.0])
+
     def test_mc_sft_can_upweight_late_and_final_states(self):
         examples = prepare_gen_value_mc_sft.build_mc_sft_examples(
             [

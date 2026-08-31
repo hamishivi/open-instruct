@@ -43,6 +43,7 @@ VALUE_PRETRAIN_STEPS="${VALUE_PRETRAIN_STEPS:-100}"
 GEN_VALUE_MODEL_PATH="${GEN_VALUE_MODEL_PATH:-Qwen/Qwen3-4B-Base}"
 GEN_VALUE_CONDITIONING="${GEN_VALUE_CONDITIONING:-none}"
 GEN_VALUE_REINFORCE_BASELINE="${GEN_VALUE_REINFORCE_BASELINE:-leave_one_out_by_outcome}"
+GEN_VALUE_SCORE_MAX="${GEN_VALUE_SCORE_MAX:-10}"
 SEED="${SEED:-17}"
 NUM_UNIQUE_PROMPTS_ROLLOUT=32
 NUM_SAMPLES_PER_PROMPT_ROLLOUT=8
@@ -53,6 +54,10 @@ if [[ ! "${VALUE_PRETRAIN_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [[ ! "${SEED}" =~ ^[0-9]+$ ]]; then
     echo "ERROR: SEED must be a nonnegative integer" >&2
+    exit 1
+fi
+if [[ ! "${GEN_VALUE_SCORE_MAX}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: GEN_VALUE_SCORE_MAX must be a positive integer" >&2
     exit 1
 fi
 TOTAL_EPISODES=$((VALUE_PRETRAIN_STEPS * NUM_UNIQUE_PROMPTS_ROLLOUT * NUM_SAMPLES_PER_PROMPT_ROLLOUT))
@@ -144,7 +149,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --gen_value_segmentation sae \
     --gen_value_max_segments 16 \
     --gen_value_score_min 0 \
-    --gen_value_score_max 10 \
+    --gen_value_score_max "${GEN_VALUE_SCORE_MAX}" \
     --gen_value_max_new_tokens 1024 \
     --gen_value_max_model_len 32768 \
     --gen_value_temperature 1.0 \

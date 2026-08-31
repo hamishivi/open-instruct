@@ -62,6 +62,7 @@ RUN_OUTPUT_DIR="${RUN_OUTPUT_DIR:-${PWD}/outputs/${EXP_NAME}}"
 CHECKPOINT_STATE_DIR="${CHECKPOINT_STATE_DIR:-${RUN_OUTPUT_DIR}/checkpoint_states}"
 GEN_VALUE_CONDITIONING="${GEN_VALUE_CONDITIONING:-none}"
 GEN_VALUE_REINFORCE_BASELINE="${GEN_VALUE_REINFORCE_BASELINE:-leave_one_out_by_outcome}"
+GEN_VALUE_SCORE_MAX="${GEN_VALUE_SCORE_MAX:-10}"
 # Pool token-identical critic states across sampled policy continuations to the
 # empirical Monte Carlo return without removing any critic completion.
 GEN_VALUE_POOL_SHARED_STATE_RETURNS="${GEN_VALUE_POOL_SHARED_STATE_RETURNS:-true}"
@@ -90,6 +91,10 @@ if [[ ! "${JOINT_TRAINING_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [[ ! "${VALUE_WARMUP_STEPS}" =~ ^[0-9]+$ ]]; then
     echo "ERROR: VALUE_WARMUP_STEPS must be a nonnegative integer" >&2
+    exit 1
+fi
+if [[ ! "${GEN_VALUE_SCORE_MAX}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: GEN_VALUE_SCORE_MAX must be a positive integer" >&2
     exit 1
 fi
 TOTAL_TRAINING_STEPS=$((VALUE_WARMUP_STEPS + JOINT_TRAINING_STEPS))
@@ -164,7 +169,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --gen_value_segmentation sae \
     --gen_value_max_segments 16 \
     --gen_value_score_min 0 \
-    --gen_value_score_max 10 \
+    --gen_value_score_max "${GEN_VALUE_SCORE_MAX}" \
     --gen_value_max_new_tokens 1024 \
     --gen_value_max_model_len 32768 \
     --gen_value_train_pack_length "${GEN_VALUE_TRAIN_PACK_LENGTH}" \
