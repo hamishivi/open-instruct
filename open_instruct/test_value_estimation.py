@@ -303,6 +303,9 @@ class TestValueEstimationStates(unittest.TestCase):
             value_estimation.ScoreDatasetConfig.__dataclass_fields__["gen_value_max_new_tokens"].default, 1024
         )
 
+    def test_mc_dataset_defaults_to_one_data_parallel_replica(self):
+        self.assertEqual(value_estimation.MakeDatasetConfig.__dataclass_fields__["data_parallel_size"].default, 1)
+
     def test_optional_float_cli_field_is_parsed_as_float(self):
         parser = argparse.ArgumentParser()
         field = next(

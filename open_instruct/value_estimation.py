@@ -85,6 +85,7 @@ class MakeDatasetConfig:
     top_p: float = 1.0
     seed: int = 1
     tensor_parallel_size: int = 1
+    data_parallel_size: int = 1
     gpu_memory_utilization: float = 0.9
     verifier_name: str = "math"
     keep_continuation_texts: bool = False
@@ -145,6 +146,7 @@ def _run_rollouts(
     top_p: float,
     max_tokens: int | Sequence[int],
     tensor_parallel_size: int,
+    data_parallel_size: int,
     gpu_memory_utilization: float,
     logprobs: bool = False,
 ) -> list[list[dict[str, Any]]]:
@@ -156,6 +158,7 @@ def _run_rollouts(
     llm = LLM(
         model=model_name_or_path,
         tensor_parallel_size=tensor_parallel_size,
+        data_parallel_size=data_parallel_size,
         gpu_memory_utilization=gpu_memory_utilization,
     )
     if isinstance(max_tokens, int):
@@ -402,6 +405,7 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
         top_p=cfg.top_p,
         max_tokens=cfg.max_response_length,
         tensor_parallel_size=cfg.tensor_parallel_size,
+        data_parallel_size=cfg.data_parallel_size,
         gpu_memory_utilization=cfg.gpu_memory_utilization,
         logprobs=cfg.probe_mode == "sae",
     )
@@ -503,6 +507,7 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
             top_p=cfg.top_p,
             max_tokens=continuation_max_tokens,
             tensor_parallel_size=cfg.tensor_parallel_size,
+            data_parallel_size=cfg.data_parallel_size,
             gpu_memory_utilization=cfg.gpu_memory_utilization,
         )
         for (row_idx, p_idx), cands in zip(continuation_indices, conts):

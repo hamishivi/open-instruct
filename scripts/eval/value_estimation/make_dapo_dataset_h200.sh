@@ -17,6 +17,7 @@ SAE_THRESHOLD="${SAE_THRESHOLD:-0.2}"
 SEED="${SEED:-1}"
 EXCLUDE_PROBLEM_DATASET_PATH="${EXCLUDE_PROBLEM_DATASET_PATH:-}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
+DATA_PARALLEL_SIZE="${DATA_PARALLEL_SIZE:-1}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 
 MAKE_DATASET_ARGS=(
@@ -36,6 +37,7 @@ MAKE_DATASET_ARGS=(
     --chat_template_name qwen_instruct_user_boxed_math
     --seed "${SEED}"
     --tensor_parallel_size "${TENSOR_PARALLEL_SIZE}"
+    --data_parallel_size "${DATA_PARALLEL_SIZE}"
     --gpu_memory_utilization "${GPU_MEMORY_UTILIZATION}"
 )
 if [[ -n "${EXCLUDE_PROBLEM_DATASET_PATH}" ]]; then
