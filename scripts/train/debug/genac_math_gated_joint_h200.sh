@@ -47,6 +47,12 @@ GATE_MIN_FINAL_CORRECT="${GATE_MIN_FINAL_CORRECT:-0.90}"
 GATE_MAX_FINAL_INCORRECT="${GATE_MAX_FINAL_INCORRECT:-0.08}"
 GATE_MIN_INTERMEDIATE_CORRECT="${GATE_MIN_INTERMEDIATE_CORRECT:-0.45}"
 GATE_MAX_INTERMEDIATE_INCORRECT="${GATE_MAX_INTERMEDIATE_INCORRECT:-0.20}"
+# Overall MSE is dominated by the balanced final-action probes, where the
+# direct-MC SFT critic is already nearly binary.  Bound intermediate-state MSE
+# separately so a warmup cannot pass by preserving terminal classification
+# while degrading the state values that actually shape SAE advantages.
+GATE_MAX_INTERMEDIATE_CORRECT_MSE="${GATE_MAX_INTERMEDIATE_CORRECT_MSE:-0.13}"
+GATE_MAX_INTERMEDIATE_INCORRECT_MSE="${GATE_MAX_INTERMEDIATE_INCORRECT_MSE:-0.08}"
 
 if python - \
     "${WARMUP_GATE_SUMMARY}" \
@@ -57,7 +63,9 @@ if python - \
     "${GATE_MIN_FINAL_CORRECT}" \
     "${GATE_MAX_FINAL_INCORRECT}" \
     "${GATE_MIN_INTERMEDIATE_CORRECT}" \
-    "${GATE_MAX_INTERMEDIATE_INCORRECT}" <<'PY'
+    "${GATE_MAX_INTERMEDIATE_INCORRECT}" \
+    "${GATE_MAX_INTERMEDIATE_CORRECT_MSE}" \
+    "${GATE_MAX_INTERMEDIATE_INCORRECT_MSE}" <<'PY'
 import json
 import sys
 
@@ -74,6 +82,8 @@ thresholds = dict(
             "max_final_incorrect",
             "min_intermediate_correct",
             "max_intermediate_incorrect",
+            "max_intermediate_correct_mse",
+            "max_intermediate_incorrect_mse",
         ),
         threshold_values,
     )
@@ -90,6 +100,8 @@ observed = {
     "final_incorrect": metrics["final_action_incorrect_pred_mean"],
     "intermediate_correct": metrics["intermediate_correct_pred_mean"],
     "intermediate_incorrect": metrics["intermediate_incorrect_pred_mean"],
+    "intermediate_correct_mse": metrics["intermediate_correct_penalized_mse"],
+    "intermediate_incorrect_mse": metrics["intermediate_incorrect_penalized_mse"],
 }
 checks = {
     "parse_rate": observed["parse_rate"] >= thresholds["min_parse_rate"],
@@ -100,6 +112,12 @@ checks = {
     "final_incorrect": observed["final_incorrect"] <= thresholds["max_final_incorrect"],
     "intermediate_correct": observed["intermediate_correct"] >= thresholds["min_intermediate_correct"],
     "intermediate_incorrect": observed["intermediate_incorrect"] <= thresholds["max_intermediate_incorrect"],
+    "intermediate_correct_mse": (
+        observed["intermediate_correct_mse"] <= thresholds["max_intermediate_correct_mse"]
+    ),
+    "intermediate_incorrect_mse": (
+        observed["intermediate_incorrect_mse"] <= thresholds["max_intermediate_incorrect_mse"]
+    ),
 }
 accepted = all(checks.values())
 print(json.dumps({"accepted": accepted, "checks": checks, "observed": observed, "thresholds": thresholds}, sort_keys=True))
