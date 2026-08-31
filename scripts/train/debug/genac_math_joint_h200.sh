@@ -53,7 +53,10 @@ CHECKPOINT_STATE_DIR="${CHECKPOINT_STATE_DIR:-${RUN_OUTPUT_DIR}/checkpoint_state
 GEN_VALUE_CONDITIONING="${GEN_VALUE_CONDITIONING:-none}"
 GEN_VALUE_REINFORCE_BASELINE="${GEN_VALUE_REINFORCE_BASELINE:-leave_one_out_by_outcome}"
 GEN_VALUE_LEARNING_RATE="${GEN_VALUE_LEARNING_RATE:-1e-6}"
-GEN_VALUE_SYNC_FREQ="${GEN_VALUE_SYNC_FREQ:-5}"
+# Weight publication costs well under one second versus minutes per policy step.
+# Publish every completed critic update so actor-facing values do not retain a
+# separate multi-update serving lag after source-data staleness is bounded.
+GEN_VALUE_SYNC_FREQ="${GEN_VALUE_SYNC_FREQ:-1}"
 GEN_VALUE_MAX_ASYNC_STEPS="${GEN_VALUE_MAX_ASYNC_STEPS:-1}"
 # A small/positive advantage gap remains useful signal. Keep only a hard guard
 # against reversed separation; use the continuous gap to drive critic diagnostics
