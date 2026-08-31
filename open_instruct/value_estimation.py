@@ -233,6 +233,16 @@ def _cuda_device_groups(
     ]
 
 
+def _configure_data_replica_environment(replica_rank: int, visible_devices: str) -> None:
+    """Isolate one vLLM replica's GPU visibility and compilation caches."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
+    job_key = os.environ.get("SLURM_JOB_ID", str(os.getppid()))
+    vllm_cache_root = pathlib.Path(os.environ.get("VLLM_CACHE_ROOT", "/tmp/vllm-data-cache"))
+    torchinductor_cache_root = pathlib.Path(os.environ.get("TORCHINDUCTOR_CACHE_DIR", "/tmp/torchinductor-data-cache"))
+    os.environ["VLLM_CACHE_ROOT"] = str(vllm_cache_root / f"job-{job_key}-replica-{replica_rank}")
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(torchinductor_cache_root / f"job-{job_key}-replica-{replica_rank}")
+
+
 def _run_rollouts_replica_worker(
     replica_rank: int,
     visible_devices: str,
@@ -250,7 +260,7 @@ def _run_rollouts_replica_worker(
 ) -> None:
     """Generate one prompt shard after masking the process to its assigned GPUs."""
     try:
-        os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
+        _configure_data_replica_environment(replica_rank, visible_devices)
         shard_results = _run_rollouts_single_replica(
             [prompt for _, prompt in indexed_prompts],
             model_name_or_path=model_name_or_path,

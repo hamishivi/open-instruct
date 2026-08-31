@@ -1,7 +1,9 @@
 import argparse
 import dataclasses
 import math
+import os
 import unittest
+from unittest import mock
 
 import numpy as np
 from scripts.data import prepare_gen_value_mc_sft, prepare_gen_value_sft, synthesize_gen_value_sft
@@ -317,6 +319,22 @@ class TestValueEstimationStates(unittest.TestCase):
     def test_dense_data_parallel_replicas_require_enough_visible_devices(self):
         with self.assertRaisesRegex(ValueError, "Need 4 visible CUDA devices"):
             value_estimation._cuda_device_groups(data_parallel_size=2, tensor_parallel_size=2, visible_devices="4,7,2")
+
+    def test_dense_data_parallel_replicas_isolate_compile_caches(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CUDA_VISIBLE_DEVICES": "4,7",
+                "SLURM_JOB_ID": "123",
+                "VLLM_CACHE_ROOT": "/cache/vllm",
+                "TORCHINDUCTOR_CACHE_DIR": "/cache/torchinductor",
+            },
+        ):
+            value_estimation._configure_data_replica_environment(1, "7")
+
+            self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "7")
+            self.assertEqual(os.environ["VLLM_CACHE_ROOT"], "/cache/vllm/job-123-replica-1")
+            self.assertEqual(os.environ["TORCHINDUCTOR_CACHE_DIR"], "/cache/torchinductor/job-123-replica-1")
 
     def test_mc_dataset_actor_identity_can_differ_from_rollout_checkpoint(self):
         config = value_estimation.MakeDatasetConfig(
