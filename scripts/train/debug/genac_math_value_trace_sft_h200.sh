@@ -10,6 +10,7 @@ fi
 
 MIN_TRACE_EXAMPLES=${MIN_TRACE_EXAMPLES:-512}
 ALLOW_GROUND_TRUTH_CONDITIONING=${ALLOW_GROUND_TRUTH_CONDITIONING:-0}
+TRACE_DATASET_WEIGHT=${TRACE_DATASET_WEIGHT:-1.0}
 if [[ ! "${MIN_TRACE_EXAMPLES}" =~ ^[0-9]+$ ]]; then
     echo "MIN_TRACE_EXAMPLES must be a nonnegative integer: ${MIN_TRACE_EXAMPLES}" >&2
     exit 1
@@ -20,6 +21,26 @@ if [[ "${ALLOW_GROUND_TRUTH_CONDITIONING}" == "1" ]]; then
 fi
 PYTHON_EXECUTABLE=${PYTHON_EXECUTABLE:-python}
 "${PYTHON_EXECUTABLE}" scripts/data/synthesize_gen_value_sft.py audit "${AUDIT_ARGS[@]}"
+
+DATASET_MIXER_ARGS=("${TRACE_JSONL}" "${TRACE_DATASET_WEIGHT}")
+if [[ -n "${AUX_TRACE_JSONL:-}" ]]; then
+    if [[ ! -f "${AUX_TRACE_JSONL}" ]]; then
+        echo "AUX_TRACE_JSONL is not a file: ${AUX_TRACE_JSONL}" >&2
+        exit 1
+    fi
+    AUX_MIN_TRACE_EXAMPLES=${AUX_MIN_TRACE_EXAMPLES:-${MIN_TRACE_EXAMPLES}}
+    AUX_TRACE_DATASET_WEIGHT=${AUX_TRACE_DATASET_WEIGHT:-1.0}
+    if [[ ! "${AUX_MIN_TRACE_EXAMPLES}" =~ ^[0-9]+$ ]]; then
+        echo "AUX_MIN_TRACE_EXAMPLES must be a nonnegative integer: ${AUX_MIN_TRACE_EXAMPLES}" >&2
+        exit 1
+    fi
+    AUX_AUDIT_ARGS=("${AUX_TRACE_JSONL}" --min_examples "${AUX_MIN_TRACE_EXAMPLES}")
+    if [[ "${ALLOW_GROUND_TRUTH_CONDITIONING}" == "1" ]]; then
+        AUX_AUDIT_ARGS+=(--allow_ground_truth_conditioning)
+    fi
+    "${PYTHON_EXECUTABLE}" scripts/data/synthesize_gen_value_sft.py audit "${AUX_AUDIT_ARGS[@]}"
+    DATASET_MIXER_ARGS+=("${AUX_TRACE_JSONL}" "${AUX_TRACE_DATASET_WEIGHT}")
+fi
 
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-4B-Base}
 NUM_GPUS=${NUM_GPUS:-4}
@@ -63,7 +84,7 @@ accelerate launch \
     --warmup_ratio 0.03 \
     --weight_decay 0.01 \
     --num_train_epochs "${NUM_TRAIN_EPOCHS}" \
-    --dataset_mixer_list "${TRACE_JSONL}" 1.0 \
+    --dataset_mixer_list "${DATASET_MIXER_ARGS[@]}" \
     --dataset_mixer_list_splits train \
     --dataset_transform_fn gen_value_sft_tokenize_and_truncate_v1 sft_tulu_filter_v1 \
     --dataset_target_columns input_ids attention_mask labels \
