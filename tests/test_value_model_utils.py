@@ -78,6 +78,40 @@ def test_gen_value_validation_removes_every_state_from_heldout_prompt_group():
     assert all(tuple(pair["request_output"].prompt_token_ids) != heldout_prompt for pair in training_pairs)
 
 
+def test_gen_value_validation_preserves_near_horizon_and_both_outcomes():
+    near_horizon_incorrect = {
+        "pairs": [
+            _pair(
+                [1],
+                0.0,
+                state_kind="final_action",
+                response_tokens_used=8000,
+                response_token_limit=8192,
+            )
+        ]
+    }
+    mixed_incorrect = {
+        "pairs": [_pair([2], 0.0, state_kind="final_action", response_tokens_used=4000)]
+    }
+    mixed_correct = {
+        "pairs": [_pair([2], 1.0, state_kind="final_action", response_tokens_used=4000)]
+    }
+    ordinary_incorrect = {
+        "pairs": [_pair([3], 0.0, state_kind="final_action", response_tokens_used=4000)]
+    }
+
+    examples, _ = value_model_utils.build_gen_value_validation_holdout(
+        [near_horizon_incorrect, mixed_incorrect, mixed_correct, ordinary_incorrect],
+        max_examples=16,
+        seed=7,
+        prompt_holdout_fraction=0.5,
+    )
+
+    sampled = [example for example in examples if example["target_source"] == "single_sample_return"]
+    assert {example["target"] for example in sampled} == {0.0, 1.0}
+    assert any(value_model_utils.is_gen_value_near_horizon_incorrect(example) for example in sampled)
+
+
 def test_final_action_replay_does_not_distort_leave_one_out_baseline():
     first = {"state_kind": "final_action"}
     second = {"state_kind": "segment_start"}
