@@ -52,6 +52,9 @@ RUN_OUTPUT_DIR="${RUN_OUTPUT_DIR:-${PWD}/outputs/${EXP_NAME}}"
 CHECKPOINT_STATE_DIR="${CHECKPOINT_STATE_DIR:-${RUN_OUTPUT_DIR}/checkpoint_states}"
 GEN_VALUE_CONDITIONING="${GEN_VALUE_CONDITIONING:-none}"
 GEN_VALUE_REINFORCE_BASELINE="${GEN_VALUE_REINFORCE_BASELINE:-leave_one_out_by_outcome}"
+# Pool token-identical critic states across sampled policy continuations to the
+# empirical Monte Carlo return without removing any critic completion.
+GEN_VALUE_POOL_SHARED_STATE_RETURNS="${GEN_VALUE_POOL_SHARED_STATE_RETURNS:-true}"
 GEN_VALUE_LEARNING_RATE="${GEN_VALUE_LEARNING_RATE:-1e-6}"
 # Weight publication costs well under one second versus minutes per policy step.
 # Publish every completed critic update so actor-facing values do not retain a
@@ -159,6 +162,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --gen_value_learning_rate "${GEN_VALUE_LEARNING_RATE}" \
     --gen_value_reinforce_coef 1.0 \
     --gen_value_reinforce_baseline "${GEN_VALUE_REINFORCE_BASELINE}" \
+    --gen_value_pool_shared_state_returns "${GEN_VALUE_POOL_SHARED_STATE_RETURNS}" \
     --gen_value_final_action_replay_weight 4 \
     --gen_value_sync_freq "${GEN_VALUE_SYNC_FREQ}" \
     --gen_value_max_async_steps "${GEN_VALUE_MAX_ASYNC_STEPS}" \
