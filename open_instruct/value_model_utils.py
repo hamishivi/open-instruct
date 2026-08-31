@@ -842,6 +842,19 @@ def gen_value_validation_metrics(
             (float(example["target"]) - prediction) ** 2 for example, prediction in rows
         ) / len(rows)
 
+    def add_binary_ranking_auc(
+        prefix: str, correct: list[tuple[dict[str, Any], float]], incorrect: list[tuple[dict[str, Any], float]]
+    ) -> None:
+        """Add exact pairwise AUC, assigning half credit to prediction ties."""
+        if not correct or not incorrect:
+            return
+        pairwise_credit = sum(
+            float(correct_prediction > incorrect_prediction) + 0.5 * float(correct_prediction == incorrect_prediction)
+            for _, correct_prediction in correct
+            for _, incorrect_prediction in incorrect
+        )
+        metrics[f"gen_value/validation_{prefix}_auc"] = pairwise_credit / (len(correct) * len(incorrect))
+
     initial = [(example, prediction) for example, prediction in parsed if example["kind"] == "initial"]
     empirical_return = [
         (example, prediction)
@@ -917,6 +930,9 @@ def gen_value_validation_metrics(
     for name, rows in prefix_position_groups.items():
         add_group(name, rows)
     add_group("near_horizon_incorrect", near_horizon_incorrect)
+    add_binary_ranking_auc("final", final_correct, final_incorrect)
+    add_binary_ranking_auc("final_action", final_action_correct, final_action_incorrect)
+    add_binary_ranking_auc("prefix", prefix_correct, prefix_incorrect)
     if final_correct and final_incorrect:
         metrics["gen_value/validation_final_value_gap"] = (
             metrics["gen_value/validation_final_correct_v_hat_mean"]
@@ -930,6 +946,7 @@ def gen_value_validation_metrics(
     for band in prefix_position_bands:
         correct = prefix_position_groups[f"prefix_{band}_correct"]
         incorrect = prefix_position_groups[f"prefix_{band}_incorrect"]
+        add_binary_ranking_auc(f"prefix_{band}", correct, incorrect)
         if correct and incorrect:
             metrics[f"gen_value/validation_prefix_{band}_value_gap"] = (
                 metrics[f"gen_value/validation_prefix_{band}_correct_v_hat_mean"]

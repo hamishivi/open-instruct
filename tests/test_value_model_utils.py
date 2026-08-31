@@ -145,6 +145,23 @@ def test_gen_value_validation_reports_early_to_late_value_deltas():
     assert metrics["gen_value/validation_prefix_correct_early_to_late_delta"] == pytest.approx(0.6)
     assert metrics["gen_value/validation_prefix_incorrect_early_to_late_delta"] == pytest.approx(-0.4)
     assert metrics["gen_value/validation_prefix_value_gap_early_to_late_delta"] == pytest.approx(1.0)
+    assert metrics["gen_value/validation_prefix_auc"] == pytest.approx(0.75)
+    assert metrics["gen_value/validation_prefix_early_auc"] == pytest.approx(0.0)
+    assert metrics["gen_value/validation_prefix_late_auc"] == pytest.approx(1.0)
+
+
+def test_gen_value_validation_auc_assigns_half_credit_to_ties():
+    examples = [
+        {"kind": "final_action", "target": 1.0},
+        {"kind": "final_action", "target": 1.0},
+        {"kind": "final_action", "target": 0.0},
+        {"kind": "final_action", "target": 0.0},
+    ]
+
+    metrics = value_model_utils.gen_value_validation_metrics(examples, [0.8, 0.4, 0.4, 0.2])
+
+    assert metrics["gen_value/validation_final_auc"] == pytest.approx(0.875)
+    assert metrics["gen_value/validation_final_action_auc"] == pytest.approx(0.875)
 
 
 @pytest.mark.parametrize(
