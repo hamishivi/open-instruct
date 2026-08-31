@@ -373,10 +373,14 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
         {
             "gen_value/reinforce_loss": 1.0,
             "gen_value/reward_mean": 0.0,
+            "gen_value/optimization_reward_mean": 0.0,
             "gen_value/mse": 0.25,
+            "gen_value/optimization_mse": 0.25,
             "gen_value/train_tokens": 2,
             "gen_value/train_examples": 1,
             "gen_value/parsed_examples": 1,
+            "gen_value/unique_examples": 1,
+            "gen_value/unique_parsed_examples": 1,
             "gen_value/train_packs": 1,
             "gen_value/train_pack_tokens": 100,
             "gen_value/train_examples_per_pack": 1.0,
@@ -393,10 +397,14 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
         {
             "gen_value/reinforce_loss": 3.0,
             "gen_value/reward_mean": 1.0,
+            "gen_value/optimization_reward_mean": 1.0,
             "gen_value/mse": 0.5,
+            "gen_value/optimization_mse": 0.5,
             "gen_value/train_tokens": 6,
             "gen_value/train_examples": 3,
             "gen_value/parsed_examples": 2,
+            "gen_value/unique_examples": 2,
+            "gen_value/unique_parsed_examples": 1,
             "gen_value/train_packs": 2,
             "gen_value/train_pack_tokens": 300,
             "gen_value/train_examples_per_pack": 1.5,
@@ -412,9 +420,15 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
     metrics = _drain_gen_value_metrics(metrics_q)
 
     assert metrics["gen_value/reinforce_loss"] == pytest.approx(2.5)
-    assert metrics["gen_value/reward_mean"] == pytest.approx(0.75)
-    assert metrics["gen_value/mse"] == pytest.approx((0.25 + 2 * 0.5) / 3)
+    assert metrics["gen_value/reward_mean"] == pytest.approx(2 / 3)
+    assert metrics["gen_value/optimization_reward_mean"] == pytest.approx(0.75)
+    assert metrics["gen_value/mse"] == pytest.approx((0.25 + 0.5) / 2)
+    assert metrics["gen_value/optimization_mse"] == pytest.approx((0.25 + 2 * 0.5) / 3)
     assert metrics["gen_value/train_tokens"] == 8
+    assert metrics["gen_value/train_examples"] == 4
+    assert metrics["gen_value/parsed_examples"] == 3
+    assert metrics["gen_value/unique_examples"] == 3
+    assert metrics["gen_value/unique_parsed_examples"] == 2
     assert metrics["gen_value/train_packs"] == 3
     assert metrics["gen_value/train_pack_tokens"] == 400
     assert metrics["gen_value/train_examples_per_pack"] == pytest.approx(4 / 3)

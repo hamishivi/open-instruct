@@ -381,8 +381,15 @@ class GenValueTrainerActor:
 
         validated_examples: list[dict[str, Any]] = []
         skipped_empty_generation = 0
-        mses: list[float] = []  # Parsed generations only; parse failures have no numeric prediction.
-        parsed_v_hats: list[float] = []  # Only for pairs where parsing succeeded.
+        # Optimizer inputs include intentional final-action replay copies.  Keep
+        # separate unique-sample diagnostics so replaying easy terminal states
+        # cannot make the reported critic calibration look artificially strong.
+        optimization_mses: list[float] = []
+        optimization_v_hats: list[float] = []
+        unique_rewards: list[float] = []
+        unique_outcomes: list[float] = []
+        unique_mses: list[float] = []
+        unique_v_hats: list[float] = []
         near_horizon_incorrect_v_hats: list[float] = []
         near_horizon_incorrect_mses: list[float] = []
         diagnostic_pair_ids = {id(pair) for pair in value_model_utils.unique_replayed_gen_value_pairs(training_pairs)}
@@ -412,16 +419,22 @@ class GenValueTrainerActor:
             outcome = max(0.0, min(1.0, float(pair["outcome"])))
             v_hat = self._score_from_text(completion.text)
             if v_hat is not None:
-                parsed_v_hats.append(v_hat)
+                optimization_v_hats.append(v_hat)
             reward, squared_error = value_model_utils.generative_value_reinforce_reward(outcome, v_hat)
             is_first_replay = id(pair) in diagnostic_pair_ids
             if is_first_replay:
                 diagnostic_pair_ids.remove(id(pair))
+                unique_rewards.append(reward)
+                unique_outcomes.append(outcome)
+                if v_hat is not None:
+                    unique_v_hats.append(v_hat)
+                if squared_error is not None:
+                    unique_mses.append(squared_error)
                 self._maybe_store_training_trace(
                     pair, prompt_ids, completion.text, outcome, v_hat, squared_error, reward
                 )
             if squared_error is not None:
-                mses.append(squared_error)
+                optimization_mses.append(squared_error)
                 if is_first_replay and value_model_utils.is_gen_value_near_horizon_incorrect(pair):
                     near_horizon_incorrect_v_hats.append(v_hat)
                     near_horizon_incorrect_mses.append(squared_error)
@@ -458,7 +471,8 @@ class GenValueTrainerActor:
         gradient_scale = self._reinforce_coef / max(reinforce_token_denominator, 1)
         total_loss = 0.0
         rewards = raw_rewards
-        parsed_count = len(parsed_v_hats)
+        optimization_parsed_count = len(optimization_v_hats)
+        unique_parsed_count = len(unique_v_hats)
         has_effective_training_signal = False
         reinforce_token_count = 0
         tis_ratio_sum = 0.0
@@ -538,7 +552,8 @@ class GenValueTrainerActor:
 
         metrics = {
             "gen_value/reinforce_loss": total_loss,
-            "gen_value/reward_mean": sum(rewards) / len(rewards),
+            "gen_value/reward_mean": sum(unique_rewards) / len(unique_rewards),
+            "gen_value/optimization_reward_mean": sum(rewards) / len(rewards),
             "gen_value/reinforce_weight_mean": sum(reinforce_weights) / len(reinforce_weights),
             "gen_value/reinforce_weight_abs_mean": sum(abs(weight) for weight in reinforce_weights)
             / len(reinforce_weights),
@@ -546,14 +561,21 @@ class GenValueTrainerActor:
             / len(reinforce_weights),
             "gen_value/reinforce_weight_negative_frac": sum(weight < 0.0 for weight in reinforce_weights)
             / len(reinforce_weights),
-            "gen_value/outcome_mean": sum(outcomes) / len(outcomes),
-            "gen_value/mse": sum(mses) / len(mses) if mses else float("nan"),
-            "gen_value/parse_rate": parsed_count / len(rewards),
+            "gen_value/outcome_mean": sum(unique_outcomes) / len(unique_outcomes),
+            "gen_value/optimization_outcome_mean": sum(outcomes) / len(outcomes),
+            "gen_value/mse": sum(unique_mses) / len(unique_mses) if unique_mses else float("nan"),
+            "gen_value/optimization_mse": (
+                sum(optimization_mses) / len(optimization_mses) if optimization_mses else float("nan")
+            ),
+            "gen_value/parse_rate": unique_parsed_count / len(unique_rewards),
+            "gen_value/optimization_parse_rate": optimization_parsed_count / len(rewards),
             "gen_value/version": self._step_count,
             "gen_value/reinforce_steps": self._step_count,
             "gen_value/train_tokens": reinforce_token_count,
             "gen_value/train_examples": len(rewards),
-            "gen_value/parsed_examples": parsed_count,
+            "gen_value/parsed_examples": optimization_parsed_count,
+            "gen_value/unique_examples": len(unique_rewards),
+            "gen_value/unique_parsed_examples": unique_parsed_count,
             "gen_value/train_packs": len(packs),
             "gen_value/train_pack_tokens": sum(pack_token_counts),
             "gen_value/train_examples_per_pack": len(rewards) / len(packs),
@@ -577,11 +599,13 @@ class GenValueTrainerActor:
         if tis_mask_total_tokens:
             metrics["gen_value/tis_mask_tokens"] = tis_mask_total_tokens
             metrics["gen_value/tis_mask_frac_kept"] = tis_mask_kept_tokens / tis_mask_total_tokens
-        if parsed_v_hats:
+        if unique_v_hats:
             # Mean of parsed predictions -- tells us whether the critic is biased high/low
             # vs. ``outcome_mean`` and whether it's moving over training. Undefined when
             # no pair parsed this step, so we only emit the key when we have signal.
-            metrics["gen_value/v_hat_mean"] = sum(parsed_v_hats) / len(parsed_v_hats)
+            metrics["gen_value/v_hat_mean"] = sum(unique_v_hats) / len(unique_v_hats)
+        if optimization_v_hats:
+            metrics["gen_value/optimization_v_hat_mean"] = sum(optimization_v_hats) / len(optimization_v_hats)
         if near_horizon_incorrect_v_hats:
             metrics["gen_value/near_horizon_incorrect_v_hat_mean"] = sum(near_horizon_incorrect_v_hats) / len(
                 near_horizon_incorrect_v_hats
@@ -998,15 +1022,20 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
     weighted_metrics = {
         "gen_value/reinforce_loss": "gen_value/train_tokens",
         "gen_value/grad_norm": "gen_value/train_tokens",
-        "gen_value/reward_mean": "gen_value/train_examples",
+        "gen_value/reward_mean": "gen_value/unique_examples",
+        "gen_value/optimization_reward_mean": "gen_value/train_examples",
         "gen_value/reinforce_weight_mean": "gen_value/train_examples",
         "gen_value/reinforce_weight_abs_mean": "gen_value/train_examples",
         "gen_value/reinforce_weight_positive_frac": "gen_value/train_examples",
         "gen_value/reinforce_weight_negative_frac": "gen_value/train_examples",
-        "gen_value/outcome_mean": "gen_value/train_examples",
-        "gen_value/parse_rate": "gen_value/train_examples",
-        "gen_value/mse": "gen_value/parsed_examples",
-        "gen_value/v_hat_mean": "gen_value/parsed_examples",
+        "gen_value/outcome_mean": "gen_value/unique_examples",
+        "gen_value/optimization_outcome_mean": "gen_value/train_examples",
+        "gen_value/parse_rate": "gen_value/unique_examples",
+        "gen_value/optimization_parse_rate": "gen_value/train_examples",
+        "gen_value/mse": "gen_value/unique_parsed_examples",
+        "gen_value/optimization_mse": "gen_value/parsed_examples",
+        "gen_value/v_hat_mean": "gen_value/unique_parsed_examples",
+        "gen_value/optimization_v_hat_mean": "gen_value/parsed_examples",
         "gen_value/near_horizon_incorrect_v_hat_mean": "gen_value/near_horizon_incorrect_examples",
         "gen_value/near_horizon_incorrect_mse": "gen_value/near_horizon_incorrect_examples",
         "gen_value/tis_ratio": "gen_value/tis_tokens",
@@ -1030,6 +1059,8 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
         "gen_value/train_tokens",
         "gen_value/train_examples",
         "gen_value/parsed_examples",
+        "gen_value/unique_examples",
+        "gen_value/unique_parsed_examples",
         "gen_value/near_horizon_incorrect_examples",
         "gen_value/train_packs",
         "gen_value/train_pack_tokens",
