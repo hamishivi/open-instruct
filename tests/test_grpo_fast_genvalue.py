@@ -314,7 +314,7 @@ def test_matching_critic_temperatures_reuse_one_completion(monkeypatch):
     assert pairs[0]["critic_version"] == 3
 
 
-def test_gen_value_admission_waits_for_critic_source_step(monkeypatch):
+def test_gen_value_generation_waits_for_critic_source_step(monkeypatch):
     trainer_cls = grpo_fast.PolicyTrainerRayProcess.__ray_metadata__.modified_class
     trainer = object.__new__(trainer_cls)
     trainer.args = SimpleNamespace(gen_value_max_async_steps=1)
@@ -332,14 +332,14 @@ def test_gen_value_admission_waits_for_critic_source_step(monkeypatch):
     monkeypatch.setattr(grpo_fast.ray, "get", lambda value: value)
     monkeypatch.setattr(grpo_fast.time, "sleep", lambda _: None)
 
-    before, after, wait_seconds = trainer._wait_for_gen_value_admission(policy_training_step=2)
+    before, after, wait_seconds = trainer._wait_for_gen_value_generation(policy_training_step=2)
 
     assert before == 0
     assert after == 1
     assert wait_seconds >= 0.0
 
 
-def test_gen_value_admission_does_not_wait_within_window(monkeypatch):
+def test_gen_value_generation_does_not_wait_within_window(monkeypatch):
     trainer_cls = grpo_fast.PolicyTrainerRayProcess.__ray_metadata__.modified_class
     trainer = object.__new__(trainer_cls)
     trainer.args = SimpleNamespace(gen_value_max_async_steps=1)
@@ -351,7 +351,7 @@ def test_gen_value_admission_does_not_wait_within_window(monkeypatch):
     trainer._gen_value_training_progress = SimpleNamespace(get_latest_trained_policy_step=RemoteMethod())
     monkeypatch.setattr(grpo_fast.ray, "get", lambda value: value)
 
-    before, after, _ = trainer._wait_for_gen_value_admission(policy_training_step=5)
+    before, after, _ = trainer._wait_for_gen_value_generation(policy_training_step=5)
 
     assert before == 4
     assert after == 4

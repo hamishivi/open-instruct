@@ -317,14 +317,15 @@ class PolicyTrainerRayProcess(RayProcess):
     def set_gen_value_version(self, version: int) -> None:
         self._gen_value_version = int(version)
 
-    def _wait_for_gen_value_admission(self, policy_training_step: int) -> tuple[int | None, int | None, float]:
-        """Apply critic backpressure without discarding already generated examples.
+    def _wait_for_gen_value_generation(self, policy_training_step: int) -> tuple[int | None, int | None, float]:
+        """Apply critic backpressure before inference without discarding examples.
 
-        Critic completions are produced during the policy step. Before publishing
-        them to the critic trainer, wait until their source-policy step is within
-        ``gen_value_max_async_steps`` of the latest source step that the critic has
-        finished training. This mirrors the policy rollout window while preserving
-        every critic example for the less staleness-sensitive critic objective.
+        Before asking the generative critic to score this policy step, wait until
+        its source-policy step is within ``gen_value_max_async_steps`` of the latest
+        source step that the critic has finished training. This mirrors the policy
+        rollout window. Unlike policy importance-sampling staleness handling, no
+        completed critic example is discarded: the whole step waits before critic
+        generation, then every generated example is admitted for MSE training.
         """
         if self._gen_value_training_progress is None:
             return None, None, 0.0
@@ -340,8 +341,8 @@ class PolicyTrainerRayProcess(RayProcess):
             now = time.perf_counter()
             if now - last_log_time >= 60.0:
                 logger.info(
-                    "[GenValue] Policy step %d is waiting for critic training at source-policy step %d "
-                    "(max async steps=%d); all generated critic examples remain queued for admission.",
+                    "[GenValue] Policy step %d is waiting before critic generation for training at "
+                    "source-policy step %d (max async steps=%d); no critic examples will be discarded.",
                     policy_training_step,
                     latest_trained_step,
                     max_async_steps,
@@ -2148,6 +2149,26 @@ class PolicyTrainerRayProcess(RayProcess):
         # each rollout at fixed-chunk boundaries and use those piecewise-constant estimates as
         # the value function for GAE instead of the scalar value head.
         _gen_value_training_rollouts: list[dict] = []
+        if _use_gen_value and self._gen_value_training_queue is not None:
+            (latest_trained_before_generation, latest_trained_at_generation, generation_backpressure_seconds) = (
+                self._wait_for_gen_value_generation(training_step)
+            )
+            sae_step_metrics["gen_value/generation_backpressure_seconds"] = generation_backpressure_seconds
+            # Keep the original metric as a compatibility alias for existing
+            # dashboards while making its pre-inference meaning explicit above.
+            sae_step_metrics["gen_value/staleness_backpressure_seconds"] = generation_backpressure_seconds
+            if latest_trained_before_generation is not None:
+                sae_step_metrics["gen_value/latest_trained_before_generation"] = float(
+                    latest_trained_before_generation
+                )
+                sae_step_metrics["gen_value/source_step_lag_before_generation"] = float(
+                    max(training_step - latest_trained_before_generation, 0)
+                )
+            if latest_trained_at_generation is not None:
+                sae_step_metrics["gen_value/latest_trained_at_generation"] = float(latest_trained_at_generation)
+                sae_step_metrics["gen_value/source_step_lag_at_generation"] = float(
+                    max(training_step - latest_trained_at_generation, 0)
+                )
 
         if _use_gen_value and bool(getattr(self.args, "gen_value_use_icc", False)):
             icc_batch_success_rate, icc_success_rate = self._update_gen_value_icc_success_rate(data_BT)
@@ -2569,24 +2590,6 @@ class PolicyTrainerRayProcess(RayProcess):
                 if _gen_value_training_rollouts:
                     sae_step_metrics.update(
                         value_model_utils.gen_value_sampled_version_metrics(_gen_value_training_rollouts)
-                    )
-                (latest_trained_before_admission, latest_trained_after_admission, staleness_backpressure_seconds) = (
-                    self._wait_for_gen_value_admission(training_step)
-                )
-                sae_step_metrics["gen_value/staleness_backpressure_seconds"] = staleness_backpressure_seconds
-                if latest_trained_before_admission is not None:
-                    sae_step_metrics["gen_value/latest_trained_before_admission"] = float(
-                        latest_trained_before_admission
-                    )
-                    sae_step_metrics["gen_value/source_step_lag_before_admission"] = float(
-                        max(training_step - latest_trained_before_admission, 0)
-                    )
-                if latest_trained_after_admission is not None:
-                    sae_step_metrics["gen_value/latest_trained_after_admission"] = float(
-                        latest_trained_after_admission
-                    )
-                    sae_step_metrics["gen_value/source_step_lag_after_admission"] = float(
-                        max(training_step - latest_trained_after_admission, 0)
                     )
                 if self._gen_value_training_progress is not None:
                     ray.get(
