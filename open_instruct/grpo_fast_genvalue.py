@@ -1346,6 +1346,19 @@ def _gen_value_reinforce_loop(
                 timeout=_GEN_VALUE_OPERATION_TIMEOUT_S,
             )
             metrics = metrics[0]
+            reported_train_examples = metrics.get("gen_value/train_examples")
+            if reported_train_examples != len(pairs):
+                raise RuntimeError(
+                    "Generative-critic trainer example accounting diverged across the Ray boundary: "
+                    f"driver sent {len(pairs)} examples, trainer reported {reported_train_examples}."
+                )
+            reported_unique_examples = metrics.get("gen_value/unique_examples")
+            if reported_unique_examples != unique_pair_count:
+                raise RuntimeError(
+                    "Generative-critic replay identity diverged across the Ray boundary: "
+                    f"driver sent {unique_pair_count} unique examples, trainer reported "
+                    f"{reported_unique_examples}."
+                )
             critic_version = int(metrics["gen_value/version"])
             if model_snapshot_freq > 0 and critic_version % model_snapshot_freq == 0:
                 snapshot_start = time.perf_counter()
