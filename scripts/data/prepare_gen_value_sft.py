@@ -44,6 +44,18 @@ def position_counts(examples: list[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
+def filter_state_kinds(
+    examples: list[dict[str, Any]], allowed_state_kinds: list[str] | None
+) -> list[dict[str, Any]]:
+    if not allowed_state_kinds:
+        return examples
+    allowed = set(allowed_state_kinds)
+    filtered = [example for example in examples if example.get("state_kind") in allowed]
+    if not filtered:
+        raise RuntimeError(f"No input traces matched state kinds {sorted(allowed)}.")
+    return filtered
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("inputs", nargs="+", type=pathlib.Path, help="Reservoir JSONL file(s).")
@@ -58,13 +70,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_examples_per_outcome", type=int)
     parser.add_argument("--no_balance_outcomes", action="store_true")
     parser.add_argument("--no_balance_positions", action="store_true")
+    parser.add_argument(
+        "--state_kind",
+        action="append",
+        dest="state_kinds",
+        help="Retain only this state kind before trace selection; repeat to retain multiple kinds.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    examples = read_jsonl(args.inputs)
+    input_examples = read_jsonl(args.inputs)
+    examples = filter_state_kinds(input_examples, args.state_kinds)
     selected = select_gen_value_sft_traces(
         examples,
         max_squared_error=args.max_squared_error,
@@ -85,12 +104,14 @@ def main() -> None:
     temporary_path.replace(args.output)
 
     summary = {
-        "input_examples": len(examples),
+        "input_examples": len(input_examples),
+        "filtered_input_examples": len(examples),
         "selected_examples": len(selected),
         "selected_by_outcome": outcome_counts(selected),
         "selected_by_position": position_counts(selected),
         "max_squared_error": args.max_squared_error,
         "min_critic_version": args.min_critic_version,
+        "state_kinds": sorted(set(args.state_kinds)) if args.state_kinds else None,
         "output": str(args.output),
     }
     print(json.dumps(summary, indent=2, sort_keys=True))

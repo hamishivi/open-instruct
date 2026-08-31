@@ -4,7 +4,7 @@ import math
 import unittest
 
 import numpy as np
-from scripts.data import prepare_gen_value_mc_sft, synthesize_gen_value_sft
+from scripts.data import prepare_gen_value_mc_sft, prepare_gen_value_sft, synthesize_gen_value_sft
 
 from open_instruct import value_estimation
 
@@ -19,6 +19,17 @@ class _FakeTokenizer:
 
 
 class TestValueEstimationStates(unittest.TestCase):
+    def test_trace_sft_can_target_prefix_states_without_discarding_other_kinds_by_default(self):
+        examples = [{"id": "early", "state_kind": "segment_start"}, {"id": "terminal", "state_kind": "final_action"}]
+
+        self.assertIs(prepare_gen_value_sft.filter_state_kinds(examples, None), examples)
+        self.assertEqual(
+            prepare_gen_value_sft.filter_state_kinds(examples, ["segment_start"]),
+            [{"id": "early", "state_kind": "segment_start"}],
+        )
+        with self.assertRaisesRegex(RuntimeError, "No input traces matched state kinds"):
+            prepare_gen_value_sft.filter_state_kinds(examples, ["missing"])
+
     def test_sae_mc_probes_match_online_segment_starts_and_final_action(self):
         logprobs = [math.log(0.9), math.log(0.1), math.log(0.9), math.log(0.1), math.log(0.9), math.log(0.9)]
 
