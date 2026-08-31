@@ -542,6 +542,21 @@ def _sample_record_indices(
     return rng.sample(eligible_indices, min(num_to_sample, len(eligible_indices)))
 
 
+def _load_source_dataset(dataset_name: str, dataset_split: str, load_dataset_fn: Any) -> Any:
+    """Load a Hub dataset or a local parquet/JSON source file."""
+    dataset_path = pathlib.Path(dataset_name).expanduser()
+    if not dataset_path.is_file():
+        return load_dataset_fn(dataset_name, split=dataset_split)
+
+    dataset_format_by_suffix = {".json": "json", ".jsonl": "json", ".parquet": "parquet"}
+    dataset_format = dataset_format_by_suffix.get(dataset_path.suffix.lower())
+    if dataset_format is None:
+        raise ValueError(
+            f"Unsupported local dataset format {dataset_path.suffix!r}; expected .parquet, .json, or .jsonl."
+        )
+    return load_dataset_fn(dataset_format, data_files=str(dataset_path), split=dataset_split)
+
+
 def make_dataset(cfg: MakeDatasetConfig) -> str:
     """Build the value-estimation dataset described in the plan."""
     import pandas as pd  # noqa: PLC0415
@@ -551,7 +566,7 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
     np.random.seed(cfg.seed)
 
     logger.info(f"Loading dataset {cfg.dataset_name} split={cfg.dataset_split}")
-    ds = load_dataset(cfg.dataset_name, split=cfg.dataset_split)
+    ds = _load_source_dataset(cfg.dataset_name, cfg.dataset_split, load_dataset)
     excluded_problems: set[str] = set()
     if cfg.exclude_problem_dataset_path is not None:
         exclusion_path = pathlib.Path(cfg.exclude_problem_dataset_path)

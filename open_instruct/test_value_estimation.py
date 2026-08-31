@@ -319,6 +319,42 @@ class TestValueEstimationStates(unittest.TestCase):
                 [{"prompt": "held out"}], num_to_sample=1, seed=7, excluded_problems={"held out"}
             )
 
+    def test_source_dataset_loads_hub_dataset_by_name(self):
+        loader = mock.Mock(return_value="dataset")
+
+        result = value_estimation._load_source_dataset("org/dataset", "train", loader)
+
+        self.assertEqual(result, "dataset")
+        loader.assert_called_once_with("org/dataset", split="train")
+
+    def test_source_dataset_loads_local_parquet_file(self):
+        loader = mock.Mock(return_value="dataset")
+        dataset_path = "/tmp/heldout-problems.parquet"
+        with mock.patch.object(value_estimation.pathlib.Path, "is_file", return_value=True):
+            result = value_estimation._load_source_dataset(dataset_path, "train", loader)
+
+        self.assertEqual(result, "dataset")
+        loader.assert_called_once_with("parquet", data_files=dataset_path, split="train")
+
+    def test_source_dataset_loads_local_jsonl_file(self):
+        loader = mock.Mock(return_value="dataset")
+        dataset_path = "/tmp/heldout-problems.jsonl"
+        with mock.patch.object(value_estimation.pathlib.Path, "is_file", return_value=True):
+            result = value_estimation._load_source_dataset(dataset_path, "validation", loader)
+
+        self.assertEqual(result, "dataset")
+        loader.assert_called_once_with("json", data_files=dataset_path, split="validation")
+
+    def test_source_dataset_rejects_unsupported_local_file(self):
+        loader = mock.Mock()
+        with (
+            mock.patch.object(value_estimation.pathlib.Path, "is_file", return_value=True),
+            self.assertRaisesRegex(ValueError, "Unsupported local dataset format"),
+        ):
+            value_estimation._load_source_dataset("/tmp/heldout-problems.csv", "train", loader)
+
+        loader.assert_not_called()
+
     def test_generative_scorer_default_matches_online_reasoning_budget(self):
         self.assertEqual(
             value_estimation.ScoreDatasetConfig.__dataclass_fields__["gen_value_max_new_tokens"].default, 1024
