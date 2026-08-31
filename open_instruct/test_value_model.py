@@ -51,6 +51,7 @@ from open_instruct.value_model_utils import (
     causal_value_mask,
     compute_value_loss,
     flatten_gen_value_pack,
+    gen_value_pair_sample_id,
     gen_value_sampled_version_metrics,
     gen_value_validation_metrics,
     generative_value_reinforce_reward,
@@ -840,14 +841,19 @@ class TestValueLoss(unittest.TestCase):
 
         replayed = replay_gen_value_final_actions([segment, final], replay_weight=4)
 
-        self.assertEqual(replayed, [segment, final, final, final, final])
+        self.assertEqual([pair["id"] for pair in replayed], [1, 2, 2, 2, 2])
+        self.assertEqual([gen_value_pair_sample_id(pair) for pair in replayed], [0, 1, 1, 1, 1])
+        self.assertEqual(segment, {"state_kind": "segment_start", "id": 1})
+        self.assertEqual(final, {"state_kind": "final_action", "id": 2})
 
     def test_gen_value_replay_deduplication_preserves_unique_state_order(self):
         segment = {"state_kind": "segment_start", "id": 1}
         final = {"state_kind": "final_action", "id": 2}
         replayed = replay_gen_value_final_actions([segment, final], replay_weight=4)
 
-        self.assertEqual(unique_replayed_gen_value_pairs(replayed), [segment, final])
+        unique = unique_replayed_gen_value_pairs(replayed)
+        self.assertEqual([pair["id"] for pair in unique], [1, 2])
+        self.assertEqual([gen_value_pair_sample_id(pair) for pair in unique], [0, 1])
 
     def test_gen_value_reinforce_baseline_rejects_unknown_mode(self):
         with self.assertRaisesRegex(ValueError, "Unknown generative-value REINFORCE baseline"):

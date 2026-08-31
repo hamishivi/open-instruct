@@ -22,6 +22,7 @@ from open_instruct.grpo_fast_genvalue import (
     _gen_value_scoring_loop,
     _put_gen_value_metrics,
     _resolve_gen_value_model,
+    _resolve_gen_value_train_pack_length,
     _resolve_gen_value_tokenizer,
     _sync_gen_value_weights,
     _wait_for_gen_value_publish_barrier,
@@ -191,6 +192,7 @@ def test_genvalue_config_rejects_negative_reinforce_coef():
         ("gen_value_vllm_tensor_parallel_size", 0),
         ("gen_value_max_segments", 0),
         ("gen_value_max_new_tokens", 0),
+        ("gen_value_train_pack_length", 0),
         ("gen_value_learning_rate", 0.0),
     ],
 )
@@ -523,6 +525,28 @@ def test_genvalue_config_rejects_context_without_prompt_room():
     kwargs["gen_value_max_model_len"] = 1024
     with pytest.raises(ValueError, match="must be greater than --gen_value_max_new_tokens"):
         GenValueExperimentConfig(**kwargs)
+
+
+def test_genvalue_config_rejects_training_pack_larger_than_declared_context():
+    kwargs = _base_kwargs()
+    kwargs["gen_value_max_model_len"] = 32768
+    kwargs["gen_value_train_pack_length"] = 32769
+    with pytest.raises(ValueError, match="cannot exceed --gen_value_max_model_len"):
+        GenValueExperimentConfig(**kwargs)
+
+
+def test_genvalue_train_pack_length_defaults_to_policy_and_allows_critic_override():
+    default_cfg = GenValueExperimentConfig(**_base_kwargs())
+    assert _resolve_gen_value_train_pack_length(default_cfg, 10240, 32768) == 10240
+
+    override_cfg = GenValueExperimentConfig(**_base_kwargs(), gen_value_train_pack_length=32768)
+    assert _resolve_gen_value_train_pack_length(override_cfg, 10240, 32768) == 32768
+
+
+def test_genvalue_train_pack_length_rejects_effective_context_overflow():
+    cfg = GenValueExperimentConfig(**_base_kwargs(), gen_value_train_pack_length=32768)
+    with pytest.raises(ValueError, match="effective context limit"):
+        _resolve_gen_value_train_pack_length(cfg, 10240, 16384)
 
 
 def test_diagnostic_scoring_exception_propagates(monkeypatch):

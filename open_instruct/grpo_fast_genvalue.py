@@ -176,7 +176,7 @@ class GenValueTrainerActor:
             raise ValueError(f"Generative critic pack length must be > 0, got {self._pack_length}.")
         if self._pack_length > self._max_sequence_tokens:
             raise ValueError(
-                "The policy pack length cannot exceed the generative critic context limit "
+                "The generative critic training pack length cannot exceed its context limit "
                 f"({self._pack_length} > {self._max_sequence_tokens})."
             )
         torch.cuda.set_device(0)
@@ -637,6 +637,7 @@ class GenValueTrainerActor:
             "gen_value/unique_examples": len(unique_rewards),
             "gen_value/unique_parsed_examples": unique_parsed_count,
             "gen_value/train_packs": len(packs),
+            "gen_value/train_pack_target_tokens": self._pack_length,
             "gen_value/train_pack_tokens": sum(pack_token_counts),
             "gen_value/train_examples_per_pack": len(rewards) / len(packs),
             "gen_value/train_mean_pack_tokens": sum(pack_token_counts) / len(packs),
@@ -773,6 +774,11 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
     # critic model's declared maximum. Requests must fit the full prompt and full
     # gen_value_max_new_tokens budget; neither side is silently shortened.
     gen_value_max_model_len: int | None = None
+    # Token target used only to coalesce independent generative-critic training
+    # examples into one FlashAttention forward/backward pass. None preserves the
+    # historical behavior by reusing the policy pack length. Raising this does
+    # not change policy packing, critic examples, response lengths, or segments.
+    gen_value_train_pack_length: int | None = None
     # Score schema.
     gen_value_score_min: float = 0.0
     gen_value_score_max: float = 10.0
@@ -880,6 +886,19 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
                 "--gen_value_max_model_len must be greater than --gen_value_max_new_tokens "
                 f"({self.gen_value_max_model_len} <= {self.gen_value_max_new_tokens})."
             )
+        if self.gen_value_train_pack_length is not None and self.gen_value_train_pack_length <= 0:
+            raise ValueError(
+                f"--gen_value_train_pack_length must be > 0 when set, got {self.gen_value_train_pack_length}."
+            )
+        if (
+            self.gen_value_train_pack_length is not None
+            and self.gen_value_max_model_len is not None
+            and self.gen_value_train_pack_length > self.gen_value_max_model_len
+        ):
+            raise ValueError(
+                "--gen_value_train_pack_length cannot exceed --gen_value_max_model_len "
+                f"({self.gen_value_train_pack_length} > {self.gen_value_max_model_len})."
+            )
         if self.gen_value_score_max <= self.gen_value_score_min:
             raise ValueError("--gen_value_score_max must be greater than --gen_value_score_min.")
         if self.gen_value_reinforce_coef < 0:
@@ -967,6 +986,21 @@ def _resolve_gen_value_model(args: GenValueExperimentConfig, model_config: Model
         # A different repository must not inherit a revision belonging to the policy model.
         model_revision = None
     return model_path, model_revision
+
+
+def _resolve_gen_value_train_pack_length(
+    args: GenValueExperimentConfig, policy_pack_length: int, gen_value_max_model_len: int
+) -> int:
+    """Resolve the critic-only packing target against its effective context limit."""
+    pack_length = args.gen_value_train_pack_length or policy_pack_length
+    if pack_length <= 0:
+        raise ValueError(f"The generative critic training pack length must be > 0, got {pack_length}.")
+    if pack_length > gen_value_max_model_len:
+        raise ValueError(
+            "The generative critic training pack length cannot exceed its effective context limit "
+            f"({pack_length} > {gen_value_max_model_len})."
+        )
+    return pack_length
 
 
 def score_partial_rollout_batch(
@@ -1800,11 +1834,16 @@ def main():
                 f"({gen_value_max_model_len} <= {args.gen_value_max_new_tokens})."
             )
         _check_gen_value_engines(gen_value_vllm_engines)
+        gen_value_train_pack_length = _resolve_gen_value_train_pack_length(
+            args, streaming_config.pack_length, gen_value_max_model_len
+        )
         logger.info(
-            "======== ✅ Gen-value vLLM pool ready (%d engine(s), model=%s, max_model_len=%d) =========",
+            "======== ✅ Gen-value vLLM pool ready (%d engine(s), model=%s, max_model_len=%d, "
+            "train_pack_length=%d) =========",
             len(gen_value_vllm_engines),
             gen_value_model_path,
             gen_value_max_model_len,
+            gen_value_train_pack_length,
         )
     else:
         logger.warning(
@@ -1859,7 +1898,7 @@ def main():
             args.gen_value_score_max,
             tensor_parallel_size=args.gen_value_vllm_tensor_parallel_size,
             max_sequence_tokens=gen_value_max_model_len,
-            pack_length=streaming_config.pack_length,
+            pack_length=gen_value_train_pack_length,
             attn_implementation=olmo_core_attn_to_hf(model_config.attn_implementation),
             gradient_checkpointing=model_config.gradient_checkpointing,
             temperature=args.gen_value_temperature,

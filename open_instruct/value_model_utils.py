@@ -1216,7 +1216,7 @@ def select_gen_value_sft_traces(
 
 
 def pack_gen_value_examples(examples: list[dict[str, Any]], target_tokens: int) -> list[list[dict[str, Any]]]:
-    """Pack critic examples in order up to the policy's token budget.
+    """Pack critic examples in order up to the configured training token target.
 
     An example longer than the target remains intact in its own pack. The critic's
     actual context limit is validated separately, so packing never truncates data.

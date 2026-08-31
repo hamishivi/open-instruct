@@ -66,6 +66,9 @@ GEN_VALUE_REINFORCE_BASELINE="${GEN_VALUE_REINFORCE_BASELINE:-leave_one_out_by_o
 # empirical Monte Carlo return without removing any critic completion.
 GEN_VALUE_POOL_SHARED_STATE_RETURNS="${GEN_VALUE_POOL_SHARED_STATE_RETURNS:-true}"
 GEN_VALUE_LEARNING_RATE="${GEN_VALUE_LEARNING_RATE:-1e-6}"
+# Coalesce the unchanged critic examples up to the critic's full context so its
+# optimizer needs fewer forward/backward passes. Policy packing remains 10,240.
+GEN_VALUE_TRAIN_PACK_LENGTH="${GEN_VALUE_TRAIN_PACK_LENGTH:-32768}"
 # Weight publication costs well under one second versus minutes per policy step.
 # Publish every completed critic update so actor-facing values do not retain a
 # separate multi-update serving lag after source-data staleness is bounded.
@@ -164,6 +167,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --gen_value_score_max 10 \
     --gen_value_max_new_tokens 1024 \
     --gen_value_max_model_len 32768 \
+    --gen_value_train_pack_length "${GEN_VALUE_TRAIN_PACK_LENGTH}" \
     --gen_value_temperature 1.0 \
     --gen_value_inference_temperature 0.0 \
     --gen_value_conditioning "${GEN_VALUE_CONDITIONING}" \
