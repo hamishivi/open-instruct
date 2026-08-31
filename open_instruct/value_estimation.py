@@ -642,6 +642,7 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
             )
 
     preds_per_row: list[list[float | None]] = []
+    raw_generations_per_row: list[list[str | None]] | None = None
     all_preds: list[float | None] = []
     all_mc: list[float] = []
     all_horizon_fractions: list[float] = []
@@ -656,18 +657,25 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
     if cfg.value_model_type == "scalar":
         preds_per_row = _score_with_scalar_value(df, cfg)
     elif cfg.value_model_type == "generative":
-        preds_per_row = _score_with_generative_value(df, cfg)
+        preds_per_row, raw_generations_per_row = _score_with_generative_value(df, cfg)
     else:
         raise ValueError(f"Unknown value_model_type: {cfg.value_model_type}")
 
     correct_preds: list[float] = []
     incorrect_preds: list[float] = []
     probe_rows = []
-    for i, row in df.iterrows():
+    for row_position, (_, row) in enumerate(df.iterrows()):
         is_correct = bool(row.get("rollout_is_correct"))
         rollout_length = len(row["rollout_tokens"])
         response_token_limit = int(row.get("response_token_limit", 8192))
-        for pos, p, mc in zip(row["probe_positions"], preds_per_row[i], row["mc_values"]):
+        raw_generations = (
+            raw_generations_per_row[row_position]
+            if raw_generations_per_row is not None
+            else [None] * len(row["probe_positions"])
+        )
+        for pos, p, mc, raw_generation in zip(
+            row["probe_positions"], preds_per_row[row_position], row["mc_values"], raw_generations, strict=True
+        ):
             prediction = None if p is None or not np.isfinite(float(p)) else float(p)
             state_kind = "final_action" if int(pos) == rollout_length - 1 else "intermediate"
             group = f"{state_kind}_{'correct' if is_correct else 'incorrect'}"
@@ -685,7 +693,7 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
             probe_rows.append(
                 {
                     "run_name": cfg.run_name,
-                    "rollout_idx": i,
+                    "rollout_idx": row_position,
                     "rollout_is_correct": is_correct,
                     "state_kind": state_kind,
                     "probe_position": int(pos),
@@ -693,6 +701,7 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
                     "horizon_fraction": horizon_fraction,
                     "predicted_value": prediction,
                     "parsed": prediction is not None,
+                    "raw_generation": raw_generation,
                     "mc_value": float(mc),
                 }
             )
@@ -774,6 +783,8 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
 
     df_out = df.copy()
     df_out["predicted_values"] = preds_per_row
+    if raw_generations_per_row is not None:
+        df_out["raw_generations"] = raw_generations_per_row
     df_out["run_config"] = [json.dumps(dataclasses.asdict(cfg))] * len(df_out)
     pathlib.Path(os.path.dirname(cfg.output_path) or ".").mkdir(parents=True, exist_ok=True)
     df_out.to_parquet(cfg.output_path, index=False)
@@ -840,7 +851,40 @@ def _score_with_scalar_value(df, cfg: ScoreDatasetConfig) -> list[list[float]]:
     return all_preds
 
 
-def _score_with_generative_value(df, cfg: ScoreDatasetConfig) -> list[list[float | None]]:
+def _collate_generative_value_generations(
+    generations: Sequence[str],
+    positions: Sequence[tuple[int, int]],
+    num_probes_per_row: Sequence[int],
+    *,
+    score_min: float,
+    score_max: float,
+) -> tuple[list[list[float | None]], list[list[str | None]]]:
+    """Parse flat critic generations while retaining the exact diagnostic text."""
+    if len(generations) != len(positions):
+        raise ValueError(f"Generations and positions differ in length ({len(generations)} != {len(positions)}).")
+
+    predictions: list[list[float | None]] = [[None] * count for count in num_probes_per_row]
+    raw_generations: list[list[str | None]] = [[None] * count for count in num_probes_per_row]
+    for text, (row_position, probe_position) in zip(generations, positions, strict=True):
+        if not 0 <= row_position < len(predictions):
+            raise IndexError(f"row_position {row_position} is outside {len(predictions)} scored rows.")
+        if not 0 <= probe_position < len(predictions[row_position]):
+            raise IndexError(
+                f"probe_position {probe_position} is outside row {row_position}'s "
+                f"{len(predictions[row_position])} probes."
+            )
+        raw_generations[row_position][probe_position] = text
+        parsed = value_model_utils.parse_generative_value_score(text, score_min=score_min, score_max=score_max)
+        if parsed is not None:
+            predictions[row_position][probe_position] = value_model_utils.rescale_gen_value_score(
+                parsed, score_min, score_max
+            )
+    return predictions, raw_generations
+
+
+def _score_with_generative_value(
+    df, cfg: ScoreDatasetConfig
+) -> tuple[list[list[float | None]], list[list[str | None]]]:
     """Score probes using a generative value model served via vLLM."""
     from transformers import AutoTokenizer  # noqa: PLC0415
     from vllm import LLM, SamplingParams  # noqa: PLC0415
@@ -864,8 +908,10 @@ def _score_with_generative_value(df, cfg: ScoreDatasetConfig) -> list[list[float
 
     prompts: list[str] = []
     positions: list[tuple[int, int]] = []
-    for idx, row in df.iterrows():
+    num_probes_per_row: list[int] = []
+    for row_position, (_, row) in enumerate(df.iterrows()):
         rollout_tokens = list(row["rollout_tokens"])
+        num_probes_per_row.append(len(row["probe_positions"]))
         prompt_token_ids = _optional_sequence_as_list(row.get("prompt_token_ids"))
         critic_problem = value_model_utils.decode_generative_value_problem(
             tokenizer, prompt_token_ids or None, fallback_problem=row.get("problem", row.get("prompt", ""))
@@ -893,21 +939,17 @@ def _score_with_generative_value(df, cfg: ScoreDatasetConfig) -> list[list[float
                 response_token_limit=int(row.get("response_token_limit", 8192)),
             )
             prompts.append(prompt)
-            positions.append((idx, p_idx))
+            positions.append((row_position, p_idx))
 
     raw = llm.generate(prompts, sp)
-    # Re-collate into per-row lists.
-    all_preds: list[list[float | None]] = [[None for _ in row["probe_positions"]] for _, row in df.iterrows()]
-    for out, (row_idx, p_idx) in zip(raw, positions):
-        txt = out.outputs[0].text if hasattr(out, "outputs") else ""
-        parsed = value_model_utils.parse_generative_value_score(
-            txt, score_min=cfg.gen_value_score_min, score_max=cfg.gen_value_score_max
-        )
-        if parsed is not None:
-            all_preds[row_idx][p_idx] = value_model_utils.rescale_gen_value_score(
-                parsed, cfg.gen_value_score_min, cfg.gen_value_score_max
-            )
-    return all_preds
+    generations = [out.outputs[0].text if hasattr(out, "outputs") else "" for out in raw]
+    return _collate_generative_value_generations(
+        generations,
+        positions,
+        num_probes_per_row,
+        score_min=cfg.gen_value_score_min,
+        score_max=cfg.gen_value_score_max,
+    )
 
 
 # --------------------------------------------------------------------------------------------
