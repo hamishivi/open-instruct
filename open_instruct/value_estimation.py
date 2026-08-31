@@ -823,6 +823,39 @@ def _prediction_group_metrics(
     return metrics
 
 
+def _bucketed_prediction_metrics(
+    predictions: Sequence[float | None], targets: Sequence[float], fractions: Sequence[float], *, prefix: str
+) -> dict[str, float]:
+    """Summarize prediction quality over early, middle, and late position bands."""
+    if len(predictions) != len(targets) or len(predictions) != len(fractions):
+        raise ValueError(
+            "Predictions, targets, and position fractions must have the same length "
+            f"({len(predictions)}, {len(targets)}, {len(fractions)})."
+        )
+
+    buckets = {
+        "early": [index for index, fraction in enumerate(fractions) if fraction < 0.25],
+        "middle": [index for index, fraction in enumerate(fractions) if 0.25 <= fraction < 0.75],
+        "late": [index for index, fraction in enumerate(fractions) if fraction >= 0.75],
+    }
+    metrics: dict[str, float] = {}
+    for name, indices in buckets.items():
+        if not indices:
+            continue
+        bucket_predictions = [predictions[index] for index in indices]
+        bucket_targets = [float(targets[index]) for index in indices]
+        bucket_metrics = _prediction_group_metrics(bucket_predictions, bucket_targets, prefix=f"{prefix}_{name}")
+        # Preserve score_dataset's existing semantics: ``mc_mean`` is the
+        # target mean over successfully parsed predictions, not all examples.
+        target_mean_key = f"{prefix}_{name}_target_mean"
+        parsed_target_mean_key = f"{prefix}_{name}_parsed_target_mean"
+        bucket_metrics.pop(target_mean_key)
+        if parsed_target_mean_key in bucket_metrics:
+            bucket_metrics[f"{prefix}_{name}_mc_mean"] = bucket_metrics.pop(parsed_target_mean_key)
+        metrics.update(bucket_metrics)
+    return metrics
+
+
 def score_dataset(cfg: ScoreDatasetConfig) -> str:
     import pandas as pd  # noqa: PLC0415
 
@@ -859,6 +892,7 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
     all_preds: list[float | None] = []
     all_mc: list[float] = []
     all_horizon_fractions: list[float] = []
+    all_trajectory_fractions: list[float] = []
     grouped_predictions: dict[str, list[float | None]] = {
         "final_action_correct": [],
         "final_action_incorrect": [],
@@ -897,7 +931,9 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
             grouped_predictions[group].append(prediction)
             grouped_targets[group].append(float(mc))
             horizon_fraction = int(pos) / max(response_token_limit, 1)
+            trajectory_fraction = int(pos) / max(rollout_length - 1, 1)
             all_horizon_fractions.append(horizon_fraction)
+            all_trajectory_fractions.append(trajectory_fraction)
             if prediction is not None:
                 if is_correct:
                     correct_preds.append(prediction)
@@ -912,6 +948,7 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
                     "probe_position": int(pos),
                     "response_tokens_remaining": response_token_limit - int(pos),
                     "horizon_fraction": horizon_fraction,
+                    "trajectory_fraction": trajectory_fraction,
                     "predicted_value": prediction,
                     "parsed": prediction is not None,
                     "raw_generation": raw_generation,
@@ -956,33 +993,13 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
             metrics[f"calib_bin_{b}_pred_mean"] = float(np.mean([parsed_preds[j] for j in chunk]))
             metrics[f"calib_bin_{b}_mc_mean"] = float(np.mean([parsed_mc[j] for j in chunk]))
 
-        horizon_buckets = {
-            "early": [j for j, fraction in enumerate(all_horizon_fractions) if fraction < 0.25],
-            "middle": [j for j, fraction in enumerate(all_horizon_fractions) if 0.25 <= fraction < 0.75],
-            "late": [j for j, fraction in enumerate(all_horizon_fractions) if fraction >= 0.75],
-        }
-        for name, indices in horizon_buckets.items():
-            if not indices:
-                continue
-            bucket_parsed_indices = [index for index in indices if all_preds[index] is not None]
-            bucket_preds = [float(all_preds[index]) for index in bucket_parsed_indices]
-            bucket_mc = [all_mc[index] for index in bucket_parsed_indices]
-            metrics[f"horizon_{name}_examples"] = float(len(indices))
-            metrics[f"horizon_{name}_parse_rate"] = len(bucket_parsed_indices) / len(indices)
-            metrics[f"horizon_{name}_penalized_mse"] = float(
-                np.mean(
-                    [
-                        1.0 if all_preds[index] is None else (float(all_preds[index]) - all_mc[index]) ** 2
-                        for index in indices
-                    ]
-                )
-            )
-            if bucket_preds:
-                metrics[f"horizon_{name}_pred_mean"] = float(np.mean(bucket_preds))
-                metrics[f"horizon_{name}_mc_mean"] = float(np.mean(bucket_mc))
-                metrics[f"horizon_{name}_mse"] = float(
-                    np.mean([(prediction - target) ** 2 for prediction, target in zip(bucket_preds, bucket_mc)])
-                )
+        metrics.update(_bucketed_prediction_metrics(all_preds, all_mc, all_horizon_fractions, prefix="horizon"))
+        # Budget-relative horizon metrics answer how close a state is to the hard
+        # token limit. Trajectory-relative metrics answer whether the critic gets
+        # better as the sampled solution itself progresses. A short completed
+        # response can be early in the former sense and late in the latter, so
+        # reporting only one view can hide the prefix-ranking failure we care about.
+        metrics.update(_bucketed_prediction_metrics(all_preds, all_mc, all_trajectory_fractions, prefix="trajectory"))
 
     if correct_preds:
         metrics["correct_pred_mean"] = float(np.mean(correct_preds))

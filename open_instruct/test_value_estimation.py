@@ -452,6 +452,24 @@ class TestValueEstimationStates(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "differ in length"):
             value_estimation._prediction_group_metrics([0.1], [], prefix="broken")
 
+    def test_bucketed_prediction_metrics_separates_position_bands_and_penalizes_parse_failures(self):
+        metrics = value_estimation._bucketed_prediction_metrics(
+            [0.1, 0.5, None, 0.9], [0.0, 0.5, 1.0, 1.0], [0.0, 0.25, 0.5, 1.0], prefix="trajectory"
+        )
+
+        self.assertEqual(metrics["trajectory_early_examples"], 1.0)
+        self.assertAlmostEqual(metrics["trajectory_early_mse"], 0.01)
+        self.assertEqual(metrics["trajectory_middle_examples"], 2.0)
+        self.assertAlmostEqual(metrics["trajectory_middle_parse_rate"], 0.5)
+        self.assertAlmostEqual(metrics["trajectory_middle_penalized_mse"], 0.5)
+        self.assertAlmostEqual(metrics["trajectory_middle_mc_mean"], 0.5)
+        self.assertEqual(metrics["trajectory_late_examples"], 1.0)
+        self.assertAlmostEqual(metrics["trajectory_late_mse"], 0.01)
+
+    def test_bucketed_prediction_metrics_rejects_length_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "same length"):
+            value_estimation._bucketed_prediction_metrics([0.1], [0.0], [], prefix="trajectory")
+
 
 if __name__ == "__main__":
     unittest.main()
