@@ -384,6 +384,7 @@ class GenValueTrainerActor:
         ``R_v = 1 - (r - v_hat)^2``, with both ``r`` and ``v_hat`` clipped to
         [0, 1]. Parse failures receive reward zero.
         """
+        reinforce_step_started_at = time.perf_counter()
         if not training_pairs:
             return {"gen_value/version": self._step_count, "gen_value/reinforce_steps": self._step_count}
 
@@ -511,7 +512,10 @@ class GenValueTrainerActor:
         for example, reinforce_weight in zip(validated_examples, reinforce_weights):
             example["reward"] = reinforce_weight
 
+        training_preparation_seconds = time.perf_counter() - reinforce_step_started_at
+        packing_started_at = time.perf_counter()
         packs = value_model_utils.pack_gen_value_examples(validated_examples, self._pack_length)
+        training_packing_seconds = time.perf_counter() - packing_started_at
         # DeepSpeed's BF16 optimizer owns the FP32 accumulation buffers, so clear
         # it directly rather than only clearing the BF16 module gradients.
         self._optimizer.zero_grad()
@@ -529,6 +533,7 @@ class GenValueTrainerActor:
         tis_mask_kept_tokens = 0
         tis_mask_total_tokens = 0
 
+        optimization_started_at = time.perf_counter()
         pack_token_counts: list[int] = []
         for pack_idx, pack in enumerate(packs):
             flattened = value_model_utils.flatten_gen_value_pack(pack)
@@ -598,6 +603,9 @@ class GenValueTrainerActor:
                 grad_norm = float(global_grad_norm)
             self._step_count += 1
 
+        training_optimization_seconds = time.perf_counter() - optimization_started_at
+        reinforce_step_seconds = time.perf_counter() - reinforce_step_started_at
+
         metrics = {
             "gen_value/reinforce_loss": total_loss,
             "gen_value/reward_mean": sum(unique_rewards) / len(unique_rewards),
@@ -633,6 +641,10 @@ class GenValueTrainerActor:
             "gen_value/train_examples_per_pack": len(rewards) / len(packs),
             "gen_value/train_mean_pack_tokens": sum(pack_token_counts) / len(packs),
             "gen_value/train_max_pack_tokens": max(pack_token_counts),
+            "gen_value/training_preparation_seconds": training_preparation_seconds,
+            "gen_value/training_packing_seconds": training_packing_seconds,
+            "gen_value/training_optimization_seconds": training_optimization_seconds,
+            "gen_value/reinforce_step_seconds": reinforce_step_seconds,
             "gen_value/lr": self._optimizer.param_groups[0]["lr"],
         }
         metrics.update(pooling_metrics)

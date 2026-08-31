@@ -2229,7 +2229,9 @@ class PolicyTrainerRayProcess(RayProcess):
                             )
                     num_segment_prompts = sum(len(request["prompts"]) for request in gen_value_requests)
                     sae_step_metrics["gen_value/num_segment_prompts"] = float(num_segment_prompts)
+                    gen_value_scoring_started_at = time.perf_counter()
                     gen_value_results = self._score_gen_value_requests(gen_value_requests)
+                    sae_step_metrics["gen_value/scoring_seconds"] = time.perf_counter() - gen_value_scoring_started_at
                     if self._sp_world_size > 1:
                         # Followers need only the numeric values. Keeping request outputs
                         # on SP rank 0 prevents duplicate critic examples and avoids
