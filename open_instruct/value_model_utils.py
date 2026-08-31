@@ -1001,6 +1001,26 @@ def write_gen_value_validation_snapshot(
     return snapshot_path
 
 
+def read_gen_value_validation_snapshot(path: pathlib.Path) -> list[dict[str, Any]]:
+    """Read and validate a persisted fixed generative-critic holdout."""
+    examples: list[dict[str, Any]] = []
+    with path.open(encoding="utf-8") as snapshot_file:
+        for line_number, line in enumerate(snapshot_file, start=1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                raise ValueError(f"Expected an object at {path}:{line_number}, got {type(row).__name__}.")
+            if not isinstance(row.get("prompt"), str) or not row["prompt"]:
+                raise ValueError(f"Missing non-empty prompt at {path}:{line_number}.")
+            if not isinstance(row.get("target"), int | float):
+                raise ValueError(f"Missing numeric target at {path}:{line_number}.")
+            examples.append(row)
+    if not examples:
+        raise ValueError(f"Validation snapshot is empty: {path}.")
+    return examples
+
+
 def write_gen_value_training_trace_reservoir(
     output_dir: str, version: int, examples: Sequence[dict[str, Any]], seen_by_outcome: dict[str, int]
 ) -> pathlib.Path:

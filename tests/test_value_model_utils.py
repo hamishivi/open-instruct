@@ -1,5 +1,6 @@
 """CPU-only tests for generative-value target and replay helpers."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -164,6 +165,26 @@ def test_gen_value_validation_auc_assigns_half_credit_to_ties():
     assert metrics["gen_value/validation_final_action_auc"] == pytest.approx(0.875)
 
 
+def test_read_gen_value_validation_snapshot_validates_required_fields(tmp_path):
+    snapshot_path = tmp_path / "snapshot.jsonl"
+    snapshot_path.write_text(json.dumps({"prompt": "Score this.", "target": 1.0}) + "\n", encoding="utf-8")
+
+    assert value_model_utils.read_gen_value_validation_snapshot(snapshot_path) == [
+        {"prompt": "Score this.", "target": 1.0}
+    ]
+
+
+@pytest.mark.parametrize(
+    "row, message", [({"target": 1.0}, "non-empty prompt"), ({"prompt": "Score this."}, "numeric target")]
+)
+def test_read_gen_value_validation_snapshot_rejects_invalid_rows(tmp_path, row, message):
+    snapshot_path = tmp_path / "snapshot.jsonl"
+    snapshot_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        value_model_utils.read_gen_value_validation_snapshot(snapshot_path)
+
+
 @pytest.mark.parametrize(
     ("threshold", "observed", "expected"),
     [
@@ -197,33 +218,25 @@ def test_gen_value_training_queue_capacity_rejects_invalid_values(world_size: in
 
 @pytest.mark.parametrize(
     ("policy_step", "latest_trained_step", "max_async_steps", "expected"),
-    [
-        (1, 0, 1, True),
-        (2, 1, 1, True),
-        (2, 0, 1, False),
-        (5, 3, 2, True),
-        (6, 3, 2, False),
-    ],
+    [(1, 0, 1, True), (2, 1, 1, True), (2, 0, 1, False), (5, 3, 2, True), (6, 3, 2, False)],
 )
 def test_gen_value_source_step_admission_window(
     policy_step: int, latest_trained_step: int, max_async_steps: int, expected: bool
 ):
     assert (
-        value_model_utils.gen_value_source_step_is_admissible(
-            policy_step, latest_trained_step, max_async_steps
-        )
+        value_model_utils.gen_value_source_step_is_admissible(policy_step, latest_trained_step, max_async_steps)
         is expected
     )
 
 
-@pytest.mark.parametrize(("policy_step", "latest_trained_step", "max_async_steps"), [(-1, 0, 1), (1, -1, 1), (1, 0, 0)])
+@pytest.mark.parametrize(
+    ("policy_step", "latest_trained_step", "max_async_steps"), [(-1, 0, 1), (1, -1, 1), (1, 0, 0)]
+)
 def test_gen_value_source_step_admission_rejects_invalid_values(
     policy_step: int, latest_trained_step: int, max_async_steps: int
 ):
     with pytest.raises(ValueError):
-        value_model_utils.gen_value_source_step_is_admissible(
-            policy_step, latest_trained_step, max_async_steps
-        )
+        value_model_utils.gen_value_source_step_is_admissible(policy_step, latest_trained_step, max_async_steps)
 
 
 def test_gen_value_training_progress_waits_for_all_admitted_rollouts():
