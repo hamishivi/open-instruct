@@ -525,6 +525,8 @@ def _extract_problem(row: dict[str, Any]) -> str:
     """Return the unformatted user problem used to identify held-out states."""
     if "messages" in row and isinstance(row["messages"], list) and row["messages"]:
         return str(row["messages"][-1].get("content", ""))
+    if row.get("problem") is not None:
+        return str(row["problem"])
     return str(row.get("prompt", ""))
 
 

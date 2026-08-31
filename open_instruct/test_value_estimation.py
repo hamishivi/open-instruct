@@ -335,6 +335,12 @@ class TestValueEstimationStates(unittest.TestCase):
 
         self.assertCountEqual(indices, [1, 2])
 
+    def test_extract_problem_reads_local_problem_column(self):
+        self.assertEqual(
+            value_estimation._extract_problem({"problem": "held-out question", "ground_truth": "42"}),
+            "held-out question",
+        )
+
     def test_problem_exclusion_fails_when_nothing_remains(self):
         with self.assertRaisesRegex(ValueError, "No dataset rows remain"):
             value_estimation._sample_record_indices(
