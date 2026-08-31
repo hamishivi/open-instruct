@@ -306,6 +306,18 @@ class TestValueEstimationStates(unittest.TestCase):
     def test_mc_dataset_defaults_to_one_data_parallel_replica(self):
         self.assertEqual(value_estimation.MakeDatasetConfig.__dataclass_fields__["data_parallel_size"].default, 1)
 
+    def test_dense_data_parallel_replicas_get_disjoint_cuda_device_groups(self):
+        self.assertEqual(
+            value_estimation._cuda_device_groups(
+                data_parallel_size=2, tensor_parallel_size=2, visible_devices="4,7,2,9"
+            ),
+            ["4,7", "2,9"],
+        )
+
+    def test_dense_data_parallel_replicas_require_enough_visible_devices(self):
+        with self.assertRaisesRegex(ValueError, "Need 4 visible CUDA devices"):
+            value_estimation._cuda_device_groups(data_parallel_size=2, tensor_parallel_size=2, visible_devices="4,7,2")
+
     def test_mc_dataset_actor_identity_can_differ_from_rollout_checkpoint(self):
         config = value_estimation.MakeDatasetConfig(
             model_name_or_path="/checkpoints/step_100",

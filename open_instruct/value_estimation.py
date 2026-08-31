@@ -28,9 +28,12 @@ import argparse
 import contextlib
 import dataclasses
 import json
+import multiprocessing
 import os
 import pathlib
+import queue
 import random
+import traceback
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -143,7 +146,7 @@ class ConvertCheckpointConfig:
 # --------------------------------------------------------------------------------------------
 # make_dataset
 # --------------------------------------------------------------------------------------------
-def _run_rollouts(
+def _run_rollouts_single_replica(
     prompts: list[str | list[int]],
     *,
     model_name_or_path: str,
@@ -152,19 +155,15 @@ def _run_rollouts(
     top_p: float,
     max_tokens: int | Sequence[int],
     tensor_parallel_size: int,
-    data_parallel_size: int,
     gpu_memory_utilization: float,
     logprobs: bool = False,
 ) -> list[list[dict[str, Any]]]:
-    """Run `n` rollouts per prompt through vLLM. Returns list-of-lists of dicts with keys
-    ``token_ids`` (list[int]), ``text`` (str), ``logprobs`` (list[float] | None).
-    """
+    """Run one independent vLLM replica over one prompt shard."""
     from vllm import LLM, SamplingParams  # noqa: PLC0415
 
     llm = LLM(
         model=model_name_or_path,
         tensor_parallel_size=tensor_parallel_size,
-        data_parallel_size=data_parallel_size,
         gpu_memory_utilization=gpu_memory_utilization,
     )
     if isinstance(max_tokens, int):
@@ -207,6 +206,189 @@ def _run_rollouts(
     with contextlib.suppress(Exception):
         del llm
     return result
+
+
+def _cuda_device_groups(
+    *, data_parallel_size: int, tensor_parallel_size: int, visible_devices: str | None = None
+) -> list[str]:
+    """Assign each independent dense-model replica a disjoint CUDA device group."""
+    if data_parallel_size < 1:
+        raise ValueError(f"data_parallel_size must be positive, got {data_parallel_size}.")
+    if tensor_parallel_size < 1:
+        raise ValueError(f"tensor_parallel_size must be positive, got {tensor_parallel_size}.")
+    required_devices = data_parallel_size * tensor_parallel_size
+    if visible_devices is None:
+        visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    devices = [device.strip() for device in visible_devices.split(",") if device.strip()] if visible_devices else []
+    if not devices:
+        devices = [str(device) for device in range(required_devices)]
+    if len(devices) < required_devices:
+        raise ValueError(
+            f"Need {required_devices} visible CUDA devices for DP={data_parallel_size}, TP={tensor_parallel_size}; "
+            f"CUDA_VISIBLE_DEVICES exposes {len(devices)} ({','.join(devices)})."
+        )
+    return [
+        ",".join(devices[rank * tensor_parallel_size : (rank + 1) * tensor_parallel_size])
+        for rank in range(data_parallel_size)
+    ]
+
+
+def _run_rollouts_replica_worker(
+    replica_rank: int,
+    visible_devices: str,
+    indexed_prompts: list[tuple[int, str | list[int]]],
+    *,
+    model_name_or_path: str,
+    n: int,
+    temperature: float,
+    top_p: float,
+    max_tokens: int | list[int],
+    tensor_parallel_size: int,
+    gpu_memory_utilization: float,
+    logprobs: bool,
+    result_queue: Any,
+) -> None:
+    """Generate one prompt shard after masking the process to its assigned GPUs."""
+    try:
+        os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
+        shard_results = _run_rollouts_single_replica(
+            [prompt for _, prompt in indexed_prompts],
+            model_name_or_path=model_name_or_path,
+            n=n,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            tensor_parallel_size=tensor_parallel_size,
+            gpu_memory_utilization=gpu_memory_utilization,
+            logprobs=logprobs,
+        )
+        result_queue.put(
+            (replica_rank, list(zip((index for index, _ in indexed_prompts), shard_results, strict=True)), None)
+        )
+    except BaseException:
+        result_queue.put((replica_rank, None, traceback.format_exc()))
+        raise
+
+
+def _run_rollouts(
+    prompts: list[str | list[int]],
+    *,
+    model_name_or_path: str,
+    n: int,
+    temperature: float,
+    top_p: float,
+    max_tokens: int | Sequence[int],
+    tensor_parallel_size: int,
+    data_parallel_size: int,
+    gpu_memory_utilization: float,
+    logprobs: bool = False,
+) -> list[list[dict[str, Any]]]:
+    """Run `n` rollouts per prompt through independent dense-model replicas.
+
+    vLLM's built-in offline ``data_parallel_size`` mode targets MoE expert
+    parallelism and rejects dense models such as Qwen3-4B. For dense rollout
+    throughput, launch one ordinary LLM process per replica, shard prompts, and
+    restore the original prompt order after generation.
+    """
+    if not prompts:
+        return []
+    if isinstance(max_tokens, Sequence) and not isinstance(max_tokens, (str, bytes)):
+        if len(max_tokens) != len(prompts):
+            raise ValueError(
+                f"max_tokens must be one integer or one value per prompt ({len(max_tokens)} != {len(prompts)})."
+            )
+        max_tokens = [int(value) for value in max_tokens]
+    if data_parallel_size == 1:
+        return _run_rollouts_single_replica(
+            prompts,
+            model_name_or_path=model_name_or_path,
+            n=n,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            tensor_parallel_size=tensor_parallel_size,
+            gpu_memory_utilization=gpu_memory_utilization,
+            logprobs=logprobs,
+        )
+
+    replica_count = min(data_parallel_size, len(prompts))
+    device_groups = _cuda_device_groups(data_parallel_size=replica_count, tensor_parallel_size=tensor_parallel_size)
+    prompt_shards: list[list[tuple[int, str | list[int]]]] = [[] for _ in range(replica_count)]
+    for index, prompt in enumerate(prompts):
+        prompt_shards[index % replica_count].append((index, prompt))
+
+    logger.info(
+        "Running %d prompts across %d independent vLLM replicas on CUDA device groups %s",
+        len(prompts),
+        replica_count,
+        device_groups,
+    )
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    processes: list[multiprocessing.Process] = []
+    for replica_rank, (visible_devices, indexed_prompts) in enumerate(zip(device_groups, prompt_shards, strict=True)):
+        if isinstance(max_tokens, list):
+            shard_max_tokens: int | list[int] = [max_tokens[index] for index, _ in indexed_prompts]
+        else:
+            shard_max_tokens = max_tokens
+        process = context.Process(
+            target=_run_rollouts_replica_worker,
+            kwargs={
+                "replica_rank": replica_rank,
+                "visible_devices": visible_devices,
+                "indexed_prompts": indexed_prompts,
+                "model_name_or_path": model_name_or_path,
+                "n": n,
+                "temperature": temperature,
+                "top_p": top_p,
+                "max_tokens": shard_max_tokens,
+                "tensor_parallel_size": tensor_parallel_size,
+                "gpu_memory_utilization": gpu_memory_utilization,
+                "logprobs": logprobs,
+                "result_queue": result_queue,
+            },
+            name=f"vllm-data-replica-{replica_rank}",
+        )
+        process.start()
+        processes.append(process)
+
+    indexed_results: list[tuple[int, list[dict[str, Any]]]] = []
+    received_ranks: set[int] = set()
+    try:
+        while len(received_ranks) < replica_count:
+            try:
+                replica_rank, shard_results, error = result_queue.get(timeout=5)
+            except queue.Empty:
+                failed = [process for process in processes if process.exitcode not in (None, 0)]
+                if failed:
+                    raise RuntimeError(
+                        "vLLM data replica exited before returning results: "
+                        + ", ".join(f"{process.name}={process.exitcode}" for process in failed)
+                    ) from None
+                continue
+            received_ranks.add(replica_rank)
+            if error is not None:
+                raise RuntimeError(f"vLLM data replica {replica_rank} failed:\n{error}")
+            indexed_results.extend(shard_results)
+
+        for process in processes:
+            process.join(timeout=30)
+            if process.exitcode != 0:
+                raise RuntimeError(f"{process.name} exited with code {process.exitcode} after returning results.")
+    except BaseException:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        for process in processes:
+            process.join(timeout=30)
+        raise
+    finally:
+        result_queue.close()
+
+    indexed_results.sort(key=lambda item: item[0])
+    if [index for index, _ in indexed_results] != list(range(len(prompts))):
+        raise RuntimeError("Data-parallel vLLM replicas returned incomplete or duplicate prompt indices.")
+    return [result for _, result in indexed_results]
 
 
 def _actor_state_token_ids(prompt_token_ids: Sequence[int], rollout_token_ids: Sequence[int], probe: int) -> list[int]:
