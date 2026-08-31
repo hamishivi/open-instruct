@@ -5,6 +5,7 @@ set -euo pipefail
 # defaults are a cheap pipeline/throughput pilot; set TARGET_NUM_PAIRS and
 # CONTINUATIONS_PER_PROBE higher for the fixed production calibration set.
 MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-Qwen/Qwen3-4B-Base}"
+ACTOR_MODEL_NAME="${ACTOR_MODEL_NAME:-${MODEL_NAME_OR_PATH}}"
 OUTPUT_PATH="${OUTPUT_PATH:-./value_estimation_data/dapo_math_mc_pilot.parquet}"
 TARGET_NUM_PAIRS="${TARGET_NUM_PAIRS:-10}"
 NUM_PROMPTS_TO_SAMPLE="${NUM_PROMPTS_TO_SAMPLE:-200}"
@@ -22,6 +23,7 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 
 MAKE_DATASET_ARGS=(
     --model_name_or_path "${MODEL_NAME_OR_PATH}"
+    --actor_model_name "${ACTOR_MODEL_NAME}"
     --output_path "${OUTPUT_PATH}"
     --dataset_name hamishivi/DAPO-Math-17k-Processed_filtered
     --num_prompts_to_sample "${NUM_PROMPTS_TO_SAMPLE}"

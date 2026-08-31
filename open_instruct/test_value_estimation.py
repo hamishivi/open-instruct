@@ -306,6 +306,15 @@ class TestValueEstimationStates(unittest.TestCase):
     def test_mc_dataset_defaults_to_one_data_parallel_replica(self):
         self.assertEqual(value_estimation.MakeDatasetConfig.__dataclass_fields__["data_parallel_size"].default, 1)
 
+    def test_mc_dataset_actor_identity_can_differ_from_rollout_checkpoint(self):
+        config = value_estimation.MakeDatasetConfig(
+            model_name_or_path="/checkpoints/step_100",
+            output_path="values.parquet",
+            actor_model_name="Qwen/Qwen3-4B-Base",
+        )
+
+        self.assertEqual(config.actor_model_name, "Qwen/Qwen3-4B-Base")
+
     def test_optional_float_cli_field_is_parsed_as_float(self):
         parser = argparse.ArgumentParser()
         field = next(

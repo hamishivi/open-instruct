@@ -49,6 +49,12 @@ logger = logger_utils.setup_logger(__name__)
 class MakeDatasetConfig:
     model_name_or_path: str
     output_path: str
+    actor_model_name: str | None = None
+    """Canonical actor identity recorded in critic prompts.
+
+    This can differ from ``model_name_or_path`` when rollouts are generated from
+    a local checkpoint but the online actor is identified by its base model.
+    """
     dataset_name: str = "hamishivi/DAPO-Math-17k-Processed_filtered"
     dataset_split: str = "train"
     exclude_problem_dataset_path: str | None = None
@@ -477,7 +483,7 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
                 "mc_values": [],  # filled in below
                 "num_continuations": cfg.continuations_per_probe,
                 "response_token_limit": cfg.max_response_length,
-                "actor_model_name": cfg.model_name_or_path,
+                "actor_model_name": cfg.actor_model_name or cfg.model_name_or_path,
                 "actor_success_rate": observed_actor_success_rate,
                 "probe_mode": cfg.probe_mode,
                 "probe_semantics": (
