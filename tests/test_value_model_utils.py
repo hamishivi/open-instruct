@@ -93,6 +93,33 @@ def test_final_action_replay_does_not_distort_leave_one_out_baseline():
     assert weights == pytest.approx([0.25, 0.25, 0.25, 0.25, -0.25])
 
 
+def test_shared_state_returns_pool_unique_continuations_without_dropping_replays():
+    correct = _pair([1, 2], 1.0, state_kind="segment_start", response_tokens_used=0)
+    incorrect = _pair([1, 2], 0.0, state_kind="segment_start", response_tokens_used=0)
+    distinct = _pair([1, 3], 0.0, state_kind="segment_start", response_tokens_used=0)
+
+    targets, metrics = value_model_utils.pool_gen_value_shared_state_returns(
+        [correct, correct, incorrect, distinct]
+    )
+
+    assert targets == {id(correct): 0.5, id(incorrect): 0.5, id(distinct): 0.0}
+    assert metrics == {
+        "gen_value/shared_state_unique_examples": 3.0,
+        "gen_value/shared_state_groups": 2.0,
+        "gen_value/shared_state_pooled_groups": 1.0,
+        "gen_value/shared_state_pooled_examples": 2.0,
+        "gen_value/shared_state_changed_examples": 2.0,
+    }
+
+
+@pytest.mark.parametrize("outcome", [float("nan"), -0.1, 1.1])
+def test_shared_state_return_pooling_rejects_invalid_outcomes(outcome: float):
+    pair = _pair([1, 2], outcome, state_kind="segment_start", response_tokens_used=0)
+
+    with pytest.raises(ValueError, match="finite and in \\[0, 1\\]"):
+        value_model_utils.pool_gen_value_shared_state_returns([pair])
+
+
 def test_near_horizon_detection_requires_incorrect_outcome_and_little_budget():
     near_horizon = {"outcome": 0.0, "response_tokens_used": 7500, "response_token_limit": 8192}
     assert value_model_utils.is_gen_value_near_horizon_incorrect(near_horizon)

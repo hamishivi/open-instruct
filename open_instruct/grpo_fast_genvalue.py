@@ -141,6 +141,7 @@ class GenValueTrainerActor:
         tensor_parallel_size: int = 1,
         reinforce_coef: float = 0.1,
         reinforce_baseline: str = "none",
+        pool_shared_state_returns: bool = True,
         weight_decay: float = 0.0,
         set_weight_decay_on_bias_and_norm: bool = True,
         fused_optimizer: bool = True,
@@ -161,6 +162,7 @@ class GenValueTrainerActor:
         self._tis_mask_upper = tis_mask_upper
         self._reinforce_coef = reinforce_coef
         self._reinforce_baseline = reinforce_baseline
+        self._pool_shared_state_returns = pool_shared_state_returns
         self._step_count = 0
         self._trace_reservoir_size = trace_reservoir_size
         self._trace_rng = random.Random(trace_seed)
@@ -325,14 +327,16 @@ class GenValueTrainerActor:
         pair: dict[str, Any],
         prompt_ids: list[int],
         generation: str,
-        outcome: float,
+        sampled_outcome: float,
+        training_target: float,
         prediction: float | None,
-        squared_error: float | None,
+        sampled_squared_error: float | None,
+        training_target_squared_error: float | None,
         reward: float,
     ) -> None:
         if self._trace_reservoir_size == 0:
             return
-        bucket = "correct" if outcome > 0.5 else "incorrect"
+        bucket = "correct" if sampled_outcome > 0.5 else "incorrect"
         capacity = self._trace_bucket_capacity(bucket)
         self._trace_seen_by_outcome[bucket] += 1
         seen = self._trace_seen_by_outcome[bucket]
@@ -350,9 +354,11 @@ class GenValueTrainerActor:
             "response_tokens_used": pair.get("response_tokens_used"),
             "response_token_limit": pair.get("response_token_limit"),
             "trajectory_fraction": pair.get("trajectory_fraction"),
-            "outcome": outcome,
+            "outcome": sampled_outcome,
+            "training_target": training_target,
             "prediction": prediction,
-            "squared_error": squared_error,
+            "squared_error": sampled_squared_error,
+            "training_target_squared_error": training_target_squared_error,
             "reinforce_reward": reward,
             "prompt": self._tokenizer.decode(prompt_ids, skip_special_tokens=False),
             "generation": generation,
@@ -373,11 +379,30 @@ class GenValueTrainerActor:
     def reinforce_step(self, training_pairs: list[dict]) -> dict:
         """Apply one REINFORCE gradient step with the MSE-shaped critic reward.
 
-        For each pair we compute ``R_v = 1 - (r - v_hat)^2``, with both ``r`` and
-        ``v_hat`` clipped to [0, 1]. Parse failures receive reward zero.
+        Exact token-identical states first share their empirical Monte Carlo
+        return when pooling is enabled. For each pair we then compute
+        ``R_v = 1 - (r - v_hat)^2``, with both ``r`` and ``v_hat`` clipped to
+        [0, 1]. Parse failures receive reward zero.
         """
         if not training_pairs:
             return {"gen_value/version": self._step_count, "gen_value/reinforce_steps": self._step_count}
+
+        pairs_with_outcomes = [pair for pair in training_pairs if pair["outcome"] is not None]
+        if self._pool_shared_state_returns:
+            return_targets, pooling_metrics = value_model_utils.pool_gen_value_shared_state_returns(
+                pairs_with_outcomes
+            )
+        else:
+            unique_pairs = value_model_utils.unique_replayed_gen_value_pairs(pairs_with_outcomes)
+            return_targets = {id(pair): max(0.0, min(1.0, float(pair["outcome"]))) for pair in unique_pairs}
+            pooling_metrics = {
+                "gen_value/shared_state_unique_examples": float(len(unique_pairs)),
+                "gen_value/shared_state_groups": float(len(unique_pairs)),
+                "gen_value/shared_state_pooled_groups": 0.0,
+                "gen_value/shared_state_pooled_examples": 0.0,
+                "gen_value/shared_state_changed_examples": 0.0,
+            }
+        pooling_metrics["gen_value/shared_state_pooling_enabled"] = float(self._pool_shared_state_returns)
 
         validated_examples: list[dict[str, Any]] = []
         skipped_empty_generation = 0
@@ -388,7 +413,9 @@ class GenValueTrainerActor:
         optimization_v_hats: list[float] = []
         unique_rewards: list[float] = []
         unique_outcomes: list[float] = []
+        unique_sampled_outcomes: list[float] = []
         unique_mses: list[float] = []
+        unique_sampled_mses: list[float] = []
         unique_v_hats: list[float] = []
         near_horizon_incorrect_v_hats: list[float] = []
         near_horizon_incorrect_mses: list[float] = []
@@ -416,28 +443,42 @@ class GenValueTrainerActor:
             if not generated_ids:
                 skipped_empty_generation += 1
                 continue
-            outcome = max(0.0, min(1.0, float(pair["outcome"])))
+            sampled_outcome = max(0.0, min(1.0, float(pair["outcome"])))
+            outcome = return_targets[id(pair)]
             v_hat = self._score_from_text(completion.text)
             if v_hat is not None:
                 optimization_v_hats.append(v_hat)
             reward, squared_error = value_model_utils.generative_value_reinforce_reward(outcome, v_hat)
+            sampled_squared_error = None if v_hat is None else (v_hat - sampled_outcome) ** 2
             is_first_replay = id(pair) in diagnostic_pair_ids
             if is_first_replay:
                 diagnostic_pair_ids.remove(id(pair))
                 unique_rewards.append(reward)
                 unique_outcomes.append(outcome)
+                unique_sampled_outcomes.append(sampled_outcome)
                 if v_hat is not None:
                     unique_v_hats.append(v_hat)
                 if squared_error is not None:
                     unique_mses.append(squared_error)
+                if sampled_squared_error is not None:
+                    unique_sampled_mses.append(sampled_squared_error)
                 self._maybe_store_training_trace(
-                    pair, prompt_ids, completion.text, outcome, v_hat, squared_error, reward
+                    pair,
+                    prompt_ids,
+                    completion.text,
+                    sampled_outcome,
+                    outcome,
+                    v_hat,
+                    sampled_squared_error,
+                    squared_error,
+                    reward,
                 )
             if squared_error is not None:
                 optimization_mses.append(squared_error)
                 if is_first_replay and value_model_utils.is_gen_value_near_horizon_incorrect(pair):
                     near_horizon_incorrect_v_hats.append(v_hat)
-                    near_horizon_incorrect_mses.append(squared_error)
+                    assert sampled_squared_error is not None
+                    near_horizon_incorrect_mses.append(sampled_squared_error)
             validated_examples.append(
                 {
                     "sequence_ids": sequence_ids,
@@ -562,8 +603,12 @@ class GenValueTrainerActor:
             "gen_value/reinforce_weight_negative_frac": sum(weight < 0.0 for weight in reinforce_weights)
             / len(reinforce_weights),
             "gen_value/outcome_mean": sum(unique_outcomes) / len(unique_outcomes),
+            "gen_value/sampled_outcome_mean": sum(unique_sampled_outcomes) / len(unique_sampled_outcomes),
             "gen_value/optimization_outcome_mean": sum(outcomes) / len(outcomes),
             "gen_value/mse": sum(unique_mses) / len(unique_mses) if unique_mses else float("nan"),
+            "gen_value/sampled_mse": (
+                sum(unique_sampled_mses) / len(unique_sampled_mses) if unique_sampled_mses else float("nan")
+            ),
             "gen_value/optimization_mse": (
                 sum(optimization_mses) / len(optimization_mses) if optimization_mses else float("nan")
             ),
@@ -583,6 +628,7 @@ class GenValueTrainerActor:
             "gen_value/train_max_pack_tokens": max(pack_token_counts),
             "gen_value/lr": self._optimizer.param_groups[0]["lr"],
         }
+        metrics.update(pooling_metrics)
         if self._trace_reservoir_size > 0:
             metrics["gen_value/trace_examples_seen"] = sum(self._trace_seen_by_outcome.values())
             metrics["gen_value/trace_examples_retained"] = sum(len(rows) for rows in self._trace_reservoirs.values())
@@ -717,6 +763,11 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
     # Optional variance-reducing baseline for the raw GenAC reward. Leave-one-out
     # centering also makes malformed/inaccurate generations receive negative weight.
     gen_value_reinforce_baseline: str = "none"
+    # Token-identical critic states sampled under multiple policy continuations
+    # share their empirical Monte Carlo return. This preserves every completion
+    # while replacing contradictory per-trajectory Bernoulli labels with the
+    # lower-variance state-value target already used by offline DirectMC SFT.
+    gen_value_pool_shared_state_returns: bool = True
     # Exact final-action critic states are scarce relative to segment starts.
     # Replaying them improves near-horizon discrimination without changing actor data.
     gen_value_final_action_replay_weight: int = 1
@@ -1780,6 +1831,7 @@ def main():
             tis_mask_upper=args.tis_mask_upper,
             reinforce_coef=args.gen_value_reinforce_coef,
             reinforce_baseline=args.gen_value_reinforce_baseline,
+            pool_shared_state_returns=args.gen_value_pool_shared_state_returns,
             weight_decay=args.weight_decay,
             set_weight_decay_on_bias_and_norm=args.set_weight_decay_on_bias_and_norm,
             fused_optimizer=args.fused_optimizer,

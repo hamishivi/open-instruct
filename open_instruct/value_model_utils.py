@@ -567,6 +567,59 @@ def unique_replayed_gen_value_pairs(training_pairs: Sequence[dict[str, Any]]) ->
     return unique
 
 
+def pool_gen_value_shared_state_returns(
+    training_pairs: Sequence[dict[str, Any]],
+) -> tuple[dict[int, float], dict[str, float]]:
+    """Pool exact shared critic states to their empirical Monte Carlo return.
+
+    Multiple policy continuations can begin from the same token-identical critic
+    prompt. Training each copy against its individual Bernoulli outcome is
+    unbiased, but needlessly high variance: the value of that shared state is the
+    mean return across its sampled continuations. Identity-preserving final-action
+    replay copies are collapsed before pooling, then receive the target assigned
+    to their original pair through the returned identity map. No example is
+    removed from the optimizer batch.
+    """
+    unique_pairs = unique_replayed_gen_value_pairs(training_pairs)
+    grouped_pairs: dict[tuple[int, ...], list[dict[str, Any]]] = {}
+    sampled_outcomes: dict[int, float] = {}
+    for pair in unique_pairs:
+        outcome = pair.get("outcome")
+        if outcome is None:
+            raise ValueError("Shared-state return pooling requires a sampled outcome for every pair.")
+        outcome = float(outcome)
+        if not math.isfinite(outcome) or not 0.0 <= outcome <= 1.0:
+            raise ValueError(f"Generative-value outcome must be finite and in [0, 1], got {outcome}.")
+        pair_id = id(pair)
+        sampled_outcomes[pair_id] = outcome
+        prompt_ids = tuple(int(token_id) for token_id in pair["request_output"].prompt_token_ids)
+        grouped_pairs.setdefault(prompt_ids, []).append(pair)
+
+    targets_by_pair_id: dict[int, float] = {}
+    pooled_groups = 0
+    pooled_examples = 0
+    changed_examples = 0
+    for pairs in grouped_pairs.values():
+        target = sum(sampled_outcomes[id(pair)] for pair in pairs) / len(pairs)
+        if len(pairs) > 1:
+            pooled_groups += 1
+            pooled_examples += len(pairs)
+        for pair in pairs:
+            pair_id = id(pair)
+            targets_by_pair_id[pair_id] = target
+            if target != sampled_outcomes[pair_id]:
+                changed_examples += 1
+
+    metrics = {
+        "gen_value/shared_state_unique_examples": float(len(unique_pairs)),
+        "gen_value/shared_state_groups": float(len(grouped_pairs)),
+        "gen_value/shared_state_pooled_groups": float(pooled_groups),
+        "gen_value/shared_state_pooled_examples": float(pooled_examples),
+        "gen_value/shared_state_changed_examples": float(changed_examples),
+    }
+    return targets_by_pair_id, metrics
+
+
 def is_gen_value_near_horizon_incorrect(example: dict[str, Any]) -> bool:
     """Whether a failed critic state is close to the hard response-token limit."""
     target = example.get("target", example.get("outcome"))
