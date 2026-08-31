@@ -1705,7 +1705,7 @@ def build_generative_value_prompt(
 
 
 def parse_generative_value_score(text: str, score_min: float = 0.0, score_max: float = 10.0) -> float | None:
-    """Extract the score from a `{score: X}` pattern."""
+    """Extract the score from an ``<answer>X</answer>`` element."""
     m = _SCORE_RE.search(text)
     if m:
         try:

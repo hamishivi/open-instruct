@@ -65,7 +65,7 @@ def main() -> None:
         prompt_ids = [42 + index] * prompt_length
         generated_ids = [142 + index] * args.generated_length
         completion = SimpleNamespace(
-            text="{score: 5}", token_ids=generated_ids, logprobs=[-8.0] * args.generated_length
+            text="<answer>5</answer>", token_ids=generated_ids, logprobs=[-8.0] * args.generated_length
         )
         training_pairs.append(
             {
@@ -93,6 +93,8 @@ def main() -> None:
         "metrics": metrics,
     }
     print(json.dumps(result, indent=2, sort_keys=True))
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
