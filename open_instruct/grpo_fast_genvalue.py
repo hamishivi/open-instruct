@@ -1098,6 +1098,49 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
     return merged
 
 
+def _wait_for_gen_value_publish_barrier(
+    critic_version: int,
+    sync_freq: int,
+    stop_event: threading.Event,
+    publish_complete_event: threading.Event,
+    progress_state: dict[str, Any],
+    progress_lock: threading.Lock,
+) -> float:
+    """Keep the trainer actor idle until a publishable critic version is served.
+
+    Ray actors execute methods serially. Without this barrier, the asynchronous
+    loop can enqueue the next ``reinforce_step`` before the policy boundary asks
+    the same actor to broadcast its weights. The nominally sub-second packed
+    broadcast then waits behind an entire optimizer update. Pause only at
+    configured publication versions so the broadcast RPC reaches an idle actor,
+    then resume training after the main thread records the served version.
+
+    Shutdown bypasses the barrier: the final policy callback drains the trainer
+    first and publishes the last completed version afterwards.
+    """
+    critic_version = int(critic_version)
+    sync_freq = int(sync_freq)
+    if sync_freq <= 0 or critic_version % sync_freq != 0:
+        return 0.0
+
+    started_at = time.perf_counter()
+    with progress_lock:
+        progress_state["pending_publish_version"] = critic_version
+    try:
+        while not stop_event.is_set():
+            with progress_lock:
+                synced_version = int(progress_state["synced_version"])
+            if synced_version >= critic_version:
+                break
+            publish_complete_event.wait(timeout=0.1)
+            publish_complete_event.clear()
+    finally:
+        with progress_lock:
+            if progress_state.get("pending_publish_version") == critic_version:
+                progress_state["pending_publish_version"] = None
+    return time.perf_counter() - started_at
+
+
 def _gen_value_scoring_loop(
     args: GenValueExperimentConfig,
     tokenizer: Any,
@@ -1179,6 +1222,8 @@ def _gen_value_reinforce_loop(
     output_dir: str,
     validation_state: dict[str, Any],
     validation_lock: threading.Lock,
+    sync_freq: int,
+    publish_complete_event: threading.Event,
 ) -> None:
     """Pipe queued rollouts into fixed-size critic batches and update asynchronously."""
     logger.info("[GenValue] asynchronous critic trainer started.")
@@ -1299,7 +1344,15 @@ def _gen_value_reinforce_loop(
                 }
             )
             metrics.update(capture_metrics)
+            # Publish optimizer metrics before blocking so the policy callback
+            # cannot race past and defer the whole update to its next W&B step.
             _put_gen_value_metrics(metrics_Q, metrics, "REINFORCE")
+            publish_barrier_seconds = _wait_for_gen_value_publish_barrier(
+                critic_version, sync_freq, stop_event, publish_complete_event, progress_state, progress_lock
+            )
+            _put_gen_value_metrics(
+                metrics_Q, {"gen_value/publish_barrier_seconds": publish_barrier_seconds}, "publication"
+            )
             logger.debug("[GenValue] REINFORCE step: %s", metrics)
 
     with progress_lock:
@@ -1808,6 +1861,7 @@ def main():
     # ── Step 5: background threads (scoring + REINFORCE) ──────────────────────
     gen_value_step_trigger = threading.Event()
     gen_value_stop_event = threading.Event()
+    gen_value_publish_complete_event = threading.Event()
     # Cross-thread metrics shuttle: background threads put() per-step metric
     # dicts here; _one_training_step_with_genvalue drains them and merges into
     # data_thread_metrics so they land in the main pretty-print + wandb log.
@@ -1821,6 +1875,7 @@ def main():
         "pending_rollouts": 0,
         "admitted_rollouts": 0,
         "trained_rollouts": 0,
+        "pending_publish_version": None,
     }
     gen_value_validation_lock = threading.Lock()
     gen_value_validation_state: dict[str, Any] = {"captured": False, "examples": []}
@@ -1868,6 +1923,8 @@ def main():
             args.output_dir,
             gen_value_validation_state,
             gen_value_validation_lock,
+            args.gen_value_sync_freq,
+            gen_value_publish_complete_event,
         )
 
     # Wrap one_training_step to expose asynchronous critic progress and trigger diagnostics.
@@ -1959,6 +2016,7 @@ def main():
                     with gen_value_progress_lock:
                         gen_value_progress_state["version"] = max(gen_value_progress_state["version"], synced_version)
                         gen_value_progress_state["synced_version"] = synced_version
+                    gen_value_publish_complete_event.set()
                 with gen_value_progress_lock:
                     trainer_progress = dict(gen_value_progress_state)
                 synced_version = int(trainer_progress["synced_version"])
@@ -1976,6 +2034,9 @@ def main():
                         "gen_value/trained_rollouts": trainer_progress["trained_rollouts"],
                     }
                 )
+                pending_publish_version = trainer_progress["pending_publish_version"]
+                if pending_publish_version is not None:
+                    progress_metrics["gen_value/pending_publish_version"] = int(pending_publish_version)
                 latest_sampled_policy_training_step = trainer_progress["latest_source_policy_training_step"]
                 if latest_sampled_policy_training_step is not None:
                     latest_sampled_policy_training_step = int(latest_sampled_policy_training_step)

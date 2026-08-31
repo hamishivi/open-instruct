@@ -3,6 +3,7 @@
 
 from queue import Queue
 import threading
+import time
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -23,6 +24,7 @@ from open_instruct.grpo_fast_genvalue import (
     _resolve_gen_value_model,
     _resolve_gen_value_tokenizer,
     _sync_gen_value_weights,
+    _wait_for_gen_value_publish_barrier,
 )
 from open_instruct.value_model_utils import segment_rollout
 
@@ -353,6 +355,60 @@ def test_gen_value_admission_does_not_wait_within_window(monkeypatch):
 
     assert before == 4
     assert after == 4
+
+
+def test_gen_value_publish_barrier_releases_after_serving_version_advances():
+    stop_event = threading.Event()
+    publish_complete_event = threading.Event()
+    progress_lock = threading.Lock()
+    progress_state = {"synced_version": 1, "pending_publish_version": None}
+    result: list[float] = []
+
+    waiter = threading.Thread(
+        target=lambda: result.append(
+            _wait_for_gen_value_publish_barrier(
+                2, 1, stop_event, publish_complete_event, progress_state, progress_lock
+            )
+        )
+    )
+    waiter.start()
+    deadline = time.monotonic() + 1.0
+    while progress_state["pending_publish_version"] != 2 and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert progress_state["pending_publish_version"] == 2
+    assert waiter.is_alive()
+
+    with progress_lock:
+        progress_state["synced_version"] = 2
+    publish_complete_event.set()
+    waiter.join(timeout=1.0)
+
+    assert not waiter.is_alive()
+    assert result and result[0] >= 0.0
+    assert progress_state["pending_publish_version"] is None
+
+
+def test_gen_value_publish_barrier_skips_non_publish_versions():
+    progress_state = {"synced_version": 0, "pending_publish_version": None}
+    wait_seconds = _wait_for_gen_value_publish_barrier(
+        1, 2, threading.Event(), threading.Event(), progress_state, threading.Lock()
+    )
+
+    assert wait_seconds == 0.0
+    assert progress_state["pending_publish_version"] is None
+
+
+def test_gen_value_publish_barrier_shutdown_does_not_deadlock():
+    stop_event = threading.Event()
+    stop_event.set()
+    progress_state = {"synced_version": 1, "pending_publish_version": None}
+
+    wait_seconds = _wait_for_gen_value_publish_barrier(
+        2, 1, stop_event, threading.Event(), progress_state, threading.Lock()
+    )
+
+    assert wait_seconds >= 0.0
+    assert progress_state["pending_publish_version"] is None
 
 
 def test_gen_value_training_progress_is_monotonic():
