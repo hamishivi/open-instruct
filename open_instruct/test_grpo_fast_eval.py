@@ -203,7 +203,8 @@ class TestValueRewardRangeSetup(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "tool/environment rewards"):
             setup_runtime_variables(args, streaming_config, EnvsConfig(tools=["python"]))
 
-    def test_accepts_explicit_bounds_for_tool_rewards(self):
+    @patch("open_instruct.grpo_fast.maybe_use_ai2_hf_entity", return_value=None)
+    def test_accepts_explicit_bounds_for_tool_rewards(self, _maybe_use_ai2_hf_entity):
         args = grpo_utils.GRPOExperimentConfig(use_value_model=True, value_reward_min=-5.0, value_reward_max=5.0)
         streaming_config = data_loader_lib.StreamingDataLoaderConfig()
 
@@ -215,7 +216,8 @@ class TestValueRewardRangeSetup(unittest.TestCase):
 
 class TestValueCheckpointState(unittest.TestCase):
     def test_value_engine_checkpoint_is_tagged_with_policy_step(self):
-        trainer = object.__new__(PolicyTrainerRayProcess)
+        trainer_cls = PolicyTrainerRayProcess.__ray_metadata__.modified_class
+        trainer = object.__new__(trainer_cls)
         value_mpu = object()
         trainer.value_model = SimpleNamespace(mpu=value_mpu, save_checkpoint=Mock(return_value=True))
         trainer._save_value_model = Mock()
@@ -291,7 +293,8 @@ class TestModelCompletionMarker(unittest.TestCase):
 
 class TestValueTokenAlignment(unittest.TestCase):
     def test_rejects_non_sequence_parallel_shape_mismatch(self):
-        trainer = object.__new__(PolicyTrainerRayProcess)
+        trainer_cls = PolicyTrainerRayProcess.__ray_metadata__.modified_class
+        trainer = object.__new__(trainer_cls)
         trainer._sp_world_size = 1
 
         with self.assertRaisesRegex(RuntimeError, "only a masked sequence-parallel padding suffix"):
@@ -300,7 +303,8 @@ class TestValueTokenAlignment(unittest.TestCase):
             )
 
     def test_allows_only_masked_sequence_parallel_padding_suffix(self):
-        trainer = object.__new__(PolicyTrainerRayProcess)
+        trainer_cls = PolicyTrainerRayProcess.__ray_metadata__.modified_class
+        trainer = object.__new__(trainer_cls)
         trainer._sp_world_size = 2
 
         aligned = trainer._align_value_predictions(
@@ -310,7 +314,8 @@ class TestValueTokenAlignment(unittest.TestCase):
         torch.testing.assert_close(aligned, torch.tensor([[1.0, 0.0, 0.0]]))
 
     def test_rejects_sequence_parallel_padding_over_real_tokens(self):
-        trainer = object.__new__(PolicyTrainerRayProcess)
+        trainer_cls = PolicyTrainerRayProcess.__ray_metadata__.modified_class
+        trainer = object.__new__(trainer_cls)
         trainer._sp_world_size = 2
 
         with self.assertRaisesRegex(RuntimeError, "only a masked sequence-parallel padding suffix"):
@@ -319,7 +324,8 @@ class TestValueTokenAlignment(unittest.TestCase):
             )
 
     def test_dummy_value_forward_uses_one_attended_token(self):
-        trainer = object.__new__(PolicyTrainerRayProcess)
+        trainer_cls = PolicyTrainerRayProcess.__ray_metadata__.modified_class
+        trainer = object.__new__(trainer_cls)
         trainer.tokenizer = SimpleNamespace(pad_token_id=7)
         trainer.value_model = Mock(return_value=SimpleNamespace(logits=torch.ones(1, 1, 1, requires_grad=True)))
         dummy_outputs = []
@@ -335,7 +341,8 @@ class TestValueTokenAlignment(unittest.TestCase):
 
 class TestConditionedClassificationValueForward(unittest.TestCase):
     def test_preserves_two_logits_and_converts_to_scalar_values(self):
-        trainer = object.__new__(PolicyTrainerRayProcess)
+        trainer_cls = PolicyTrainerRayProcess.__ray_metadata__.modified_class
+        trainer = object.__new__(trainer_cls)
         trainer.args = SimpleNamespace(
             value_loss="classification",
             bound_value_predictions=False,
