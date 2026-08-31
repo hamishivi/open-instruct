@@ -519,6 +519,11 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
             "gen_value/parsed_examples": 1,
             "gen_value/unique_examples": 1,
             "gen_value/unique_parsed_examples": 1,
+            "gen_value/shared_state_unique_examples": 1,
+            "gen_value/shared_state_groups": 1,
+            "gen_value/shared_state_pooled_groups": 0,
+            "gen_value/shared_state_pooled_examples": 0,
+            "gen_value/shared_state_changed_examples": 0,
             "gen_value/train_packs": 1,
             "gen_value/train_pack_tokens": 100,
             "gen_value/train_examples_per_pack": 1.0,
@@ -543,6 +548,11 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
             "gen_value/parsed_examples": 2,
             "gen_value/unique_examples": 2,
             "gen_value/unique_parsed_examples": 1,
+            "gen_value/shared_state_unique_examples": 2,
+            "gen_value/shared_state_groups": 1,
+            "gen_value/shared_state_pooled_groups": 1,
+            "gen_value/shared_state_pooled_examples": 2,
+            "gen_value/shared_state_changed_examples": 1,
             "gen_value/train_packs": 2,
             "gen_value/train_pack_tokens": 300,
             "gen_value/train_examples_per_pack": 1.5,
@@ -567,6 +577,11 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
     assert metrics["gen_value/parsed_examples"] == 3
     assert metrics["gen_value/unique_examples"] == 3
     assert metrics["gen_value/unique_parsed_examples"] == 2
+    assert metrics["gen_value/shared_state_unique_examples"] == 3
+    assert metrics["gen_value/shared_state_groups"] == 2
+    assert metrics["gen_value/shared_state_pooled_groups"] == 1
+    assert metrics["gen_value/shared_state_pooled_examples"] == 2
+    assert metrics["gen_value/shared_state_changed_examples"] == 1
     assert metrics["gen_value/train_packs"] == 3
     assert metrics["gen_value/train_pack_tokens"] == 400
     assert metrics["gen_value/train_examples_per_pack"] == pytest.approx(4 / 3)
