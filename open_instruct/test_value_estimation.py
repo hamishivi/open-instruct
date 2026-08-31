@@ -328,13 +328,22 @@ class TestValueEstimationStates(unittest.TestCase):
                 "SLURM_JOB_ID": "123",
                 "VLLM_CACHE_ROOT": "/cache/vllm",
                 "TORCHINDUCTOR_CACHE_DIR": "/cache/torchinductor",
+                "TRITON_CACHE_DIR": "/cache/triton",
+                "CUDA_CACHE_PATH": "/cache/cuda",
+                "XDG_CACHE_HOME": "/cache/xdg",
+                "TMPDIR": "/cache/tmp",
             },
         ):
-            value_estimation._configure_data_replica_environment(1, "7")
+            with mock.patch.object(value_estimation.pathlib.Path, "mkdir"):
+                value_estimation._configure_data_replica_environment(1, "7")
 
             self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "7")
             self.assertEqual(os.environ["VLLM_CACHE_ROOT"], "/cache/vllm/job-123-replica-1")
             self.assertEqual(os.environ["TORCHINDUCTOR_CACHE_DIR"], "/cache/torchinductor/job-123-replica-1")
+            self.assertEqual(os.environ["TRITON_CACHE_DIR"], "/cache/triton/job-123-replica-1")
+            self.assertEqual(os.environ["CUDA_CACHE_PATH"], "/cache/cuda/job-123-replica-1")
+            self.assertEqual(os.environ["XDG_CACHE_HOME"], "/cache/xdg/job-123-replica-1")
+            self.assertEqual(os.environ["TMPDIR"], "/cache/tmp/job-123-replica-1")
 
     def test_mc_dataset_actor_identity_can_differ_from_rollout_checkpoint(self):
         config = value_estimation.MakeDatasetConfig(
