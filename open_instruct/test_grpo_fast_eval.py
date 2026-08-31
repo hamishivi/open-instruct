@@ -203,9 +203,10 @@ class TestValueRewardRangeSetup(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "tool/environment rewards"):
             setup_runtime_variables(args, streaming_config, EnvsConfig(tools=["python"]))
 
-    @patch("open_instruct.grpo_fast.maybe_use_ai2_hf_entity", return_value=None)
-    def test_accepts_explicit_bounds_for_tool_rewards(self, _maybe_use_ai2_hf_entity):
-        args = grpo_utils.GRPOExperimentConfig(use_value_model=True, value_reward_min=-5.0, value_reward_max=5.0)
+    def test_accepts_explicit_bounds_for_tool_rewards(self):
+        args = grpo_utils.GRPOExperimentConfig(
+            use_value_model=True, value_reward_min=-5.0, value_reward_max=5.0, push_to_hub=False, with_tracking=False
+        )
         streaming_config = data_loader_lib.StreamingDataLoaderConfig()
 
         resolved = setup_runtime_variables(args, streaming_config, EnvsConfig(tools=["python"]))
