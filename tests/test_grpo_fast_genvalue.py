@@ -314,6 +314,52 @@ def test_matching_critic_temperatures_reuse_one_completion(monkeypatch):
     assert pairs[0]["critic_version"] == 3
 
 
+def test_critic_pool_shards_round_robin_and_restores_request_order(monkeypatch):
+    trainer_cls = grpo_fast.PolicyTrainerRayProcess.__ray_metadata__.modified_class
+    trainer = object.__new__(trainer_cls)
+    trainer._gen_value_version = 11
+    trainer.args = SimpleNamespace(
+        gen_value_max_new_tokens=16,
+        gen_value_temperature=0.0,
+        gen_value_inference_temperature=0.0,
+    )
+
+    engines = []
+    for _ in range(5):
+        engine = MagicMock()
+        engine.generate_request_outputs.remote.side_effect = lambda prompts, **_: list(prompts)
+        engines.append(engine)
+    trainer._gen_value_engines = engines
+    monkeypatch.setattr(grpo_fast, "ray_get_with_progress", lambda refs, **_: (refs, None))
+
+    def finish(_, request, outputs):
+        return torch.zeros(len(outputs)), [{"prompt": output, "request": request} for output in outputs]
+
+    trainer._finish_gen_value_scoring_request = MethodType(finish, trainer)
+    requests = [
+        {"prompts": [f"p{i}" for i in range(7)]},
+        {"prompts": [f"p{i}" for i in range(7, 12)]},
+    ]
+
+    results = trainer._score_gen_value_requests(requests)
+
+    expected_buckets = [
+        ["p0", "p5", "p10"],
+        ["p1", "p6", "p11"],
+        ["p2", "p7"],
+        ["p3", "p8"],
+        ["p4", "p9"],
+    ]
+    for engine, expected_prompts in zip(engines, expected_buckets, strict=True):
+        engine.generate_request_outputs.remote.assert_called_once()
+        assert engine.generate_request_outputs.remote.call_args.args[0] == expected_prompts
+    assert [[pair["prompt"] for pair in pairs] for _, pairs in results] == [
+        [f"p{i}" for i in range(7)],
+        [f"p{i}" for i in range(7, 12)],
+    ]
+    assert {pair["critic_version"] for _, pairs in results for pair in pairs} == {11}
+
+
 def test_gen_value_generation_waits_for_critic_source_step(monkeypatch):
     trainer_cls = grpo_fast.PolicyTrainerRayProcess.__ray_metadata__.modified_class
     trainer = object.__new__(trainer_cls)

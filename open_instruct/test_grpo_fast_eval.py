@@ -23,6 +23,7 @@ from open_instruct.environments.tools.utils import EnvsConfig
 from open_instruct.grpo_fast import (
     CHECKPOINT_COMPLETE_MARKER,
     PolicyTrainerRayProcess,
+    _build_data_prep_actor_resume_state,
     _is_in_warmup_window,
     create_generation_configs,
     maybe_evaluate,
@@ -94,6 +95,25 @@ class TestWarmupWindows(unittest.TestCase):
 
         self.assertTrue(_is_in_warmup_window(args, 55))
         self.assertFalse(_is_in_warmup_window(args, 61))
+
+
+class TestDataPreparationResumeState(unittest.TestCase):
+    def test_resume_uses_last_consumed_step_without_mutating_checkpoint(self):
+        checkpoint_state = {
+            "training_step": 50,
+            "data_prep_actor_state": {
+                "training_step": 0,
+                "last_consumed_step": 49,
+                "iter_dataloader_state": {"batches_processed": 1696},
+            },
+        }
+
+        resume_state = _build_data_prep_actor_resume_state(checkpoint_state)
+
+        self.assertEqual(resume_state["last_consumed_step"], 49)
+        self.assertEqual(resume_state["training_step"], 50)
+        self.assertEqual(resume_state["iter_dataloader_state"], {"batches_processed": 1696})
+        self.assertEqual(checkpoint_state["data_prep_actor_state"]["training_step"], 0)
 
 
 class TestGenerativeValueBoundaryState(unittest.TestCase):
