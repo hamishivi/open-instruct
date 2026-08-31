@@ -237,6 +237,55 @@ def repeat_examples_for_horizon(
     return repeated
 
 
+def summarize_trajectory_coverage(examples: Sequence[dict[str, Any]]) -> dict[str, int | float]:
+    """Count unique MC states in the trajectory bands used by held-out scoring.
+
+    Coverage is measured before any replay multiplier so a large late/final
+    repeat count cannot make a poorly targeted source dataset look adequate.
+    """
+    counts = {"early": 0, "middle": 0, "late_nonterminal": 0, "final_action": 0}
+    for example in examples:
+        if example.get("state_kind") == "final_action":
+            counts["final_action"] += 1
+            continue
+        trajectory_fraction = float(example.get("trajectory_fraction", 0.0))
+        if not math.isfinite(trajectory_fraction) or not 0.0 <= trajectory_fraction <= 1.0:
+            raise ValueError(f"Trajectory fraction must be finite and in [0, 1], got {trajectory_fraction}.")
+        if trajectory_fraction < 0.25:
+            counts["early"] += 1
+        elif trajectory_fraction < 0.75:
+            counts["middle"] += 1
+        else:
+            counts["late_nonterminal"] += 1
+    early_middle_examples = counts["early"] + counts["middle"]
+    return {
+        **counts,
+        "early_middle_examples": early_middle_examples,
+        "early_middle_fraction": early_middle_examples / len(examples) if examples else 0.0,
+    }
+
+
+def require_trajectory_coverage(
+    examples: Sequence[dict[str, Any]], *, min_early_middle_fraction: float
+) -> dict[str, int | float]:
+    """Fail closed when the raw dataset misses its intended nonterminal bands."""
+    if not 0.0 <= min_early_middle_fraction <= 1.0:
+        raise ValueError(
+            "min_early_middle_fraction must be in [0, 1], got "
+            f"{min_early_middle_fraction}."
+        )
+    coverage = summarize_trajectory_coverage(examples)
+    observed_fraction = float(coverage["early_middle_fraction"])
+    if observed_fraction < min_early_middle_fraction:
+        raise ValueError(
+            "MC SFT trajectory coverage is too late-heavy: "
+            f"{coverage['early_middle_examples']}/{len(examples)} "
+            f"({observed_fraction:.3f}) unique states are early/middle, below the required "
+            f"{min_early_middle_fraction:.3f}."
+        )
+    return coverage
+
+
 def read_excluded_problems(path: pathlib.Path | None) -> set[str]:
     if path is None:
         return set()
@@ -263,6 +312,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exclude_problem_dataset_path", type=pathlib.Path)
     parser.add_argument("--min_continuations", type=int, default=16)
     parser.add_argument("--min_examples", type=int, default=256)
+    parser.add_argument(
+        "--min_early_middle_fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum fraction of unique, pre-replay states with trajectory_fraction < 0.75. "
+            "Use this to fail closed when an intended prefix-calibration dataset is late/final-heavy."
+        ),
+    )
     parser.add_argument("--score_max", type=int, default=10)
     parser.add_argument("--gen_value_conditioning", choices=("none", "gt"), default="none")
     parser.add_argument("--final_action_repeat", type=int, default=1)
@@ -292,6 +350,9 @@ def main() -> None:
     )
     if len(raw_examples) < args.min_examples:
         raise ValueError(f"MC SFT dataset has {len(raw_examples)} examples; at least {args.min_examples} required.")
+    trajectory_coverage = require_trajectory_coverage(
+        raw_examples, min_early_middle_fraction=args.min_early_middle_fraction
+    )
     examples = repeat_examples_for_horizon(
         raw_examples,
         final_action_repeat=args.final_action_repeat,
@@ -319,6 +380,7 @@ def main() -> None:
                     and float(example["trajectory_fraction"]) >= args.late_state_fraction
                     for example in examples
                 ),
+                "raw_trajectory_coverage": trajectory_coverage,
             },
             indent=2,
             sort_keys=True,

@@ -120,6 +120,25 @@ class TestValueEstimationStates(unittest.TestCase):
         self.assertEqual([example["response_tokens_used"] for example in repeated], [1, 3, 3, 5, 5, 5])
         self.assertEqual([example["horizon_repeat_index"] for example in repeated], [0, 0, 1, 0, 1, 2])
 
+    def test_mc_sft_trajectory_coverage_is_measured_before_replay(self):
+        raw_examples = [
+            {"state_kind": "segment_start", "trajectory_fraction": 0.0},
+            {"state_kind": "segment_start", "trajectory_fraction": 0.5},
+            {"state_kind": "segment_start", "trajectory_fraction": 0.8},
+            {"state_kind": "final_action", "trajectory_fraction": 1.0},
+        ]
+
+        coverage = prepare_gen_value_mc_sft.require_trajectory_coverage(raw_examples, min_early_middle_fraction=0.5)
+
+        self.assertEqual(coverage["early"], 1)
+        self.assertEqual(coverage["middle"], 1)
+        self.assertEqual(coverage["late_nonterminal"], 1)
+        self.assertEqual(coverage["final_action"], 1)
+        self.assertEqual(coverage["early_middle_examples"], 2)
+        self.assertEqual(coverage["early_middle_fraction"], 0.5)
+        with self.assertRaisesRegex(ValueError, "too late-heavy"):
+            prepare_gen_value_mc_sft.require_trajectory_coverage(raw_examples, min_early_middle_fraction=0.75)
+
     def test_mc_sft_pools_independent_targets_for_shared_exact_states(self):
         examples = prepare_gen_value_mc_sft.build_mc_sft_examples(
             [

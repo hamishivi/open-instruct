@@ -27,6 +27,7 @@ MC_SFT_JSONL="${MC_SFT_JSONL:-${PWD}/inputs/mc_sft/direct_mc_value_sft.jsonl}"
 TOKENIZER_NAME_OR_PATH="${TOKENIZER_NAME_OR_PATH:-Qwen/Qwen3-4B-Base}"
 MIN_CONTINUATIONS="${MIN_CONTINUATIONS:-16}"
 MIN_MC_EXAMPLES="${MIN_MC_EXAMPLES:-512}"
+MIN_EARLY_MIDDLE_FRACTION="${MIN_EARLY_MIDDLE_FRACTION:-0}"
 FINAL_ACTION_REPEAT="${FINAL_ACTION_REPEAT:-4}"
 LATE_STATE_REPEAT="${LATE_STATE_REPEAT:-2}"
 LATE_STATE_FRACTION="${LATE_STATE_FRACTION:-0.75}"
@@ -39,6 +40,7 @@ GEN_VALUE_CONDITIONING="${GEN_VALUE_CONDITIONING:-none}"
     --exclude_problem_dataset_path "${HELDOUT_VALUE_PARQUET}" \
     --min_continuations "${MIN_CONTINUATIONS}" \
     --min_examples "${MIN_MC_EXAMPLES}" \
+    --min_early_middle_fraction "${MIN_EARLY_MIDDLE_FRACTION}" \
     --gen_value_conditioning "${GEN_VALUE_CONDITIONING}" \
     --final_action_repeat "${FINAL_ACTION_REPEAT}" \
     --late_state_repeat "${LATE_STATE_REPEAT}" \
