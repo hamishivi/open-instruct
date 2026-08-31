@@ -466,6 +466,19 @@ class TestValueEstimationStates(unittest.TestCase):
         )
         self.assertEqual(positions, [999])
 
+    def test_make_dataset_rejects_incomplete_balanced_panel(self):
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"found 1 prompts.*screening 64 prompts.*target_num_pairs=48.*success rate was 0\.002.*No partial",
+        ):
+            value_estimation._require_target_num_pairs(
+                paired_count=1, target_num_pairs=48, screened_prompts=64, actor_success_rate=1 / 512
+            )
+
+        value_estimation._require_target_num_pairs(
+            paired_count=48, target_num_pairs=48, screened_prompts=512, actor_success_rate=0.16
+        )
+
     def test_near_budget_final_state_uses_its_true_remaining_budget(self):
         positions = value_estimation._fixed_probe_positions(
             rollout_length=8190,

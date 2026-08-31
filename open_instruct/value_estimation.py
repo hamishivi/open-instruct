@@ -557,6 +557,22 @@ def _load_source_dataset(dataset_name: str, dataset_split: str, load_dataset_fn:
     return load_dataset_fn(dataset_format, data_files=str(dataset_path), split=dataset_split)
 
 
+def _require_target_num_pairs(
+    *, paired_count: int, target_num_pairs: int, screened_prompts: int, actor_success_rate: float
+) -> None:
+    """Reject incomplete balanced panels instead of silently writing partial data."""
+    if paired_count >= target_num_pairs:
+        return
+    raise RuntimeError(
+        "Could not build the requested balanced value-estimation panel: "
+        f"found {paired_count} prompts with both correct and incorrect rollouts after screening "
+        f"{screened_prompts} prompts, but target_num_pairs={target_num_pairs}. "
+        f"The observed actor success rate was {actor_success_rate:.3f}. Increase num_prompts_to_sample or "
+        "rollouts_per_prompt, or choose a dataset with difficulty appropriate for the actor. "
+        "No partial output was written."
+    )
+
+
 def make_dataset(cfg: MakeDatasetConfig) -> str:
     """Build the value-estimation dataset described in the plan."""
     import pandas as pd  # noqa: PLC0415
@@ -649,6 +665,12 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
     logger.info(f"Kept {len(kept)} prompts with at least one correct + incorrect rollout")
     observed_actor_success_rate = sum(evaluated_verdicts) / max(len(evaluated_verdicts), 1)
     logger.info(f"Observed actor success rate across screened rollouts: {observed_actor_success_rate:.3f}")
+    _require_target_num_pairs(
+        paired_count=len(kept),
+        target_num_pairs=cfg.target_num_pairs,
+        screened_prompts=len(prompts),
+        actor_success_rate=observed_actor_success_rate,
+    )
 
     # Build rows: for each kept prompt, pick the first correct + first incorrect rollout.
     # The other rollouts become the sibling_rollouts pool for conditioning variants.
