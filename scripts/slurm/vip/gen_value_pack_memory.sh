@@ -38,11 +38,9 @@ RUNTIME_CACHE="${RUNTIME_CACHE:-/tmp/genac-pack-memory-${SLURM_JOB_ID}}"
 mkdir -p "${RUNTIME_CACHE}"/{torchinductor,triton,cuda,xdg,tmp}
 
 srun --cpu-bind=none apptainer exec --nv \
-    --env "PREPEND_PATH=${CONTAINER_VENV}/bin" \
     --env LD_LIBRARY_PATH=/.singularity.d/libs \
     --env "HF_HOME=${HF_HOME}" \
     --env "PYTHONPATH=${PYTHONPATH}" \
-    --env "GEN_VALUE_MODEL_PATH=${GEN_VALUE_MODEL_PATH}" \
     --env "TORCHINDUCTOR_CACHE_DIR=${RUNTIME_CACHE}/torchinductor" \
     --env "TRITON_CACHE_DIR=${RUNTIME_CACHE}/triton" \
     --env "CUDA_CACHE_PATH=${RUNTIME_CACHE}/cuda" \
@@ -50,11 +48,14 @@ srun --cpu-bind=none apptainer exec --nv \
     --env "TMPDIR=${RUNTIME_CACHE}/tmp" \
     "${APPTAINER_IMAGE}" bash -c '
         set -euo pipefail
-        export PATH="${PREPEND_PATH}:${PATH}"
-        python scripts/test/gen_value_pack_memory.py \
-            --model "${GEN_VALUE_MODEL_PATH}" \
+        container_venv=$1
+        repo_root=$2
+        model_path=$3
+        cd "${repo_root}"
+        "${container_venv}/bin/python" scripts/test/gen_value_pack_memory.py \
+            --model "${model_path}" \
             --pack-length 10240
-        python scripts/test/gen_value_pack_memory.py \
-            --model "${GEN_VALUE_MODEL_PATH}" \
+        "${container_venv}/bin/python" scripts/test/gen_value_pack_memory.py \
+            --model "${model_path}" \
             --pack-length 32768
-    '
+    ' _ "${CONTAINER_VENV}" "${REPO_ROOT}" "${GEN_VALUE_MODEL_PATH}"
