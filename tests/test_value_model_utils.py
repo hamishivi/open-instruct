@@ -81,28 +81,33 @@ def test_final_action_replay_does_not_distort_leave_one_out_baseline():
     first = {"state_kind": "final_action"}
     second = {"state_kind": "segment_start"}
     replayed = value_model_utils.replay_gen_value_final_actions([first, second], replay_weight=4)
+    # Ray may deserialize repeated dictionary aliases as distinct objects. The
+    # explicit sample ID must still collapse them to their original completion.
+    serialized_replayed = [dict(pair) for pair in replayed]
+    sample_ids = [value_model_utils.gen_value_pair_sample_id(pair) for pair in serialized_replayed]
 
     weights = value_model_utils.generative_value_reinforce_weights_with_replay(
         rewards=[1.0, 1.0, 1.0, 1.0, 0.75],
         baseline="leave_one_out_by_outcome",
-        sample_ids=[id(pair) for pair in replayed],
+        sample_ids=sample_ids,
         outcomes=[1.0] * 5,
     )
 
-    assert replayed[:4] == [first] * 4
+    assert sample_ids == [0, 0, 0, 0, 1]
+    assert len(value_model_utils.unique_replayed_gen_value_pairs(serialized_replayed)) == 2
     assert weights == pytest.approx([0.25, 0.25, 0.25, 0.25, -0.25])
 
 
 def test_shared_state_returns_pool_unique_continuations_without_dropping_replays():
-    correct = _pair([1, 2], 1.0, state_kind="segment_start", response_tokens_used=0)
+    correct = _pair([1, 2], 1.0, state_kind="final_action", response_tokens_used=0)
     incorrect = _pair([1, 2], 0.0, state_kind="segment_start", response_tokens_used=0)
     distinct = _pair([1, 3], 0.0, state_kind="segment_start", response_tokens_used=0)
+    replayed = value_model_utils.replay_gen_value_final_actions([correct, incorrect, distinct], replay_weight=4)
+    serialized_replayed = [dict(pair) for pair in replayed]
 
-    targets, metrics = value_model_utils.pool_gen_value_shared_state_returns(
-        [correct, correct, incorrect, distinct]
-    )
+    targets, metrics = value_model_utils.pool_gen_value_shared_state_returns(serialized_replayed)
 
-    assert targets == {id(correct): 0.5, id(incorrect): 0.5, id(distinct): 0.0}
+    assert targets == {0: 0.5, 1: 0.5, 2: 0.0}
     assert metrics == {
         "gen_value/shared_state_unique_examples": 3.0,
         "gen_value/shared_state_groups": 2.0,

@@ -541,28 +541,53 @@ def generative_value_reinforce_weights_with_replay(
     return [unique_weights[identity_to_unique_index[int(sample_id)]] for sample_id in sample_ids]
 
 
+_GEN_VALUE_SAMPLE_ID_KEY = "_gen_value_sample_id"
+
+
+def gen_value_pair_sample_id(pair: dict[str, Any]) -> int:
+    """Return the stable per-batch identity of one critic sample.
+
+    Ray does not preserve Python object aliasing when argument values cross the
+    actor boundary, so ``id(pair)`` cannot identify replay copies in the trainer.
+    Untagged pairs retain an object-identity fallback for direct utility callers.
+    """
+    if _GEN_VALUE_SAMPLE_ID_KEY not in pair:
+        return id(pair)
+    sample_id = pair[_GEN_VALUE_SAMPLE_ID_KEY]
+    if isinstance(sample_id, bool) or not isinstance(sample_id, int) or sample_id < 0:
+        raise ValueError(f"Generative-value sample ID must be a nonnegative integer, got {sample_id!r}.")
+    return sample_id
+
+
 def replay_gen_value_final_actions(
     training_pairs: Sequence[dict[str, Any]], replay_weight: int
 ) -> list[dict[str, Any]]:
-    """Repeat exact final-action states without changing other critic states."""
+    """Tag each critic sample, then repeat exact final-action states.
+
+    The explicit tag survives Ray serialization even when repeated dictionary
+    aliases do not, allowing the remote trainer to remove replay copies from
+    calibration diagnostics and leave-one-out baseline estimation.
+    """
     if replay_weight < 1:
         raise ValueError(f"replay_weight must be at least 1, got {replay_weight}.")
     replayed: list[dict[str, Any]] = []
-    for pair in training_pairs:
+    for sample_id, pair in enumerate(training_pairs):
+        tagged_pair = dict(pair)
+        tagged_pair[_GEN_VALUE_SAMPLE_ID_KEY] = sample_id
         repeats = replay_weight if pair.get("state_kind") == "final_action" else 1
-        replayed.extend([pair] * repeats)
+        replayed.extend([tagged_pair] * repeats)
     return replayed
 
 
 def unique_replayed_gen_value_pairs(training_pairs: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Remove identity-preserving replay copies while retaining original order."""
+    """Remove tagged replay copies while retaining original order."""
     seen: set[int] = set()
     unique: list[dict[str, Any]] = []
     for pair in training_pairs:
-        identity = id(pair)
-        if identity in seen:
+        sample_id = gen_value_pair_sample_id(pair)
+        if sample_id in seen:
             continue
-        seen.add(identity)
+        seen.add(sample_id)
         unique.append(pair)
     return unique
 
@@ -575,10 +600,9 @@ def pool_gen_value_shared_state_returns(
     Multiple policy continuations can begin from the same token-identical critic
     prompt. Training each copy against its individual Bernoulli outcome is
     unbiased, but needlessly high variance: the value of that shared state is the
-    mean return across its sampled continuations. Identity-preserving final-action
+    mean return across its sampled continuations. Explicitly tagged final-action
     replay copies are collapsed before pooling, then receive the target assigned
-    to their original pair through the returned identity map. No example is
-    removed from the optimizer batch.
+    to their original sample ID. No example is removed from the optimizer batch.
     """
     unique_pairs = unique_replayed_gen_value_pairs(training_pairs)
     grouped_pairs: dict[tuple[int, ...], list[dict[str, Any]]] = {}
@@ -590,24 +614,24 @@ def pool_gen_value_shared_state_returns(
         outcome = float(outcome)
         if not math.isfinite(outcome) or not 0.0 <= outcome <= 1.0:
             raise ValueError(f"Generative-value outcome must be finite and in [0, 1], got {outcome}.")
-        pair_id = id(pair)
-        sampled_outcomes[pair_id] = outcome
+        sample_id = gen_value_pair_sample_id(pair)
+        sampled_outcomes[sample_id] = outcome
         prompt_ids = tuple(int(token_id) for token_id in pair["request_output"].prompt_token_ids)
         grouped_pairs.setdefault(prompt_ids, []).append(pair)
 
-    targets_by_pair_id: dict[int, float] = {}
+    targets_by_sample_id: dict[int, float] = {}
     pooled_groups = 0
     pooled_examples = 0
     changed_examples = 0
     for pairs in grouped_pairs.values():
-        target = sum(sampled_outcomes[id(pair)] for pair in pairs) / len(pairs)
+        target = sum(sampled_outcomes[gen_value_pair_sample_id(pair)] for pair in pairs) / len(pairs)
         if len(pairs) > 1:
             pooled_groups += 1
             pooled_examples += len(pairs)
         for pair in pairs:
-            pair_id = id(pair)
-            targets_by_pair_id[pair_id] = target
-            if target != sampled_outcomes[pair_id]:
+            sample_id = gen_value_pair_sample_id(pair)
+            targets_by_sample_id[sample_id] = target
+            if target != sampled_outcomes[sample_id]:
                 changed_examples += 1
 
     metrics = {
@@ -617,7 +641,7 @@ def pool_gen_value_shared_state_returns(
         "gen_value/shared_state_pooled_examples": float(pooled_examples),
         "gen_value/shared_state_changed_examples": float(changed_examples),
     }
-    return targets_by_pair_id, metrics
+    return targets_by_sample_id, metrics
 
 
 def is_gen_value_near_horizon_incorrect(example: dict[str, Any]) -> bool:

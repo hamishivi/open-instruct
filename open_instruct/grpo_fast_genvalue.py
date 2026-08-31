@@ -394,7 +394,10 @@ class GenValueTrainerActor:
             )
         else:
             unique_pairs = value_model_utils.unique_replayed_gen_value_pairs(pairs_with_outcomes)
-            return_targets = {id(pair): max(0.0, min(1.0, float(pair["outcome"]))) for pair in unique_pairs}
+            return_targets = {
+                value_model_utils.gen_value_pair_sample_id(pair): max(0.0, min(1.0, float(pair["outcome"])))
+                for pair in unique_pairs
+            }
             pooling_metrics = {
                 "gen_value/shared_state_unique_examples": float(len(unique_pairs)),
                 "gen_value/shared_state_groups": float(len(unique_pairs)),
@@ -419,7 +422,10 @@ class GenValueTrainerActor:
         unique_v_hats: list[float] = []
         near_horizon_incorrect_v_hats: list[float] = []
         near_horizon_incorrect_mses: list[float] = []
-        diagnostic_pair_ids = {id(pair) for pair in value_model_utils.unique_replayed_gen_value_pairs(training_pairs)}
+        diagnostic_pair_ids = {
+            value_model_utils.gen_value_pair_sample_id(pair)
+            for pair in value_model_utils.unique_replayed_gen_value_pairs(training_pairs)
+        }
         for pair in training_pairs:
             if pair["outcome"] is None:
                 continue
@@ -443,16 +449,17 @@ class GenValueTrainerActor:
             if not generated_ids:
                 skipped_empty_generation += 1
                 continue
+            sample_id = value_model_utils.gen_value_pair_sample_id(pair)
             sampled_outcome = max(0.0, min(1.0, float(pair["outcome"])))
-            outcome = return_targets[id(pair)]
+            outcome = return_targets[sample_id]
             v_hat = self._score_from_text(completion.text)
             if v_hat is not None:
                 optimization_v_hats.append(v_hat)
             reward, squared_error = value_model_utils.generative_value_reinforce_reward(outcome, v_hat)
             sampled_squared_error = None if v_hat is None else (v_hat - sampled_outcome) ** 2
-            is_first_replay = id(pair) in diagnostic_pair_ids
+            is_first_replay = sample_id in diagnostic_pair_ids
             if is_first_replay:
-                diagnostic_pair_ids.remove(id(pair))
+                diagnostic_pair_ids.remove(sample_id)
                 unique_rewards.append(reward)
                 unique_outcomes.append(outcome)
                 unique_sampled_outcomes.append(sampled_outcome)
@@ -486,7 +493,7 @@ class GenValueTrainerActor:
                     "rollout_logprobs": completion.logprobs,
                     "outcome": outcome,
                     "reward": reward,
-                    "source_pair_id": id(pair),
+                    "source_pair_id": sample_id,
                 }
             )
 
