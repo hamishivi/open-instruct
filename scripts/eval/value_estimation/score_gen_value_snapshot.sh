@@ -1,9 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
-: "${VALUE_MODEL_PATH:?Set VALUE_MODEL_PATH to the generative-value checkpoint.}"
-: "${INPUT_SNAPSHOT:?Set INPUT_SNAPSHOT to a fixed validation snapshot JSONL.}"
-: "${OUTPUT_JSONL:?Set OUTPUT_JSONL to the scored snapshot JSONL path.}"
+VALUE_MODEL_PATH="${1:-${VALUE_MODEL_PATH:-}}"
+INPUT_SNAPSHOT="${2:-${INPUT_SNAPSHOT:-}}"
+OUTPUT_JSONL="${3:-${OUTPUT_JSONL:-}}"
+
+: "${VALUE_MODEL_PATH:?Pass a value model path or set VALUE_MODEL_PATH.}"
+: "${INPUT_SNAPSHOT:?Pass a fixed validation snapshot JSONL or set INPUT_SNAPSHOT.}"
+: "${OUTPUT_JSONL:?Pass an output JSONL path or set OUTPUT_JSONL.}"
 
 PYTHON_EXECUTABLE=${PYTHON_EXECUTABLE:-python}
 TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-1}
