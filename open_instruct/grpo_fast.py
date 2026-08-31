@@ -299,6 +299,7 @@ class PolicyTrainerRayProcess(RayProcess):
         # Gen-value model handles (set by grpo_fast_genvalue.main() when applicable).
         self._gen_value_engines: list | None = None
         self._gen_value_training_queue = None
+        self._gen_value_training_progress = None
         self._gen_value_version = 0
         self._gen_value_latest_enqueued_policy_training_step: int | None = None
         self._gen_value_icc_success_rate: float | None = None
@@ -309,8 +310,48 @@ class PolicyTrainerRayProcess(RayProcess):
     def set_gen_value_training_queue(self, training_queue: Any) -> None:
         self._gen_value_training_queue = training_queue
 
+    def set_gen_value_training_progress(self, training_progress: Any) -> None:
+        """Share the critic trainer's source-policy progress with this learner."""
+        self._gen_value_training_progress = training_progress
+
     def set_gen_value_version(self, version: int) -> None:
         self._gen_value_version = int(version)
+
+    def _wait_for_gen_value_admission(self, policy_training_step: int) -> tuple[int | None, int | None, float]:
+        """Apply critic backpressure without discarding already generated examples.
+
+        Critic completions are produced during the policy step. Before publishing
+        them to the critic trainer, wait until their source-policy step is within
+        ``gen_value_max_async_steps`` of the latest source step that the critic has
+        finished training. This mirrors the policy rollout window while preserving
+        every critic example for the less staleness-sensitive critic objective.
+        """
+        if self._gen_value_training_progress is None:
+            return None, None, 0.0
+
+        max_async_steps = int(self.args.gen_value_max_async_steps)
+        started_at = time.perf_counter()
+        latest_trained_step = int(ray.get(self._gen_value_training_progress.get_latest_trained_policy_step.remote()))
+        initial_latest_trained_step = latest_trained_step
+        last_log_time = started_at
+        while not value_model_utils.gen_value_source_step_is_admissible(
+            policy_training_step, latest_trained_step, max_async_steps
+        ):
+            now = time.perf_counter()
+            if now - last_log_time >= 60.0:
+                logger.info(
+                    "[GenValue] Policy step %d is waiting for critic training at source-policy step %d "
+                    "(max async steps=%d); all generated critic examples remain queued for admission.",
+                    policy_training_step,
+                    latest_trained_step,
+                    max_async_steps,
+                )
+                last_log_time = now
+            time.sleep(0.1)
+            latest_trained_step = int(
+                ray.get(self._gen_value_training_progress.get_latest_trained_policy_step.remote())
+            )
+        return initial_latest_trained_step, latest_trained_step, time.perf_counter() - started_at
 
     def _update_gen_value_icc_success_rate(self, data_BT: data_types.CollatedBatchData) -> tuple[float, float]:
         """Update the globally consistent EMA used to policy-condition the generative critic."""
@@ -2524,10 +2565,35 @@ class PolicyTrainerRayProcess(RayProcess):
                 )
             # Pipe complete rollouts to the independent critic loop. The bounded
             # queue provides backpressure instead of silently dropping critic data.
-            if _use_gen_value and self._gen_value_training_queue is not None and _gen_value_training_rollouts:
-                sae_step_metrics.update(
-                    value_model_utils.gen_value_sampled_version_metrics(_gen_value_training_rollouts)
+            if _use_gen_value and self._gen_value_training_queue is not None:
+                if _gen_value_training_rollouts:
+                    sae_step_metrics.update(
+                        value_model_utils.gen_value_sampled_version_metrics(_gen_value_training_rollouts)
+                    )
+                (latest_trained_before_admission, latest_trained_after_admission, staleness_backpressure_seconds) = (
+                    self._wait_for_gen_value_admission(training_step)
                 )
+                sae_step_metrics["gen_value/staleness_backpressure_seconds"] = staleness_backpressure_seconds
+                if latest_trained_before_admission is not None:
+                    sae_step_metrics["gen_value/latest_trained_before_admission"] = float(
+                        latest_trained_before_admission
+                    )
+                    sae_step_metrics["gen_value/source_step_lag_before_admission"] = float(
+                        max(training_step - latest_trained_before_admission, 0)
+                    )
+                if latest_trained_after_admission is not None:
+                    sae_step_metrics["gen_value/latest_trained_after_admission"] = float(
+                        latest_trained_after_admission
+                    )
+                    sae_step_metrics["gen_value/source_step_lag_after_admission"] = float(
+                        max(training_step - latest_trained_after_admission, 0)
+                    )
+                if self._gen_value_training_progress is not None:
+                    ray.get(
+                        self._gen_value_training_progress.register_admitted_policy_step.remote(
+                            training_step, self.rank, len(_gen_value_training_rollouts)
+                        )
+                    )
                 critic_enqueue_started_at = time.perf_counter()
                 self._gen_value_training_queue.put(_gen_value_training_rollouts)
                 sae_step_metrics["gen_value/training_queue_backpressure_seconds"] = (

@@ -1164,6 +1164,7 @@ def _gen_value_scoring_loop(
 def _gen_value_reinforce_loop(
     trainer_actor: Any,
     training_queue: ray_queue.Queue,
+    training_progress: Any,
     batch_size: int,
     stop_event: threading.Event,
     metrics_Q: Queue,
@@ -1266,6 +1267,11 @@ def _gen_value_reinforce_loop(
                 progress_state["pending_rollouts"] = len(pending_rollouts)
                 progress_state["admitted_rollouts"] = admitted_rollouts
                 progress_state["trained_rollouts"] = trained_rollouts
+            # Advance source-policy progress only after the optimizer step
+            # succeeds. The progress actor knows exactly how many rollouts every
+            # learner admitted for each source step, so partial and mixed-source
+            # critic batches cannot release generation prematurely.
+            ray.get(training_progress.record_trained_policy_steps.remote(policy_training_steps))
             metrics.update(
                 {
                     "gen_value/source_policy_training_step_min": min(policy_training_steps),
@@ -1299,6 +1305,11 @@ def _gen_value_reinforce_loop(
         progress_state["training_queue_size"] = training_queue.qsize()
         progress_state["pending_rollouts"] = len(pending_rollouts)
     logger.info("[GenValue] asynchronous critic trainer stopped.")
+
+
+@ray.remote(num_cpus=0)
+class GenValueTrainingProgress(value_model_utils.GenValueTrainingProgressState):
+    """Ray wrapper around the tested generative-critic progress state."""
 
 
 def _sync_gen_value_weights(
@@ -1666,6 +1677,7 @@ def main():
     # of policy steps and policy world size.
     gen_value_trainer: Any = None
     gen_value_training_queue: ray_queue.Queue | None = None
+    gen_value_training_progress: Any = None
     gen_value_checkpoint_path: str | None = None
     gen_value_checkpoint_tag: str | None = None
     initial_gen_value_version = 0
@@ -1764,6 +1776,9 @@ def main():
             args.world_size, args.gen_value_max_async_steps
         )
         gen_value_training_queue = ray_queue.Queue(maxsize=queue_capacity)
+        gen_value_training_progress = GenValueTrainingProgress.remote(
+            max(resume_training_step - 1, 0), args.world_size
+        )
 
         utils.ray_get_with_progress(
             [a.set_gen_value_engines.remote(gen_value_vllm_engines) for a in policy_group.models],
@@ -1773,6 +1788,7 @@ def main():
         )
         utils.ray_get_with_progress(
             [a.set_gen_value_training_queue.remote(gen_value_training_queue) for a in policy_group.models]
+            + [a.set_gen_value_training_progress.remote(gen_value_training_progress) for a in policy_group.models]
             + [a.set_gen_value_version.remote(initial_synced_version) for a in policy_group.models],
             desc="Wiring generative critic training state",
             timeout=_GEN_VALUE_OPERATION_TIMEOUT_S,
@@ -1837,6 +1853,7 @@ def main():
             _gen_value_reinforce_loop,
             gen_value_trainer,
             gen_value_training_queue,
+            gen_value_training_progress,
             gen_value_batch_size,
             gen_value_stop_event,
             gen_value_metrics_Q,

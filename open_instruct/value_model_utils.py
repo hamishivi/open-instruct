@@ -140,6 +140,85 @@ def gen_value_training_queue_capacity(world_size: int, max_async_steps: int) -> 
     return world_size * max_async_steps
 
 
+def gen_value_source_step_is_admissible(
+    policy_training_step: int, latest_trained_policy_step: int, max_async_steps: int
+) -> bool:
+    """Whether critic data is within the allowed source-policy training window."""
+    if policy_training_step < 0:
+        raise ValueError(f"policy_training_step must be nonnegative, got {policy_training_step}.")
+    if latest_trained_policy_step < 0:
+        raise ValueError(f"latest_trained_policy_step must be nonnegative, got {latest_trained_policy_step}.")
+    if max_async_steps <= 0:
+        raise ValueError(f"max_async_steps must be positive, got {max_async_steps}.")
+    return policy_training_step - latest_trained_policy_step <= max_async_steps
+
+
+class GenValueTrainingProgressState:
+    """Track when every critic rollout from a source-policy step has trained."""
+
+    def __init__(self, latest_trained_policy_step: int, policy_world_size: int) -> None:
+        if latest_trained_policy_step < 0:
+            raise ValueError(f"latest_trained_policy_step must be nonnegative, got {latest_trained_policy_step}.")
+        if policy_world_size <= 0:
+            raise ValueError(f"policy_world_size must be positive, got {policy_world_size}.")
+        self._latest_trained_policy_step = int(latest_trained_policy_step)
+        self._policy_world_size = int(policy_world_size)
+        self._admitted_rollouts: dict[int, int] = {}
+        self._trained_rollouts: dict[int, int] = {}
+        self._registered_ranks: dict[int, set[int]] = {}
+
+    def get_latest_trained_policy_step(self) -> int:
+        return self._latest_trained_policy_step
+
+    def register_admitted_policy_step(self, policy_training_step: int, policy_rank: int, num_rollouts: int) -> None:
+        policy_training_step = int(policy_training_step)
+        policy_rank = int(policy_rank)
+        num_rollouts = int(num_rollouts)
+        if policy_training_step <= self._latest_trained_policy_step:
+            raise ValueError(
+                "Cannot admit a generative-critic source step that is already complete: "
+                f"latest={self._latest_trained_policy_step}, admitted={policy_training_step}."
+            )
+        if not 0 <= policy_rank < self._policy_world_size:
+            raise ValueError(f"policy_rank must be in [0, {self._policy_world_size}), got {policy_rank}.")
+        if num_rollouts < 0:
+            raise ValueError(f"num_rollouts must be nonnegative, got {num_rollouts}.")
+        registered_ranks = self._registered_ranks.setdefault(policy_training_step, set())
+        if policy_rank in registered_ranks:
+            raise ValueError(
+                f"Policy rank {policy_rank} registered source step {policy_training_step} more than once."
+            )
+        registered_ranks.add(policy_rank)
+        self._admitted_rollouts[policy_training_step] = (
+            self._admitted_rollouts.get(policy_training_step, 0) + num_rollouts
+        )
+        self._advance_completed_steps()
+
+    def record_trained_policy_steps(self, policy_training_steps: list[int]) -> None:
+        for policy_training_step in policy_training_steps:
+            policy_training_step = int(policy_training_step)
+            if policy_training_step <= self._latest_trained_policy_step:
+                raise ValueError(
+                    "Cannot record critic training for a source step that is already complete: "
+                    f"latest={self._latest_trained_policy_step}, trained={policy_training_step}."
+                )
+            self._trained_rollouts[policy_training_step] = self._trained_rollouts.get(policy_training_step, 0) + 1
+        self._advance_completed_steps()
+
+    def _advance_completed_steps(self) -> None:
+        while True:
+            next_step = self._latest_trained_policy_step + 1
+            if len(self._registered_ranks.get(next_step, set())) < self._policy_world_size:
+                return
+            admitted = self._admitted_rollouts.get(next_step, 0)
+            if self._trained_rollouts.get(next_step, 0) < admitted:
+                return
+            self._latest_trained_policy_step = next_step
+            self._admitted_rollouts.pop(next_step, None)
+            self._trained_rollouts.pop(next_step, None)
+            self._registered_ranks.pop(next_step, None)
+
+
 def update_gen_value_success_rate_ema(
     previous_rate: float | None, batch_success_rate: float, momentum: float
 ) -> float:

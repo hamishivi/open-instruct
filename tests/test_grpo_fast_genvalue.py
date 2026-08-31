@@ -14,6 +14,7 @@ pytest.importorskip("vllm")
 from open_instruct import grpo_fast
 from open_instruct.dataset_transformation import INPUT_IDS_PROMPT_KEY, TokenizerConfig
 from open_instruct.grpo_fast_genvalue import (
+    GenValueTrainingProgress,
     GenValueExperimentConfig,
     _build_sample_scoring_prompts,
     _drain_gen_value_metrics,
@@ -309,6 +310,87 @@ def test_matching_critic_temperatures_reuse_one_completion(monkeypatch):
     assert values.tolist() == pytest.approx([0.7])
     assert pairs[0]["request_output"]["temperature"] == pytest.approx(0.7)
     assert pairs[0]["critic_version"] == 3
+
+
+def test_gen_value_admission_waits_for_critic_source_step(monkeypatch):
+    trainer_cls = grpo_fast.PolicyTrainerRayProcess.__ray_metadata__.modified_class
+    trainer = object.__new__(trainer_cls)
+    trainer.args = SimpleNamespace(gen_value_max_async_steps=1)
+
+    class RemoteMethod:
+        def __init__(self, values):
+            self._values = iter(values)
+
+        def remote(self):
+            return next(self._values)
+
+    trainer._gen_value_training_progress = SimpleNamespace(
+        get_latest_trained_policy_step=RemoteMethod([0, 1])
+    )
+    monkeypatch.setattr(grpo_fast.ray, "get", lambda value: value)
+    monkeypatch.setattr(grpo_fast.time, "sleep", lambda _: None)
+
+    before, after, wait_seconds = trainer._wait_for_gen_value_admission(policy_training_step=2)
+
+    assert before == 0
+    assert after == 1
+    assert wait_seconds >= 0.0
+
+
+def test_gen_value_admission_does_not_wait_within_window(monkeypatch):
+    trainer_cls = grpo_fast.PolicyTrainerRayProcess.__ray_metadata__.modified_class
+    trainer = object.__new__(trainer_cls)
+    trainer.args = SimpleNamespace(gen_value_max_async_steps=1)
+
+    class RemoteMethod:
+        def remote(self):
+            return 4
+
+    trainer._gen_value_training_progress = SimpleNamespace(get_latest_trained_policy_step=RemoteMethod())
+    monkeypatch.setattr(grpo_fast.ray, "get", lambda value: value)
+
+    before, after, _ = trainer._wait_for_gen_value_admission(policy_training_step=5)
+
+    assert before == 4
+    assert after == 4
+
+
+def test_gen_value_training_progress_is_monotonic():
+    progress_cls = GenValueTrainingProgress.__ray_metadata__.modified_class
+    progress = progress_cls(latest_trained_policy_step=3, policy_world_size=2)
+
+    assert progress.get_latest_trained_policy_step() == 3
+    progress.register_admitted_policy_step(policy_training_step=4, policy_rank=0, num_rollouts=2)
+    progress.register_admitted_policy_step(policy_training_step=4, policy_rank=1, num_rollouts=1)
+    progress.record_trained_policy_steps([4, 4])
+    assert progress.get_latest_trained_policy_step() == 3
+    progress.record_trained_policy_steps([4])
+    assert progress.get_latest_trained_policy_step() == 4
+
+    # Mixed critic batches may begin training the next source step before all
+    # ranks finish registering it. Do not advance until admission is complete.
+    progress.record_trained_policy_steps([5, 5])
+    progress.register_admitted_policy_step(policy_training_step=5, policy_rank=0, num_rollouts=1)
+    assert progress.get_latest_trained_policy_step() == 4
+    progress.register_admitted_policy_step(policy_training_step=5, policy_rank=1, num_rollouts=1)
+    assert progress.get_latest_trained_policy_step() == 5
+
+    with pytest.raises(ValueError, match="already complete"):
+        progress.record_trained_policy_steps([4])
+
+
+def test_gen_value_training_progress_rejects_duplicate_rank_registration():
+    progress_cls = GenValueTrainingProgress.__ray_metadata__.modified_class
+    progress = progress_cls(latest_trained_policy_step=0, policy_world_size=1)
+    progress.register_admitted_policy_step(policy_training_step=1, policy_rank=0, num_rollouts=1)
+    with pytest.raises(ValueError, match="more than once"):
+        progress.register_admitted_policy_step(policy_training_step=1, policy_rank=0, num_rollouts=1)
+
+
+def test_gen_value_training_progress_rejects_negative_initial_step():
+    progress_cls = GenValueTrainingProgress.__ray_metadata__.modified_class
+    with pytest.raises(ValueError, match="must be nonnegative"):
+        progress_cls(latest_trained_policy_step=-1, policy_world_size=1)
 
 
 def test_genvalue_config_bad_score_range():

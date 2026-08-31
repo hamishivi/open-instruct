@@ -144,3 +144,65 @@ def test_gen_value_training_queue_capacity(world_size: int, max_async_steps: int
 def test_gen_value_training_queue_capacity_rejects_invalid_values(world_size: int, max_async_steps: int):
     with pytest.raises(ValueError):
         value_model_utils.gen_value_training_queue_capacity(world_size, max_async_steps)
+
+
+@pytest.mark.parametrize(
+    ("policy_step", "latest_trained_step", "max_async_steps", "expected"),
+    [
+        (1, 0, 1, True),
+        (2, 1, 1, True),
+        (2, 0, 1, False),
+        (5, 3, 2, True),
+        (6, 3, 2, False),
+    ],
+)
+def test_gen_value_source_step_admission_window(
+    policy_step: int, latest_trained_step: int, max_async_steps: int, expected: bool
+):
+    assert (
+        value_model_utils.gen_value_source_step_is_admissible(
+            policy_step, latest_trained_step, max_async_steps
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(("policy_step", "latest_trained_step", "max_async_steps"), [(-1, 0, 1), (1, -1, 1), (1, 0, 0)])
+def test_gen_value_source_step_admission_rejects_invalid_values(
+    policy_step: int, latest_trained_step: int, max_async_steps: int
+):
+    with pytest.raises(ValueError):
+        value_model_utils.gen_value_source_step_is_admissible(
+            policy_step, latest_trained_step, max_async_steps
+        )
+
+
+def test_gen_value_training_progress_waits_for_all_admitted_rollouts():
+    progress = value_model_utils.GenValueTrainingProgressState(latest_trained_policy_step=3, policy_world_size=2)
+
+    progress.register_admitted_policy_step(policy_training_step=4, policy_rank=0, num_rollouts=2)
+    progress.register_admitted_policy_step(policy_training_step=4, policy_rank=1, num_rollouts=1)
+    progress.record_trained_policy_steps([4, 4])
+    assert progress.get_latest_trained_policy_step() == 3
+
+    progress.record_trained_policy_steps([4])
+    assert progress.get_latest_trained_policy_step() == 4
+
+
+def test_gen_value_training_progress_handles_training_before_registration():
+    progress = value_model_utils.GenValueTrainingProgressState(latest_trained_policy_step=4, policy_world_size=2)
+
+    progress.record_trained_policy_steps([5, 5])
+    progress.register_admitted_policy_step(policy_training_step=5, policy_rank=0, num_rollouts=1)
+    assert progress.get_latest_trained_policy_step() == 4
+
+    progress.register_admitted_policy_step(policy_training_step=5, policy_rank=1, num_rollouts=1)
+    assert progress.get_latest_trained_policy_step() == 5
+
+
+def test_gen_value_training_progress_rejects_duplicate_rank_registration():
+    progress = value_model_utils.GenValueTrainingProgressState(latest_trained_policy_step=0, policy_world_size=1)
+    progress.register_admitted_policy_step(policy_training_step=1, policy_rank=0, num_rollouts=1)
+
+    with pytest.raises(ValueError, match="more than once"):
+        progress.register_admitted_policy_step(policy_training_step=1, policy_rank=0, num_rollouts=1)
