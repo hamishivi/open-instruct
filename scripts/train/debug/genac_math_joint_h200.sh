@@ -33,7 +33,12 @@ export TOKENIZERS_PARALLELISM=false
 export HF_HOME="${HF_HOME:-/tmp/hf_home}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 
-RAY_PORT="${RAY_PORT:-$((8000 + ${SLURM_JOB_ID:-0} % 1000))}"
+# Ray defaults the dashboard to 8265. Keep the GCS and dashboard in disjoint,
+# job-specific ranges so a job ID ending in 265 cannot collide with itself and
+# colocated jobs do not all claim the default dashboard port.
+RAY_JOB_OFFSET=$((${SLURM_JOB_ID:-0} % 10000))
+RAY_PORT="${RAY_PORT:-$((9000 + RAY_JOB_OFFSET % 1000))}"
+RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-$((20000 + RAY_JOB_OFFSET))}"
 RAY_TEMP_DIR="${RAY_TEMP_DIR:-/tmp/ray-${USER}-${SLURM_JOB_ID:-local}}"
 # `ray stop` is user-global on a host. Slurm can colocate two jobs owned by the
 # same user, so invoking it here would kill the other job's Ray cluster. Slurm
@@ -43,7 +48,12 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     ray stop --force 2>/dev/null || true
     trap 'ray stop --force' EXIT
 fi
-ray start --head --port="${RAY_PORT}" --temp-dir="${RAY_TEMP_DIR}" --dashboard-host=0.0.0.0
+ray start \
+    --head \
+    --port="${RAY_PORT}" \
+    --temp-dir="${RAY_TEMP_DIR}" \
+    --dashboard-host=0.0.0.0 \
+    --dashboard-port="${RAY_DASHBOARD_PORT}"
 
 mkdir -p "${HOME}/.triton/autotune"
 
