@@ -9,12 +9,44 @@ from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import AsyncMock, MagicMock
 
+import torch
 import vllm
 from parameterized import parameterized
 
 from open_instruct import vllm_utils
 from open_instruct.data_types import PromptRequest
 from open_instruct.utils import ModelDims
+
+
+class TestBroadcastWeightsToVllm(unittest.TestCase):
+    def test_packed_nccl_flag_reaches_sender_and_receiver(self):
+        model = torch.nn.Linear(3, 2, bias=False)
+        engine = MagicMock()
+        model_update_group = object()
+
+        with (
+            mock.patch.object(vllm_utils.ray, "get"),
+            mock.patch.object(vllm_utils.NCCLWeightTransferEngine, "trainer_send_weights") as trainer_send_weights,
+        ):
+            refs = vllm_utils.broadcast_weights_to_vllm(
+                model=model,
+                vllm_engines=[engine],
+                model_update_group=model_update_group,
+                model_step=7,
+                use_packed=True,
+            )
+
+        engine.sleep.remote.assert_called_once_with()
+        names, dtype_names, shapes, packed, model_step = engine.update_weights.remote.call_args.args
+        self.assertEqual(names, ["weight"])
+        self.assertEqual(dtype_names, ["float32"])
+        self.assertEqual(shapes, [[2, 3]])
+        self.assertTrue(packed)
+        self.assertEqual(model_step, 7)
+        trainer_args = trainer_send_weights.call_args.kwargs["trainer_args"]
+        self.assertIs(trainer_args.group, model_update_group)
+        self.assertTrue(trainer_args.packed)
+        self.assertEqual(refs, [engine.update_weights.remote.return_value])
 
 
 class TestTruncateEnvOutputTokens(unittest.TestCase):

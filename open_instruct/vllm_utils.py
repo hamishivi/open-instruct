@@ -1614,6 +1614,7 @@ def broadcast_weights_to_vllm(
     model_step: int,
     name_mapper: Callable[[str], str] | None = None,
     gather_whole_model: bool = True,
+    use_packed: bool = False,
 ) -> list[ray.ObjectRef]:
     """Broadcast model weights to vLLM engines using the native weight transfer API.
 
@@ -1624,7 +1625,9 @@ def broadcast_weights_to_vllm(
     Otherwise uses NCCL backend.
 
     `model_step` is stamped onto each vLLM engine as part of the weight-update RPC,
-    so no separate `set_model_step` call is needed.
+    so no separate `set_model_step` call is needed. ``use_packed`` combines many
+    parameters into a small number of buffered NCCL broadcasts. It is opt-in so
+    existing policy weight-transfer behavior remains unchanged.
     """
     if isinstance(model, FSDP) and not gather_whole_model:
         raise ValueError("FSDP1 does not support per-parameter gathering. Set gather_whole_model=True.")
@@ -1638,8 +1641,6 @@ def broadcast_weights_to_vllm(
 
     fsdp_submodules = _get_fsdp2_submodules(model) if isinstance(model, FSDPModule) else None
     names, dtype_names, shapes = _collect_weight_metadata(model, name_mapper, fsdp_submodules=fsdp_submodules)
-    use_packed = False
-
     if is_rank_0:
         refs = [
             engine.update_weights.remote(names, dtype_names, shapes, use_packed, model_step) for engine in vllm_engines

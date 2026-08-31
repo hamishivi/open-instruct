@@ -659,6 +659,7 @@ class GenValueTrainerActor:
             model_update_group=self._model_update_group,
             model_step=self._step_count,
             gather_whole_model=True,
+            use_packed=True,
         )
         return {"engine_refs": engine_refs, "version": self._step_count}
 
