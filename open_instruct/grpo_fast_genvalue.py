@@ -808,6 +808,11 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
     # blocks policy training, the consumer prefers the freshest available
     # policy-sized batch, and samples more than this many steps stale are discarded.
     gen_value_max_async_steps: int = 1
+    # Bounded queue retention measured in complete policy batches. Zero retains
+    # exactly the inclusive freshness window (max_async_steps + 1). A larger value
+    # is useful for frozen-policy critic pretraining, where many fresh batches share
+    # one policy model version; it never widens the admissible model-version window.
+    gen_value_training_queue_capacity_steps: int = 0
     # Conditioning for the gen-value prompt: one of none, gt, correct_demo, rollout_context.
     gen_value_conditioning: str = "none"
     # Paper-style In-Context Conditioning: identify the active actor and provide an EMA of
@@ -912,6 +917,17 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
             raise ValueError(f"--gen_value_batch_size must be > 0, got {self.gen_value_batch_size}.")
         if self.gen_value_max_async_steps <= 0:
             raise ValueError(f"--gen_value_max_async_steps must be > 0, got {self.gen_value_max_async_steps}.")
+        if self.gen_value_training_queue_capacity_steps < 0:
+            raise ValueError(
+                "--gen_value_training_queue_capacity_steps must be >= 0, got "
+                f"{self.gen_value_training_queue_capacity_steps}."
+            )
+        if 0 < self.gen_value_training_queue_capacity_steps < self.gen_value_max_async_steps + 1:
+            raise ValueError(
+                "--gen_value_training_queue_capacity_steps must be 0 or at least the inclusive freshness "
+                f"window ({self.gen_value_max_async_steps + 1}), got "
+                f"{self.gen_value_training_queue_capacity_steps}."
+            )
         if self.gen_value_sync_freq < 0:
             raise ValueError(f"--gen_value_sync_freq must be >= 0, got {self.gen_value_sync_freq}.")
         if self.gen_value_min_advantage_gap_for_policy_update is not None and (
@@ -2110,7 +2126,7 @@ def main():
                 )
 
         queue_capacity = value_model_utils.gen_value_training_queue_capacity(
-            args.world_size, args.gen_value_max_async_steps
+            args.world_size, args.gen_value_max_async_steps, args.gen_value_training_queue_capacity_steps
         )
         gen_value_training_queue = ray_queue.Queue(maxsize=queue_capacity)
         gen_value_training_progress = GenValueTrainingProgress.remote(
@@ -2133,10 +2149,12 @@ def main():
         )
         logger.info(
             "Gen-value injection wired: %d engine(s), critic batch=%d, queue capacity=%d "
-            "(max async critic steps=%d; latest-first with stale eviction) → %d policy actor(s).",
+            "(retained policy batches=%d, max async critic steps=%d; latest-first with stale eviction) "
+            "→ %d policy actor(s).",
             len(gen_value_vllm_engines),
             gen_value_batch_size,
             queue_capacity,
+            args.gen_value_training_queue_capacity_steps or args.gen_value_max_async_steps + 1,
             args.gen_value_max_async_steps,
             len(policy_group.models),
         )

@@ -37,6 +37,10 @@ EXP_NAME="${EXP_NAME:-genac-math-value-pretrain-h200}"
 RUN_OUTPUT_DIR="${RUN_OUTPUT_DIR:-${PWD}/outputs/${EXP_NAME}}"
 CHECKPOINT_STATE_DIR="${CHECKPOINT_STATE_DIR:-${RUN_OUTPUT_DIR}/checkpoint_states}"
 VALUE_PRETRAIN_STEPS="${VALUE_PRETRAIN_STEPS:-100}"
+# Retain every frozen-policy batch by default so VALUE_PRETRAIN_STEPS also means
+# that many available critic optimizer batches even when generation outruns the
+# critic. Model-version freshness filtering remains independent and unchanged.
+GEN_VALUE_TRAINING_QUEUE_CAPACITY_STEPS="${GEN_VALUE_TRAINING_QUEUE_CAPACITY_STEPS:-${VALUE_PRETRAIN_STEPS}}"
 # The GenAC cold-start recipe SFTs and RL-pretrains the base model. Keep an
 # explicit override for ablations and for continuing from an exported SFT/RL
 # critic checkpoint.
@@ -50,6 +54,10 @@ NUM_SAMPLES_PER_PROMPT_ROLLOUT=8
 
 if [[ ! "${VALUE_PRETRAIN_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: VALUE_PRETRAIN_STEPS must be at least 1" >&2
+    exit 1
+fi
+if [[ ! "${GEN_VALUE_TRAINING_QUEUE_CAPACITY_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: GEN_VALUE_TRAINING_QUEUE_CAPACITY_STEPS must be at least 1" >&2
     exit 1
 fi
 if [[ ! "${SEED}" =~ ^[0-9]+$ ]]; then
@@ -161,6 +169,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --gen_value_reinforce_coef 1.0 \
     --gen_value_reinforce_baseline "${GEN_VALUE_REINFORCE_BASELINE}" \
     --gen_value_final_action_replay_weight 4 \
+    --gen_value_training_queue_capacity_steps "${GEN_VALUE_TRAINING_QUEUE_CAPACITY_STEPS}" \
     --gen_value_sync_freq 5 \
     --gen_value_diagnostic_scoring_freq 0 \
     --gen_value_validation_freq 25 \

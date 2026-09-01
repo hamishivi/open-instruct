@@ -53,6 +53,7 @@ from open_instruct.value_model_utils import (
     flatten_gen_value_pack,
     gen_value_pair_sample_id,
     gen_value_sampled_version_metrics,
+    gen_value_training_queue_capacity,
     gen_value_validation_metrics,
     generative_value_reinforce_reward,
     generative_value_reinforce_weights,
@@ -81,6 +82,22 @@ from open_instruct.value_model_utils import (
     write_gen_value_training_trace_reservoir,
     write_gen_value_validation_snapshot,
 )
+
+
+class TestGenValueTrainingQueueCapacity(unittest.TestCase):
+    def test_default_retains_inclusive_freshness_window(self):
+        self.assertEqual(gen_value_training_queue_capacity(world_size=2, max_async_steps=1), 4)
+
+    def test_explicit_capacity_retains_more_frozen_policy_batches(self):
+        self.assertEqual(gen_value_training_queue_capacity(world_size=2, max_async_steps=1, capacity_steps=25), 50)
+
+    def test_explicit_capacity_does_not_accept_negative_values(self):
+        with self.assertRaisesRegex(ValueError, "capacity_steps must be nonnegative"):
+            gen_value_training_queue_capacity(world_size=1, max_async_steps=1, capacity_steps=-1)
+
+    def test_explicit_capacity_covers_inclusive_freshness_window(self):
+        with self.assertRaisesRegex(ValueError, "at least the inclusive freshness window"):
+            gen_value_training_queue_capacity(world_size=1, max_async_steps=2, capacity_steps=2)
 
 
 def _packing_example(sequence_ids, generated_ids, rollout_logprobs, reward):

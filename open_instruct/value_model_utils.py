@@ -125,19 +125,30 @@ def gen_value_policy_guard_active(min_advantage_gap: float | None, observed_adva
     return not math.isfinite(observed_advantage_gap) or observed_advantage_gap < min_advantage_gap
 
 
-def gen_value_training_queue_capacity(world_size: int, max_async_steps: int) -> int:
-    """Hold the inclusive freshness window of learner shards.
+def gen_value_training_queue_capacity(world_size: int, max_async_steps: int, capacity_steps: int = 0) -> int:
+    """Resolve the bounded queue capacity in learner shards.
 
     Each learner enqueues one shard per policy step. If the newest source step is
     ``N``, samples from ``N - max_async_steps`` are still admissible, so the queue
-    needs room for ``max_async_steps + 1`` complete policy batches. Producers evict
-    the oldest shard instead of blocking when this bound is reached.
+    normally needs room for ``max_async_steps + 1`` complete policy batches.
+    ``capacity_steps`` can retain a longer bounded history without changing that
+    admissibility rule. This is useful during frozen-policy critic pretraining,
+    where many fresh batches share the same policy model version. Producers evict
+    the oldest shard instead of blocking when the resolved bound is reached.
     """
     if world_size <= 0:
         raise ValueError(f"world_size must be positive, got {world_size}.")
     if max_async_steps <= 0:
         raise ValueError(f"max_async_steps must be positive, got {max_async_steps}.")
-    return world_size * (max_async_steps + 1)
+    if capacity_steps < 0:
+        raise ValueError(f"capacity_steps must be nonnegative, got {capacity_steps}.")
+    if 0 < capacity_steps < max_async_steps + 1:
+        raise ValueError(
+            "capacity_steps must be zero or at least the inclusive freshness window "
+            f"({max_async_steps + 1}), got {capacity_steps}."
+        )
+    retained_steps = capacity_steps if capacity_steps > 0 else max_async_steps + 1
+    return world_size * retained_steps
 
 
 def select_fresh_gen_value_rollouts(
