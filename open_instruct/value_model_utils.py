@@ -746,6 +746,7 @@ def generative_value_reinforce_outcome_mass_metrics(
 
 _GEN_VALUE_SAMPLE_ID_KEY = "_gen_value_sample_id"
 _GEN_VALUE_OPTIMIZER_SELECTED_KEY = "_gen_value_optimizer_selected"
+_GEN_VALUE_REPLAY_MULTIPLICITY_KEY = "_gen_value_replay_multiplicity"
 
 
 def mark_gen_value_training_pairs_for_optimizer(
@@ -857,6 +858,68 @@ def unique_replayed_gen_value_pairs(training_pairs: Sequence[dict[str, Any]]) ->
         seen.add(sample_id)
         unique.append(pair)
     return unique
+
+
+def collapse_replayed_gen_value_optimizer_examples(examples: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse exact replay copies while preserving their summed policy gradient.
+
+    Final-action replay intentionally repeats one sampled critic completion. Sending
+    those identical sequences through the model separately wastes prompt forward
+    compute. Once the leave-one-out baseline has been computed on unique samples,
+    copies have the same tokens, log probabilities, and scalar weight. Summing the
+    copy weights onto one physical example therefore preserves the exact token-loss
+    numerator. The caller must retain the original logical token denominator.
+    """
+    collapsed: list[dict[str, Any]] = []
+    by_sample_id: dict[int, dict[str, Any]] = {}
+    identity_fields = (
+        "sequence_ids",
+        "generated_ids",
+        "rollout_logprobs",
+        "outcome",
+        "optimizer_selected",
+        "parsed",
+        "prediction",
+        "squared_error",
+    )
+    for example in examples:
+        sample_id = example.get("source_pair_id")
+        if isinstance(sample_id, bool) or not isinstance(sample_id, int) or sample_id < 0:
+            raise ValueError(
+                f"Replay-collapsed optimizer examples require a nonnegative sample ID, got {sample_id!r}."
+            )
+        existing = by_sample_id.get(sample_id)
+        if existing is None:
+            collapsed_example = dict(example)
+            collapsed_example[_GEN_VALUE_REPLAY_MULTIPLICITY_KEY] = 1
+            collapsed.append(collapsed_example)
+            by_sample_id[sample_id] = collapsed_example
+            continue
+
+        for field in identity_fields:
+            if example.get(field) != existing.get(field):
+                raise ValueError(
+                    f"Replay copies with sample ID {sample_id} must have identical {field}, "
+                    f"got {existing.get(field)!r} and {example.get(field)!r}."
+                )
+        multiplicity = gen_value_replay_multiplicity(existing)
+        base_reward = float(existing["reward"]) / multiplicity
+        if float(example["reward"]) != base_reward:
+            raise ValueError(
+                f"Replay copies with sample ID {sample_id} must have identical rewards, "
+                f"got {base_reward} and {example['reward']}."
+            )
+        existing["reward"] = float(existing["reward"]) + float(example["reward"])
+        existing[_GEN_VALUE_REPLAY_MULTIPLICITY_KEY] = multiplicity + 1
+    return collapsed
+
+
+def gen_value_replay_multiplicity(example: dict[str, Any]) -> int:
+    """Return how many logical replay copies one physical optimizer example represents."""
+    multiplicity = example.get(_GEN_VALUE_REPLAY_MULTIPLICITY_KEY, 1)
+    if isinstance(multiplicity, bool) or not isinstance(multiplicity, int) or multiplicity < 1:
+        raise ValueError(f"Generative-value replay multiplicity must be a positive integer, got {multiplicity!r}.")
+    return multiplicity
 
 
 def pool_gen_value_shared_state_returns(

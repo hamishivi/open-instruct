@@ -568,7 +568,10 @@ class GenValueTrainerActor:
 
         training_preparation_seconds = time.perf_counter() - reinforce_step_started_at
         packing_started_at = time.perf_counter()
-        packs = value_model_utils.pack_gen_value_examples(optimizer_examples, self._pack_length)
+        packed_optimizer_examples = value_model_utils.collapse_replayed_gen_value_optimizer_examples(
+            optimizer_examples
+        )
+        packs = value_model_utils.pack_gen_value_examples(packed_optimizer_examples, self._pack_length)
         training_packing_seconds = time.perf_counter() - packing_started_at
         # DeepSpeed's BF16 optimizer owns the FP32 accumulation buffers, so clear
         # it directly rather than only clearing the BF16 module gradients.
@@ -586,6 +589,7 @@ class GenValueTrainerActor:
         tis_clipped_tokens = 0
         tis_mask_kept_tokens = 0
         tis_mask_total_tokens = 0
+        physical_reinforce_token_count = 0
 
         optimization_started_at = time.perf_counter()
         pack_token_counts: list[int] = []
@@ -600,6 +604,11 @@ class GenValueTrainerActor:
                 rewards_list,
             ) = flattened
             pack_token_counts.append(len(input_ids_list))
+            replay_multiplicities = [
+                value_model_utils.gen_value_replay_multiplicity(example)
+                for example in pack
+                for _ in example["generated_ids"]
+            ]
             input_ids = torch.tensor([input_ids_list], dtype=torch.long, device="cuda")
             position_ids = torch.tensor([position_ids_list], dtype=torch.long, device="cuda")
             logit_positions = torch.tensor(logit_positions_list, dtype=torch.long, device="cuda")
@@ -628,12 +637,14 @@ class GenValueTrainerActor:
             )
             tis_weights = grpo_utils.combine_tis_terms(tis_clamped, tis_mask)
             if tis_clamped is not None and tis_unclamped is not None:
-                tis_ratio_sum += float(tis_clamped.sum())
-                tis_token_count += tis_clamped.numel()
-                tis_clipped_tokens += int((tis_clamped < tis_unclamped).sum())
+                replay_multiplicities_tensor = torch.tensor(replay_multiplicities, dtype=torch.float32, device="cuda")
+                tis_ratio_sum += float((tis_clamped * replay_multiplicities_tensor).sum())
+                tis_token_count += sum(replay_multiplicities)
+                tis_clipped_tokens += int(((tis_clamped < tis_unclamped) * replay_multiplicities_tensor).sum())
             if tis_mask is not None:
-                tis_mask_kept_tokens += int(tis_mask.sum())
-                tis_mask_total_tokens += tis_mask.numel()
+                replay_multiplicities_tensor = torch.tensor(replay_multiplicities, dtype=torch.float32, device="cuda")
+                tis_mask_kept_tokens += int((tis_mask * replay_multiplicities_tensor).sum())
+                tis_mask_total_tokens += sum(replay_multiplicities)
 
             token_rewards = torch.tensor(rewards_list, dtype=torch.float32, device="cuda")
             per_token_loss = -token_logprobs * token_rewards
@@ -642,7 +653,8 @@ class GenValueTrainerActor:
             loss = per_token_loss.sum() * gradient_scale
             self._model.backward(loss)
             total_loss += float(loss.detach())
-            reinforce_token_count += per_token_loss.numel()
+            physical_reinforce_token_count += per_token_loss.numel()
+            reinforce_token_count += sum(replay_multiplicities)
             effective_weights = token_rewards != 0.0
             if tis_weights is not None:
                 effective_weights &= tis_weights > 0.0
@@ -689,6 +701,8 @@ class GenValueTrainerActor:
             "gen_value/candidate_train_tokens": candidate_reinforce_tokens,
             "gen_value/candidate_train_examples": len(validated_examples),
             "gen_value/train_examples": len(optimizer_examples),
+            "gen_value/physical_train_examples": len(packed_optimizer_examples),
+            "gen_value/replay_collapsed_examples": len(optimizer_examples) - len(packed_optimizer_examples),
             "gen_value/parsed_examples": optimization_parsed_count,
             "gen_value/unique_examples": len(unique_rewards),
             "gen_value/optimizer_unique_examples": len(optimizer_sample_ids),
@@ -700,6 +714,8 @@ class GenValueTrainerActor:
             "gen_value/train_pack_target_tokens": self._pack_length,
             "gen_value/train_pack_tokens": sum(pack_token_counts),
             "gen_value/train_examples_per_pack": len(optimizer_examples) / len(packs),
+            "gen_value/physical_train_examples_per_pack": len(packed_optimizer_examples) / len(packs),
+            "gen_value/physical_train_tokens": physical_reinforce_token_count,
             "gen_value/train_mean_pack_tokens": sum(pack_token_counts) / len(packs),
             "gen_value/train_max_pack_tokens": max(pack_token_counts),
             "gen_value/training_preparation_seconds": training_preparation_seconds,

@@ -324,6 +324,68 @@ def test_final_action_replay_does_not_distort_leave_one_out_baseline():
     assert weights == pytest.approx([0.25, 0.25, 0.25, 0.25, -0.25])
 
 
+def test_final_action_replay_collapse_preserves_exact_token_loss_numerator():
+    replay = {
+        "source_pair_id": 4,
+        "sequence_ids": [1, 2, 3, 4],
+        "generated_ids": [3, 4],
+        "rollout_logprobs": [-0.1, -0.2],
+        "outcome": 1.0,
+        "reward": 0.25,
+        "optimizer_selected": True,
+        "parsed": True,
+        "prediction": 0.8,
+        "squared_error": 0.04,
+    }
+    distinct = dict(replay, source_pair_id=5, reward=-0.5)
+
+    collapsed = value_model_utils.collapse_replayed_gen_value_optimizer_examples(
+        [dict(replay), dict(replay), dict(replay), dict(replay), distinct]
+    )
+
+    assert len(collapsed) == 2
+    assert value_model_utils.gen_value_replay_multiplicity(collapsed[0]) == 4
+    assert collapsed[0]["reward"] == 1.0
+    assert value_model_utils.gen_value_replay_multiplicity(collapsed[1]) == 1
+    assert collapsed[1]["reward"] == -0.5
+    logical_token_loss_numerator = sum(
+        len(example["generated_ids"]) * float(example["reward"])
+        for example in [replay, replay, replay, replay, distinct]
+    )
+    collapsed_token_loss_numerator = sum(
+        len(example["generated_ids"]) * float(example["reward"]) for example in collapsed
+    )
+    assert collapsed_token_loss_numerator == logical_token_loss_numerator
+    packs = value_model_utils.pack_gen_value_examples(collapsed, target_tokens=8)
+    flattened_rewards = [
+        reward
+        for pack in packs
+        for reward in value_model_utils.flatten_gen_value_pack(pack)[-1]
+    ]
+    assert sum(flattened_rewards) == logical_token_loss_numerator
+    assert sum(len(pack) for pack in packs) == 2
+
+
+def test_final_action_replay_collapse_rejects_inconsistent_copies():
+    first = {
+        "source_pair_id": 2,
+        "sequence_ids": [1, 2],
+        "generated_ids": [2],
+        "rollout_logprobs": [-0.1],
+        "outcome": 0.0,
+        "reward": 0.3,
+        "optimizer_selected": True,
+        "parsed": True,
+        "prediction": 0.2,
+        "squared_error": 0.04,
+    }
+
+    with pytest.raises(ValueError, match="identical generated_ids"):
+        value_model_utils.collapse_replayed_gen_value_optimizer_examples(
+            [first, dict(first, generated_ids=[3])]
+        )
+
+
 def test_shared_state_returns_pool_unique_continuations_without_dropping_replays():
     correct = _pair([1, 2], 1.0, state_kind="final_action", response_tokens_used=0)
     incorrect = _pair([1, 2], 0.0, state_kind="segment_start", response_tokens_used=0)
