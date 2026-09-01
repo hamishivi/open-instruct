@@ -1040,6 +1040,27 @@ def gen_value_validation_metrics(
         )
         metrics[f"gen_value/validation_{prefix}_auc"] = pairwise_credit / (len(correct) * len(incorrect))
 
+    def add_binary_macro_mse(
+        prefix: str, correct: list[tuple[dict[str, Any], float]], incorrect: list[tuple[dict[str, Any], float]]
+    ) -> None:
+        """Add equal-class-weight MSE without changing the natural value target.
+
+        Math batches contain substantially more failed than successful trajectories. A
+        prevalence-weighted validation MSE can therefore improve while calibration on
+        successful prefixes regresses. Macro averaging is only a diagnostic: it gives
+        each observed outcome class equal reporting weight while leaving both the heldout
+        examples and the critic optimizer untouched.
+        """
+        if not correct or not incorrect:
+            return
+        correct_mse = sum((float(example["target"]) - prediction) ** 2 for example, prediction in correct) / len(
+            correct
+        )
+        incorrect_mse = sum((float(example["target"]) - prediction) ** 2 for example, prediction in incorrect) / len(
+            incorrect
+        )
+        metrics[f"gen_value/validation_{prefix}_macro_mse"] = (correct_mse + incorrect_mse) / 2.0
+
     initial = [(example, prediction) for example, prediction in parsed if example["kind"] == "initial"]
     empirical_return = [
         (example, prediction)
@@ -1115,6 +1136,9 @@ def gen_value_validation_metrics(
     for name, rows in prefix_position_groups.items():
         add_group(name, rows)
     add_group("near_horizon_incorrect", near_horizon_incorrect)
+    add_binary_macro_mse("final", final_correct, final_incorrect)
+    add_binary_macro_mse("final_action", final_action_correct, final_action_incorrect)
+    add_binary_macro_mse("prefix", prefix_correct, prefix_incorrect)
     add_binary_ranking_auc("final", final_correct, final_incorrect)
     add_binary_ranking_auc("final_action", final_action_correct, final_action_incorrect)
     add_binary_ranking_auc("prefix", prefix_correct, prefix_incorrect)
@@ -1131,6 +1155,7 @@ def gen_value_validation_metrics(
     for band in prefix_position_bands:
         correct = prefix_position_groups[f"prefix_{band}_correct"]
         incorrect = prefix_position_groups[f"prefix_{band}_incorrect"]
+        add_binary_macro_mse(f"prefix_{band}", correct, incorrect)
         add_binary_ranking_auc(f"prefix_{band}", correct, incorrect)
         if correct and incorrect:
             metrics[f"gen_value/validation_prefix_{band}_value_gap"] = (

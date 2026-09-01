@@ -221,6 +221,21 @@ def test_gen_value_validation_reports_early_to_late_value_deltas():
     assert metrics["gen_value/validation_prefix_auc"] == pytest.approx(0.75)
     assert metrics["gen_value/validation_prefix_early_auc"] == pytest.approx(0.0)
     assert metrics["gen_value/validation_prefix_late_auc"] == pytest.approx(1.0)
+    assert metrics["gen_value/validation_prefix_macro_mse"] == pytest.approx((0.34 + 0.13) / 2)
+    assert metrics["gen_value/validation_prefix_early_macro_mse"] == pytest.approx((0.64 + 0.25) / 2)
+    assert metrics["gen_value/validation_prefix_late_macro_mse"] == pytest.approx((0.04 + 0.01) / 2)
+
+
+def test_gen_value_validation_macro_mse_is_not_dominated_by_majority_outcome():
+    examples = [
+        {"kind": "segment_start", "target": 1.0},
+        *[{"kind": "segment_start", "target": 0.0} for _ in range(9)],
+    ]
+
+    metrics = value_model_utils.gen_value_validation_metrics(examples, [0.0, *([0.0] * 9)])
+
+    assert metrics["gen_value/validation_mse"] == pytest.approx(0.1)
+    assert metrics["gen_value/validation_prefix_macro_mse"] == pytest.approx(0.5)
 
 
 def test_gen_value_validation_auc_assigns_half_credit_to_ties():
