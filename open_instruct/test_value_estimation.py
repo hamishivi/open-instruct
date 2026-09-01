@@ -162,6 +162,53 @@ class TestValueEstimationStates(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "too late-heavy"):
             prepare_gen_value_mc_sft.require_trajectory_coverage(raw_examples, min_early_middle_fraction=0.75)
 
+    def test_mc_sft_target_position_balance_is_deterministic_and_does_not_duplicate_states(self):
+        examples = []
+        identifier = 0
+        for trajectory_fraction, target_counts in (
+            (0.1, ((0.0, 4), (0.3, 1), (0.6, 1), (0.9, 1))),
+            (0.5, ((0.0, 2), (0.3, 1), (0.6, 1), (0.9, 1))),
+        ):
+            for target, count in target_counts:
+                for _ in range(count):
+                    examples.append(
+                        {
+                            "id": identifier,
+                            "prompt": f"state-{identifier}",
+                            "state_kind": "segment_start",
+                            "trajectory_fraction": trajectory_fraction,
+                            "target": target,
+                        }
+                    )
+                    identifier += 1
+        examples.extend(
+            [
+                {
+                    "id": identifier + offset,
+                    "prompt": f"final-{offset}",
+                    "state_kind": "final_action",
+                    "trajectory_fraction": 1.0,
+                    "target": float(offset),
+                }
+                for offset in range(2)
+            ]
+        )
+
+        balanced = prepare_gen_value_mc_sft.balance_examples_by_target_and_position(examples, seed=7)
+
+        self.assertEqual(balanced, prepare_gen_value_mc_sft.balance_examples_by_target_and_position(examples, seed=7))
+        self.assertEqual(len(balanced), 10)
+        self.assertEqual(len({example["prompt"] for example in balanced}), len(balanced))
+        self.assertEqual(sum(example["state_kind"] == "final_action" for example in balanced), 2)
+        cell_counts = {}
+        for example in balanced:
+            cell = prepare_gen_value_mc_sft._target_position_cell(example)
+            if cell is not None:
+                cell_counts[cell] = cell_counts.get(cell, 0) + 1
+        self.assertEqual(set(cell_counts.values()), {1})
+        self.assertEqual(len(cell_counts), 8)
+        self.assertTrue(all(example["target_position_balanced"] for example in balanced))
+
     def test_mc_sft_pools_independent_targets_for_shared_exact_states(self):
         examples = prepare_gen_value_mc_sft.build_mc_sft_examples(
             [

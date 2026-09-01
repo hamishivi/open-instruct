@@ -33,10 +33,21 @@ LATE_STATE_REPEAT="${LATE_STATE_REPEAT:-2}"
 LATE_STATE_FRACTION="${LATE_STATE_FRACTION:-0.75}"
 GEN_VALUE_CONDITIONING="${GEN_VALUE_CONDITIONING:-none}"
 GEN_VALUE_SCORE_MAX="${GEN_VALUE_SCORE_MAX:-10}"
+BALANCE_TARGET_POSITION="${BALANCE_TARGET_POSITION:-0}"
+BALANCE_SEED="${BALANCE_SEED:-0}"
 
 if [[ ! "${GEN_VALUE_SCORE_MAX}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: GEN_VALUE_SCORE_MAX must be a positive integer" >&2
     exit 1
+fi
+if [[ ! "${BALANCE_TARGET_POSITION}" =~ ^[01]$ ]]; then
+    echo "ERROR: BALANCE_TARGET_POSITION must be 0 or 1" >&2
+    exit 1
+fi
+
+balance_args=()
+if [[ "${BALANCE_TARGET_POSITION}" == "1" ]]; then
+    balance_args+=(--balance_target_position --balance_seed "${BALANCE_SEED}")
 fi
 
 "${PYTHON_EXECUTABLE}" scripts/data/prepare_gen_value_mc_sft.py \
@@ -51,7 +62,8 @@ fi
     --gen_value_conditioning "${GEN_VALUE_CONDITIONING}" \
     --final_action_repeat "${FINAL_ACTION_REPEAT}" \
     --late_state_repeat "${LATE_STATE_REPEAT}" \
-    --late_state_fraction "${LATE_STATE_FRACTION}"
+    --late_state_fraction "${LATE_STATE_FRACTION}" \
+    "${balance_args[@]}"
 
 export TRACE_JSONL="${MC_SFT_JSONL}"
 export MIN_TRACE_EXAMPLES="${MIN_MC_EXAMPLES}"

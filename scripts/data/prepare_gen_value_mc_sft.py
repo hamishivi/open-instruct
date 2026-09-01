@@ -3,7 +3,7 @@
 
 The standard generative-critic SFT objective supervises every token in a long
 teacher critique, so the scalar judgment can receive little effective weight.
-This ablation retains the exact online critic prompt but uses a concise
+This dataset retains the exact online critic prompt but uses a concise
 ``<answer>N</answer>`` completion, making every supervised completion token part
 of the value judgment. The target is computed from fresh continuations rather
 than the outcome of the sampled trajectory that supplied the prefix.
@@ -15,6 +15,7 @@ import argparse
 import json
 import math
 import pathlib
+import random
 from collections.abc import Sequence
 from typing import Any
 
@@ -82,9 +83,7 @@ def build_mc_sft_examples(
         if not problem:
             raise ValueError(f"Row {row_index} has no problem text.")
         critic_problem = value_model_utils.decode_generative_value_problem(
-            tokenizer,
-            optional_sequence_as_list(row.get("prompt_token_ids")) or None,
-            fallback_problem=problem,
+            tokenizer, optional_sequence_as_list(row.get("prompt_token_ids")) or None, fallback_problem=problem
         )
         ground_truth = str(row.get("ground_truth", ""))
         if gen_value_conditioning == "gt" and not ground_truth:
@@ -158,9 +157,7 @@ def build_mc_sft_examples(
                 "response_tokens_used",
                 "response_token_limit",
             )
-            inconsistent_fields = [
-                field for field in consistency_fields if existing.get(field) != example.get(field)
-            ]
+            inconsistent_fields = [field for field in consistency_fields if existing.get(field) != example.get(field)]
             if inconsistent_fields:
                 raise ValueError(
                     f"Exact critic prompt collision for row {row_index}, probe {probe_position} has inconsistent "
@@ -202,11 +199,7 @@ def build_mc_sft_examples(
 
 
 def repeat_examples_for_horizon(
-    examples: Sequence[dict[str, Any]],
-    *,
-    final_action_repeat: int,
-    late_state_repeat: int,
-    late_state_fraction: float,
+    examples: Sequence[dict[str, Any]], *, final_action_repeat: int, late_state_repeat: int, late_state_fraction: float
 ) -> list[dict[str, Any]]:
     """Deterministically upweight final-action and late-trajectory states.
 
@@ -227,14 +220,67 @@ def repeat_examples_for_horizon(
         else:
             repeat_count = 1
         for repeat_index in range(repeat_count):
-            repeated.append(
-                {
-                    **example,
-                    "horizon_repeat_count": repeat_count,
-                    "horizon_repeat_index": repeat_index,
-                }
-            )
+            repeated.append({**example, "horizon_repeat_count": repeat_count, "horizon_repeat_index": repeat_index})
     return repeated
+
+
+def _target_position_cell(example: dict[str, Any]) -> tuple[str, str] | None:
+    if example.get("state_kind") == "final_action":
+        return None
+    trajectory_fraction = float(example.get("trajectory_fraction", 0.0))
+    if not math.isfinite(trajectory_fraction) or not 0.0 <= trajectory_fraction <= 1.0:
+        raise ValueError(f"Trajectory fraction must be finite and in [0, 1], got {trajectory_fraction}.")
+    trajectory_band = "early" if trajectory_fraction < 1 / 3 else "middle" if trajectory_fraction < 2 / 3 else "late"
+    target = float(example["target"])
+    if not math.isfinite(target) or not 0.0 <= target <= 1.0:
+        raise ValueError(f"Monte Carlo value must be finite and in [0, 1], got {target}.")
+    target_bin = "0-.25" if target <= 0.25 else ".25-.5" if target <= 0.5 else ".5-.75" if target <= 0.75 else ".75-1"
+    return trajectory_band, target_bin
+
+
+def balance_examples_by_target_and_position(examples: Sequence[dict[str, Any]], *, seed: int) -> list[dict[str, Any]]:
+    """Balance exact-MC target bins per trajectory band without changing labels."""
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError(f"seed must be a nonnegative integer, got {seed!r}.")
+    target_bins = ("0-.25", ".25-.5", ".5-.75", ".75-1")
+    cells: dict[tuple[str, str], list[int]] = {}
+    retained_indices = {index for index, example in enumerate(examples) if example.get("state_kind") == "final_action"}
+    for index, example in enumerate(examples):
+        cell = _target_position_cell(example)
+        if cell is not None:
+            cells.setdefault(cell, []).append(index)
+
+    rng = random.Random(seed)
+    cell_sizes: dict[str, int] = {}
+    for trajectory_band in ("early", "middle", "late"):
+        band_cells = [cells.get((trajectory_band, target_bin), []) for target_bin in target_bins]
+        if not any(band_cells):
+            continue
+        missing_bins = [target_bin for target_bin, indices in zip(target_bins, band_cells, strict=True) if not indices]
+        if missing_bins:
+            raise ValueError(
+                f"Cannot target-balance {trajectory_band} states because target bins are empty: {missing_bins}."
+            )
+        cell_size = min(len(indices) for indices in band_cells)
+        cell_sizes[trajectory_band] = cell_size
+        for indices in band_cells:
+            retained_indices.update(rng.sample(indices, cell_size))
+
+    balanced = []
+    for index, example in enumerate(examples):
+        if index not in retained_indices:
+            continue
+        cell = _target_position_cell(example)
+        balanced.append(
+            {
+                **example,
+                "target_position_balanced": True,
+                "target_position_balance_band": "final_action" if cell is None else cell[0],
+                "target_position_balance_bin": "final_action" if cell is None else cell[1],
+                "target_position_balance_cell_size": 1 if cell is None else cell_sizes[cell[0]],
+            }
+        )
+    return balanced
 
 
 def summarize_trajectory_coverage(examples: Sequence[dict[str, Any]]) -> dict[str, int | float]:
@@ -270,10 +316,7 @@ def require_trajectory_coverage(
 ) -> dict[str, int | float]:
     """Fail closed when the raw dataset misses its intended nonterminal bands."""
     if not 0.0 <= min_early_middle_fraction <= 1.0:
-        raise ValueError(
-            "min_early_middle_fraction must be in [0, 1], got "
-            f"{min_early_middle_fraction}."
-        )
+        raise ValueError(f"min_early_middle_fraction must be in [0, 1], got {min_early_middle_fraction}.")
     coverage = summarize_trajectory_coverage(examples)
     observed_fraction = float(coverage["early_middle_fraction"])
     if observed_fraction < min_early_middle_fraction:
@@ -326,6 +369,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--final_action_repeat", type=int, default=1)
     parser.add_argument("--late_state_repeat", type=int, default=1)
     parser.add_argument("--late_state_fraction", type=float, default=0.75)
+    parser.add_argument(
+        "--balance_target_position",
+        action="store_true",
+        help=(
+            "Deterministically downsample each nonterminal trajectory band to equal exact-MC target-bin "
+            "counts. Labels, prompts, and the training objective are unchanged."
+        ),
+    )
+    parser.add_argument("--balance_seed", type=int, default=0)
     return parser.parse_args()
 
 
@@ -341,12 +393,18 @@ def main() -> None:
     if overlaps:
         raise ValueError(f"MC SFT input overlaps {len(overlaps)} held-out calibration problems.")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name_or_path)
-    raw_examples = build_mc_sft_examples(
+    source_examples = build_mc_sft_examples(
         rows,
         tokenizer=tokenizer,
         min_continuations=args.min_continuations,
         score_max=args.score_max,
         gen_value_conditioning=args.gen_value_conditioning,
+    )
+    source_trajectory_coverage = summarize_trajectory_coverage(source_examples)
+    raw_examples = (
+        balance_examples_by_target_and_position(source_examples, seed=args.balance_seed)
+        if args.balance_target_position
+        else source_examples
     )
     if len(raw_examples) < args.min_examples:
         raise ValueError(f"MC SFT dataset has {len(raw_examples)} examples; at least {args.min_examples} required.")
@@ -367,6 +425,7 @@ def main() -> None:
     print(
         json.dumps(
             {
+                "source_examples": len(source_examples),
                 "raw_examples": len(raw_examples),
                 "training_examples": len(examples),
                 "input_rows": len(rows),
@@ -380,6 +439,9 @@ def main() -> None:
                     and float(example["trajectory_fraction"]) >= args.late_state_fraction
                     for example in examples
                 ),
+                "balance_target_position": args.balance_target_position,
+                "balance_seed": args.balance_seed,
+                "source_trajectory_coverage": source_trajectory_coverage,
                 "raw_trajectory_coverage": trajectory_coverage,
             },
             indent=2,
