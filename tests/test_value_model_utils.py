@@ -27,9 +27,7 @@ def _pair(
 
 
 def test_mark_gen_value_training_pairs_for_optimizer_is_uniform_and_reproducible():
-    pairs = [
-        {"identifier": index, "request_output": SimpleNamespace(prompt_token_ids=[index])} for index in range(20)
-    ]
+    pairs = [{"identifier": index, "request_output": SimpleNamespace(prompt_token_ids=[index])} for index in range(20)]
 
     first, first_probability, first_count = value_model_utils.mark_gen_value_training_pairs_for_optimizer(
         pairs, 6, random.Random(17)
@@ -48,13 +46,11 @@ def test_mark_gen_value_training_pairs_for_optimizer_is_uniform_and_reproducible
 
 
 def test_mark_gen_value_training_pairs_for_optimizer_preserves_small_batches():
-    pairs = [
-        {"identifier": index, "request_output": SimpleNamespace(prompt_token_ids=[index])} for index in range(3)
-    ]
+    pairs = [{"identifier": index, "request_output": SimpleNamespace(prompt_token_ids=[index])} for index in range(3)]
 
     for target in (3, 4):
-        marked, inclusion_probability, selected_count = (
-            value_model_utils.mark_gen_value_training_pairs_for_optimizer(pairs, target, random.Random(0))
+        marked, inclusion_probability, selected_count = value_model_utils.mark_gen_value_training_pairs_for_optimizer(
+            pairs, target, random.Random(0)
         )
         assert [pair["identifier"] for pair in marked] == [0, 1, 2]
         assert all(value_model_utils.gen_value_optimizer_selected(pair) for pair in marked)
@@ -69,8 +65,7 @@ def test_mark_gen_value_training_pairs_for_optimizer_rejects_nonpositive_target(
 
 def test_mark_gen_value_training_pairs_for_optimizer_keeps_shared_states_together():
     pairs = [
-        {"identifier": index, "request_output": SimpleNamespace(prompt_token_ids=[index // 3])}
-        for index in range(30)
+        {"identifier": index, "request_output": SimpleNamespace(prompt_token_ids=[index // 3])} for index in range(30)
     ]
 
     marked, _, selected_count = value_model_utils.mark_gen_value_training_pairs_for_optimizer(
@@ -95,9 +90,7 @@ def test_mark_gen_value_training_pairs_for_optimizer_fallback_probability_is_exa
         def choice(self, values):
             return values[0]
 
-    pairs = [
-        {"identifier": index, "request_output": SimpleNamespace(prompt_token_ids=[index])} for index in range(4)
-    ]
+    pairs = [{"identifier": index, "request_output": SimpleNamespace(prompt_token_ids=[index])} for index in range(4)]
     marked, inclusion_probability, selected_count = value_model_utils.mark_gen_value_training_pairs_for_optimizer(
         pairs, 1, EmptyDrawRng()
     )
@@ -242,25 +235,11 @@ def test_gen_value_validation_removes_every_state_from_heldout_prompt_group():
 
 def test_gen_value_validation_preserves_near_horizon_and_both_outcomes():
     near_horizon_incorrect = {
-        "pairs": [
-            _pair(
-                [1],
-                0.0,
-                state_kind="final_action",
-                response_tokens_used=8000,
-                response_token_limit=8192,
-            )
-        ]
+        "pairs": [_pair([1], 0.0, state_kind="final_action", response_tokens_used=8000, response_token_limit=8192)]
     }
-    mixed_incorrect = {
-        "pairs": [_pair([2], 0.0, state_kind="final_action", response_tokens_used=4000)]
-    }
-    mixed_correct = {
-        "pairs": [_pair([2], 1.0, state_kind="final_action", response_tokens_used=4000)]
-    }
-    ordinary_incorrect = {
-        "pairs": [_pair([3], 0.0, state_kind="final_action", response_tokens_used=4000)]
-    }
+    mixed_incorrect = {"pairs": [_pair([2], 0.0, state_kind="final_action", response_tokens_used=4000)]}
+    mixed_correct = {"pairs": [_pair([2], 1.0, state_kind="final_action", response_tokens_used=4000)]}
+    ordinary_incorrect = {"pairs": [_pair([3], 0.0, state_kind="final_action", response_tokens_used=4000)]}
 
     examples, _ = value_model_utils.build_gen_value_validation_holdout(
         [near_horizon_incorrect, mixed_incorrect, mixed_correct, ordinary_incorrect],
@@ -357,11 +336,7 @@ def test_final_action_replay_collapse_preserves_exact_token_loss_numerator():
     )
     assert collapsed_token_loss_numerator == logical_token_loss_numerator
     packs = value_model_utils.pack_gen_value_examples(collapsed, target_tokens=8)
-    flattened_rewards = [
-        reward
-        for pack in packs
-        for reward in value_model_utils.flatten_gen_value_pack(pack)[-1]
-    ]
+    flattened_rewards = [reward for pack in packs for reward in value_model_utils.flatten_gen_value_pack(pack)[-1]]
     assert sum(flattened_rewards) == logical_token_loss_numerator
     assert sum(len(pack) for pack in packs) == 2
 
@@ -381,9 +356,7 @@ def test_final_action_replay_collapse_rejects_inconsistent_copies():
     }
 
     with pytest.raises(ValueError, match="identical generated_ids"):
-        value_model_utils.collapse_replayed_gen_value_optimizer_examples(
-            [first, dict(first, generated_ids=[3])]
-        )
+        value_model_utils.collapse_replayed_gen_value_optimizer_examples([first, dict(first, generated_ids=[3])])
 
 
 def test_shared_state_returns_pool_unique_continuations_without_dropping_replays():
@@ -407,9 +380,7 @@ def test_shared_state_returns_pool_unique_continuations_without_dropping_replays
 
 def test_generative_value_reinforce_outcome_mass_metrics_include_tokens_and_replays():
     metrics = value_model_utils.generative_value_reinforce_outcome_mass_metrics(
-        weights=[0.5, -0.25, 0.5],
-        outcomes=[1.0, 0.0, 1.0],
-        generated_token_counts=[4, 8, 2],
+        weights=[0.5, -0.25, 0.5], outcomes=[1.0, 0.0, 1.0], generated_token_counts=[4, 8, 2]
     )
 
     assert metrics == {
@@ -521,12 +492,7 @@ def test_gen_value_validation_panel_round_trips_exact_examples(tmp_path):
             "target": 0.75,
             "target_source": "empirical_sibling_return",
         },
-        {
-            "prompt_token_ids": [4, 5],
-            "kind": "final_action",
-            "target": 0.0,
-            "target_source": "single_sample_return",
-        },
+        {"prompt_token_ids": [4, 5], "kind": "final_action", "target": 0.0, "target_source": "single_sample_return"},
     ]
 
     panel_path = value_model_utils.write_gen_value_validation_panel(str(tmp_path), examples)
@@ -609,11 +575,7 @@ def test_wait_for_gen_value_source_window_blocks_until_critic_catches_up():
     observed_steps = iter([3, 3, 4])
 
     latest_trained_step, waited_seconds = value_model_utils.wait_for_gen_value_source_window(
-        lambda: next(observed_steps),
-        policy_training_step=5,
-        max_async_steps=1,
-        timeout_s=1.0,
-        poll_interval_s=0.0,
+        lambda: next(observed_steps), policy_training_step=5, max_async_steps=1, timeout_s=1.0, poll_interval_s=0.0
     )
 
     assert latest_trained_step == 4
@@ -623,21 +585,13 @@ def test_wait_for_gen_value_source_window_blocks_until_critic_catches_up():
 def test_wait_for_gen_value_source_window_times_out_explicitly():
     with pytest.raises(TimeoutError, match="latest_trained_policy_step=3"):
         value_model_utils.wait_for_gen_value_source_window(
-            lambda: 3,
-            policy_training_step=5,
-            max_async_steps=1,
-            timeout_s=1e-6,
-            poll_interval_s=0.0,
+            lambda: 3, policy_training_step=5, max_async_steps=1, timeout_s=1e-6, poll_interval_s=0.0
         )
 
 
 def _rollouts_for_steps(*source_steps: int) -> list[dict]:
     return [
-        {
-            "policy_training_step": source_step,
-            "policy_model_version": source_step,
-            "identifier": index,
-        }
+        {"policy_training_step": source_step, "policy_model_version": source_step, "identifier": index}
         for index, source_step in enumerate(source_steps)
     ]
 
@@ -679,10 +633,7 @@ def test_select_fresh_gen_value_rollouts_discards_stale_without_partial_batch():
 
 
 def test_select_fresh_gen_value_rollouts_reuses_frozen_policy_batches():
-    pending = [
-        {"policy_training_step": step, "policy_model_version": 0, "identifier": step}
-        for step in (1, 12, 25)
-    ]
+    pending = [{"policy_training_step": step, "policy_model_version": 0, "identifier": step} for step in (1, 12, 25)]
 
     selected, retained, stale = value_model_utils.select_fresh_gen_value_rollouts(
         pending, batch_size=2, max_async_steps=1
@@ -728,10 +679,7 @@ def test_select_fresh_gen_value_rollouts_does_not_discard_for_critic_version_age
         pending, batch_size=2, max_async_steps=1
     )
 
-    assert [rollout["identifier"] for rollout in selected] == [
-        "old-critic-fresh-policy",
-        "newer-critic-fresh-policy",
-    ]
+    assert [rollout["identifier"] for rollout in selected] == ["old-critic-fresh-policy", "newer-critic-fresh-policy"]
     assert retained == []
     assert stale == []
 
@@ -747,10 +695,7 @@ def test_select_fresh_gen_value_rollouts_does_not_regress_newest_seen_version():
     pending = [{"policy_training_step": 20, "policy_model_version": 8, "identifier": "old-remainder"}]
 
     selected, retained, stale = value_model_utils.select_fresh_gen_value_rollouts(
-        pending,
-        batch_size=1,
-        max_async_steps=1,
-        newest_policy_model_version=10,
+        pending, batch_size=1, max_async_steps=1, newest_policy_model_version=10
     )
 
     assert selected == []
