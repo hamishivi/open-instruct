@@ -7,6 +7,7 @@ from unittest import mock
 
 import numpy as np
 from scripts.data import prepare_gen_value_mc_sft, prepare_gen_value_sft, synthesize_gen_value_sft
+from scripts.eval.value_estimation import compare_gen_value_scores
 
 from open_instruct import value_estimation
 
@@ -565,6 +566,50 @@ class TestValueEstimationStates(unittest.TestCase):
     def test_bucketed_prediction_metrics_rejects_length_mismatch(self):
         with self.assertRaisesRegex(ValueError, "same length"):
             value_estimation._bucketed_prediction_metrics([0.1], [0.0], [], prefix="trajectory")
+
+
+class TestGenerativeValueScoreComparison(unittest.TestCase):
+    def test_auc_is_problem_balanced_and_restricted_to_real_selection_pairs(self):
+        rows = [
+            {
+                "problem": "a",
+                "rollout_is_correct": True,
+                "state_kind": "intermediate",
+                "target": 1.0,
+                "prediction": 0.6,
+            },
+            {
+                "problem": "a",
+                "rollout_is_correct": False,
+                "state_kind": "intermediate",
+                "target": 0.0,
+                "prediction": 0.5,
+            },
+            {
+                "problem": "b",
+                "rollout_is_correct": True,
+                "state_kind": "intermediate",
+                "target": 1.0,
+                "prediction": 0.2,
+            },
+            {
+                "problem": "b",
+                "rollout_is_correct": False,
+                "state_kind": "intermediate",
+                "target": 0.0,
+                "prediction": 0.1,
+            },
+        ]
+
+        metrics = compare_gen_value_scores._metrics(rows)
+
+        # The pooled metric compares cross-problem pairs and loses one of four
+        # comparisons. Both comparisons the policy could actually make are
+        # correctly ranked.
+        self.assertAlmostEqual(metrics["intermediate_outcome_auc"], 0.75)
+        self.assertAlmostEqual(metrics["intermediate_within_problem_auc"], 1.0)
+        self.assertEqual(metrics["intermediate_within_problem_auc_problems"], 2.0)
+        self.assertEqual(metrics["intermediate_within_problem_auc_pairs"], 2.0)
 
 
 if __name__ == "__main__":

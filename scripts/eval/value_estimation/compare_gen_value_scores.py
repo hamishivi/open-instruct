@@ -134,6 +134,39 @@ def _metrics(rows: list[dict[str, Any]]) -> dict[str, float | None]:
     else:
         metrics["intermediate_outcome_gap"] = None
     metrics["intermediate_outcome_auc"] = _pairwise_auc(intermediate_correct, intermediate_incorrect)
+
+    # The policy compares continuations of the same prompt. A pooled AUC also
+    # compares states from unrelated problems, so it can reward problem-level
+    # calibration offsets that never help an actual policy decision. Average a
+    # within-problem AUC instead, giving every held-out problem equal weight.
+    within_problem_aucs = []
+    within_problem_pairs = 0
+    for problem in sorted({row["problem"] for row in rows}):
+        problem_correct = [
+            row["prediction"]
+            for row in rows
+            if row["problem"] == problem
+            and row["state_kind"] == "intermediate"
+            and row["rollout_is_correct"]
+            and row["prediction"] is not None
+        ]
+        problem_incorrect = [
+            row["prediction"]
+            for row in rows
+            if row["problem"] == problem
+            and row["state_kind"] == "intermediate"
+            and not row["rollout_is_correct"]
+            and row["prediction"] is not None
+        ]
+        problem_auc = _pairwise_auc(problem_correct, problem_incorrect)
+        if problem_auc is not None:
+            within_problem_aucs.append(problem_auc)
+            within_problem_pairs += len(problem_correct) * len(problem_incorrect)
+    metrics["intermediate_within_problem_auc"] = (
+        float(np.mean(within_problem_aucs)) if within_problem_aucs else None
+    )
+    metrics["intermediate_within_problem_auc_problems"] = float(len(within_problem_aucs))
+    metrics["intermediate_within_problem_auc_pairs"] = float(within_problem_pairs)
     return metrics
 
 
@@ -189,8 +222,8 @@ def compare_scores(
     candidate_correct_mse = candidate_metrics["intermediate_correct_penalized_mse"]
     baseline_incorrect_mse = baseline_metrics["intermediate_incorrect_penalized_mse"]
     candidate_incorrect_mse = candidate_metrics["intermediate_incorrect_penalized_mse"]
-    baseline_auc = baseline_metrics["intermediate_outcome_auc"]
-    candidate_auc = candidate_metrics["intermediate_outcome_auc"]
+    baseline_auc = baseline_metrics["intermediate_within_problem_auc"]
+    candidate_auc = candidate_metrics["intermediate_within_problem_auc"]
     checks = {
         "candidate_parse_rate_at_least_0_99": candidate_metrics["parse_rate"] >= 0.99,
         "problem_balanced_mse_noninferior": float(delta_ci[1]) <= mse_noninferiority_margin,
@@ -198,7 +231,9 @@ def compare_scores(
         "failed_intermediate_mse_noninferior": (
             candidate_incorrect_mse <= baseline_incorrect_mse + mse_noninferiority_margin
         ),
-        "intermediate_auc_noninferior": candidate_auc >= baseline_auc - auc_noninferiority_margin,
+        "intermediate_within_problem_auc_noninferior": (
+            candidate_auc >= baseline_auc - auc_noninferiority_margin
+        ),
     }
     return {
         "baseline_path": str(baseline_path),
@@ -209,6 +244,7 @@ def compare_scores(
         "candidate": candidate_metrics,
         "problem_balanced_mse_delta_candidate_minus_baseline": problem_balanced_delta,
         "problem_cluster_bootstrap_95pct_ci": [float(delta_ci[0]), float(delta_ci[1])],
+        "intermediate_within_problem_auc_delta_candidate_minus_baseline": candidate_auc - baseline_auc,
         "bootstrap_samples": bootstrap_samples,
         "gate": {
             "accepted": all(checks.values()),
