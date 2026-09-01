@@ -266,15 +266,19 @@ class GenValueTrainerActor:
             checkpoint_path,
             tag=checkpoint_tag,
             load_module_strict=True,
-            load_optimizer_states=True,
+            # Legacy stage-0 BF16 critic checkpoints contain module weights and
+            # client state but no serialized Adam state. A module-only load also
+            # asks DeepSpeed's BF16 wrapper to refresh its FP32 master parameters
+            # from the restored module instead of retaining the initialization.
+            load_optimizer_states=False,
             load_lr_scheduler_states=False,
-            load_module_only=False,
+            load_module_only=True,
         )
         if loaded_path is None:
             raise ValueError(f"Failed to load generative-value DeepSpeed checkpoint from {checkpoint_path}.")
         self._step_count = int(client_state.get("gen_value_version", client_state.get("reinforce_steps", 0)))
         logger.info(
-            "[GenValue] Restored trainer checkpoint %s/%s at critic version %d.",
+            "[GenValue] Restored trainer checkpoint %s/%s at critic version %d (optimizer_state=cold_start).",
             checkpoint_path,
             checkpoint_tag,
             self._step_count,
