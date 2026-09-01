@@ -2104,7 +2104,7 @@ def main():
             "======== ✅ Gen-value trainer actor ready "
             "(lr=%.2e, pack_length=%d, attention=%s, gradient_checkpointing=%s) =========",
             gv_lr,
-            streaming_config.pack_length,
+            gen_value_train_pack_length,
             olmo_core_attn_to_hf(model_config.attn_implementation),
             model_config.gradient_checkpointing,
         )
