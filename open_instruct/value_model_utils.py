@@ -1722,6 +1722,39 @@ def rescale_gen_value_score(parsed: float, score_min: float, score_max: float) -
     return max(0.0, min(1.0, (parsed - score_min) / max(score_max - score_min, 1e-8)))
 
 
+def expected_gen_value_score_from_logprobs(
+    class_scores: Sequence[float], class_sequence_logprobs: Sequence[float]
+) -> tuple[float, list[float]]:
+    """Return a normalized-class expected score and its probabilities.
+
+    The generative critic emits a discrete score such as ``<answer>7</answer>``.
+    Greedy parsing therefore only changes in 0.1 increments after rescaling and
+    can hide useful sub-threshold weight movement. Exact sequence log
+    probabilities for every valid score provide a diagnostic-only continuous
+    prediction without changing generation or the training objective.
+    """
+    if len(class_scores) != len(class_sequence_logprobs):
+        raise ValueError(
+            "class_scores and class_sequence_logprobs must have the same length "
+            f"({len(class_scores)} != {len(class_sequence_logprobs)})."
+        )
+    if not class_scores:
+        raise ValueError("At least one generative-value class is required.")
+    scores = [float(score) for score in class_scores]
+    logprobs = [float(logprob) for logprob in class_sequence_logprobs]
+    if not all(math.isfinite(score) for score in scores):
+        raise ValueError(f"Generative-value class scores must be finite, got {scores}.")
+    if not all(math.isfinite(logprob) for logprob in logprobs):
+        raise ValueError(f"Generative-value class log probabilities must be finite, got {logprobs}.")
+
+    max_logprob = max(logprobs)
+    unnormalized = [math.exp(logprob - max_logprob) for logprob in logprobs]
+    normalizer = sum(unnormalized)
+    probabilities = [weight / normalizer for weight in unnormalized]
+    expected_score = sum(score * probability for score, probability in zip(scores, probabilities, strict=True))
+    return expected_score, probabilities
+
+
 def is_postfix_template(template: str) -> bool:
     """Postfix templates are spliced BETWEEN prompt and response (per sub-sequence).
 

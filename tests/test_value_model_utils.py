@@ -154,6 +154,39 @@ def test_mark_gen_value_training_pairs_for_optimizer_is_unbiased_for_unequal_gro
     assert expected_estimator == pytest.approx(sum(pair["contribution"] for pair in pairs))
 
 
+def test_expected_gen_value_score_from_logprobs_is_continuous_and_normalized():
+    expected_score, probabilities = value_model_utils.expected_gen_value_score_from_logprobs(
+        list(range(11)), [0.0] * 11
+    )
+
+    assert expected_score == pytest.approx(5.0)
+    assert probabilities == pytest.approx([1.0 / 11.0] * 11)
+    assert sum(probabilities) == pytest.approx(1.0)
+
+
+def test_expected_gen_value_score_from_logprobs_is_numerically_stable():
+    expected_score, probabilities = value_model_utils.expected_gen_value_score_from_logprobs(
+        [0.0, 10.0], [-10_000.0, -10_001.0]
+    )
+
+    assert probabilities == pytest.approx([0.7310585786300049, 0.2689414213699951])
+    assert expected_score == pytest.approx(2.6894142136999513)
+
+
+@pytest.mark.parametrize(
+    ("scores", "logprobs", "message"),
+    [
+        ([], [], "At least one"),
+        ([0.0], [0.0, 1.0], "same length"),
+        ([float("inf")], [0.0], "scores must be finite"),
+        ([0.0], [float("nan")], "log probabilities must be finite"),
+    ],
+)
+def test_expected_gen_value_score_from_logprobs_rejects_invalid_inputs(scores, logprobs, message):
+    with pytest.raises(ValueError, match=message):
+        value_model_utils.expected_gen_value_score_from_logprobs(scores, logprobs)
+
+
 def test_gen_value_validation_targets_use_empirical_initial_and_sampled_prefix_returns():
     correct = {
         "pairs": [
