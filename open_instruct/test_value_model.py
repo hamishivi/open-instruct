@@ -1071,6 +1071,25 @@ class TestValueLoss(unittest.TestCase):
         self.assertAlmostEqual(metrics["gen_value/validation_prefix_late_value_gap"], 0.7)
         self.assertAlmostEqual(metrics["gen_value/validation_prefix_late_incorrect_v_hat_mean"], 0.2)
 
+    def test_gen_value_validation_position_bands_do_not_overlap_at_boundaries(self):
+        examples = [
+            {"kind": "segment_start", "target": 1.0, "trajectory_fraction": 0.0},
+            {"kind": "segment_start", "target": 0.0, "trajectory_fraction": 0.374},
+            {"kind": "segment_start", "target": 1.0, "trajectory_fraction": 0.375},
+            {"kind": "segment_start", "target": 0.0, "trajectory_fraction": 0.624},
+            {"kind": "segment_start", "target": 1.0, "trajectory_fraction": 0.625},
+            {"kind": "segment_start", "target": 0.0, "trajectory_fraction": 1.0},
+        ]
+
+        metrics = gen_value_validation_metrics(examples, [0.6, 0.4, 0.7, 0.5, 0.9, 0.2])
+
+        self.assertEqual(metrics["gen_value/validation_prefix_early_correct_examples"], 1.0)
+        self.assertEqual(metrics["gen_value/validation_prefix_early_incorrect_examples"], 1.0)
+        self.assertEqual(metrics["gen_value/validation_prefix_middle_correct_examples"], 1.0)
+        self.assertEqual(metrics["gen_value/validation_prefix_middle_incorrect_examples"], 1.0)
+        self.assertEqual(metrics["gen_value/validation_prefix_late_correct_examples"], 1.0)
+        self.assertEqual(metrics["gen_value/validation_prefix_late_incorrect_examples"], 1.0)
+
     def test_gen_value_validation_snapshot_preserves_inspectable_outputs(self):
         examples = [
             {

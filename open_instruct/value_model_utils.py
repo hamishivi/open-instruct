@@ -1122,14 +1122,21 @@ def gen_value_validation_metrics(
     # those regions separately.  These are relative to the observed rollout
     # end, unlike ``near_horizon`` below, which measures proximity to the hard
     # response-token limit.
-    prefix_position_bands = {"early": (0.0, 0.375), "middle": (0.375, 0.625), "late": (0.625, 1.0)}
+    # Use half-open bins except for the final interval so an exact boundary
+    # cannot be reported in two position bands.
+    prefix_position_bands = {"early": (0.0, 0.375, False), "middle": (0.375, 0.625, False), "late": (0.625, 1.0, True)}
     prefix_position_groups: dict[str, list[tuple[dict[str, Any], float]]] = {}
-    for band, (lower, upper) in prefix_position_bands.items():
+    for band, (lower, upper, include_upper) in prefix_position_bands.items():
         band_rows = [
             (example, prediction)
             for example, prediction in prefixes
             if example.get("trajectory_fraction") is not None
-            and lower <= float(example["trajectory_fraction"]) <= upper
+            and lower <= float(example["trajectory_fraction"])
+            and (
+                float(example["trajectory_fraction"]) <= upper
+                if include_upper
+                else float(example["trajectory_fraction"]) < upper
+            )
         ]
         prefix_position_groups[f"prefix_{band}_correct"] = [
             (example, prediction) for example, prediction in band_rows if float(example["target"]) > 0.5
