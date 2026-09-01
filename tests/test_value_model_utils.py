@@ -108,6 +108,52 @@ def test_mark_gen_value_training_pairs_for_optimizer_fallback_probability_is_exa
     assert not any(value_model_utils.gen_value_optimizer_selected(pair) for pair in marked[1:])
 
 
+def test_mark_gen_value_training_pairs_for_optimizer_is_unbiased_for_unequal_groups():
+    class ScriptedRng:
+        def __init__(self, retained: tuple[bool, ...], fallback_index: int):
+            self.retained = iter(retained)
+            self.fallback_index = fallback_index
+
+        def random(self):
+            return 0.0 if next(self.retained) else 1.0
+
+        def choice(self, values):
+            return values[self.fallback_index]
+
+    group_sizes = (1, 2, 4)
+    pairs = [
+        {
+            "contribution": float(10 * group_index + pair_index + 1),
+            "request_output": SimpleNamespace(prompt_token_ids=[group_index]),
+        }
+        for group_index, group_size in enumerate(group_sizes)
+        for pair_index in range(group_size)
+    ]
+    target_examples = 2
+    base_probability = target_examples / len(pairs)
+    expected_estimator = 0.0
+
+    for mask in range(1 << len(group_sizes)):
+        retained = tuple(bool(mask & (1 << group_index)) for group_index in range(len(group_sizes)))
+        draw_probability = base_probability ** sum(retained) * (1.0 - base_probability) ** (
+            len(group_sizes) - sum(retained)
+        )
+        fallback_indices = range(len(group_sizes)) if not any(retained) else range(1)
+        for fallback_index in fallback_indices:
+            marked, inclusion_probability, _ = value_model_utils.mark_gen_value_training_pairs_for_optimizer(
+                pairs, target_examples, ScriptedRng(retained, fallback_index)
+            )
+            estimator = sum(
+                pair["contribution"] / inclusion_probability
+                for pair in marked
+                if value_model_utils.gen_value_optimizer_selected(pair)
+            )
+            fallback_probability = 1.0 / len(group_sizes) if not any(retained) else 1.0
+            expected_estimator += draw_probability * fallback_probability * estimator
+
+    assert expected_estimator == pytest.approx(sum(pair["contribution"] for pair in pairs))
+
+
 def test_gen_value_validation_targets_use_empirical_initial_and_sampled_prefix_returns():
     correct = {
         "pairs": [
