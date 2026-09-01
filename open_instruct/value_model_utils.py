@@ -707,6 +707,49 @@ def generative_value_reinforce_outcome_mass_metrics(
 _GEN_VALUE_SAMPLE_ID_KEY = "_gen_value_sample_id"
 
 
+def sample_gen_value_training_pairs(
+    training_pairs: Sequence[dict[str, Any]], target_examples: int, rng: random.Random
+) -> list[dict[str, Any]]:
+    """Sample a critic minibatch while retaining exact shared-state groups.
+
+    The asynchronous queue selects fresh *rollouts*. A complete policy-sized
+    rollout batch can nevertheless contain thousands of segment-state critic
+    examples, making one optimizer update substantially slower than a policy step.
+
+    Each token-identical prompt group is independently retained with probability
+    ``target_examples / len(training_pairs)``. Every pair therefore has the same
+    inclusion probability, preserving the existing pair-weighted objective in
+    expectation, while all continuations of a shared state remain available for
+    empirical Monte Carlo return pooling. The realized minibatch may differ
+    slightly from the target; this avoids splitting groups or biasing toward small
+    groups merely to hit an exact count.
+
+    Returning every pair when the target covers the batch avoids perturbing historical
+    runs. The caller owns ``rng`` so successive updates consume a reproducible
+    random stream rather than repeatedly selecting the same subset.
+    """
+    if target_examples <= 0:
+        raise ValueError(f"Generative-value training target examples must be positive, got {target_examples}.")
+    if len(training_pairs) <= target_examples:
+        return list(training_pairs)
+
+    grouped_indices: dict[tuple[int, ...], list[int]] = {}
+    for index, pair in enumerate(training_pairs):
+        prompt_ids = tuple(int(token_id) for token_id in pair["request_output"].prompt_token_ids)
+        grouped_indices.setdefault(prompt_ids, []).append(index)
+
+    inclusion_probability = target_examples / len(training_pairs)
+    retained_groups = {prompt_ids for prompt_ids in grouped_indices if rng.random() < inclusion_probability}
+    if not retained_groups:
+        fallback_pair = rng.choice(list(training_pairs))
+        retained_groups.add(tuple(int(token_id) for token_id in fallback_pair["request_output"].prompt_token_ids))
+    return [
+        pair
+        for pair in training_pairs
+        if tuple(int(token_id) for token_id in pair["request_output"].prompt_token_ids) in retained_groups
+    ]
+
+
 def gen_value_pair_sample_id(pair: dict[str, Any]) -> int:
     """Return the stable per-batch identity of one critic sample.
 

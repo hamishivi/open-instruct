@@ -833,6 +833,13 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
     # Independent critic update cadence. The default critic batch contains the same
     # number of complete rollouts as one global policy batch, irrespective of policy world size.
     gen_value_batch_size: int | None = None
+    # Optional optimizer-minibatch target applied after selecting a fresh policy-sized
+    # rollout batch and before final-action replay. A uniform subset leaves the
+    # pair-weighted REINFORCE objective unchanged in expectation while allowing the
+    # critic to take frequent fresh updates instead of accumulating every segment
+    # example (often several thousand) into one very slow optimizer step. Exact
+    # shared-state groups remain intact, so the realized size can vary around the target.
+    gen_value_train_target_examples_per_update: int | None = None
     # Maximum source-policy lag retained for critic training. This is intentionally
     # independent of the policy rollout pipeline's async_steps: enqueue never
     # blocks policy training, the consumer prefers the freshest available
@@ -945,6 +952,14 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
             raise ValueError(f"--gen_value_learning_rate must be > 0, got {self.gen_value_learning_rate}.")
         if self.gen_value_batch_size is not None and self.gen_value_batch_size <= 0:
             raise ValueError(f"--gen_value_batch_size must be > 0, got {self.gen_value_batch_size}.")
+        if (
+            self.gen_value_train_target_examples_per_update is not None
+            and self.gen_value_train_target_examples_per_update <= 0
+        ):
+            raise ValueError(
+                "--gen_value_train_target_examples_per_update must be > 0 when set, got "
+                f"{self.gen_value_train_target_examples_per_update}."
+            )
         if self.gen_value_max_async_steps <= 0:
             raise ValueError(f"--gen_value_max_async_steps must be > 0, got {self.gen_value_max_async_steps}.")
         if self.gen_value_training_queue_capacity_steps < 0:
@@ -1430,7 +1445,9 @@ def _gen_value_reinforce_loop(
     training_queue: ray_queue.Queue,
     training_progress: Any,
     batch_size: int,
+    target_examples_per_update: int | None,
     max_async_steps: int,
+    training_seed: int,
     stop_event: threading.Event,
     checkpoint_pause_event: threading.Event,
     checkpoint_paused_event: threading.Event,
@@ -1460,6 +1477,7 @@ def _gen_value_reinforce_loop(
     discarded_stale_rollouts = 0
     discarded_since_update = 0
     newest_seen_policy_model_version: int | None = None
+    pair_sampling_rng = random.Random(training_seed)
 
     while True:
         _hold_gen_value_training_for_checkpoint(checkpoint_pause_event, checkpoint_paused_event, stop_event)
@@ -1575,6 +1593,12 @@ def _gen_value_reinforce_loop(
                         }
                 else:
                     pairs = [pair for rollout in rollouts for pair in rollout["pairs"]]
+            candidate_pair_count = len(pairs)
+            if target_examples_per_update is not None:
+                pairs = value_model_utils.sample_gen_value_training_pairs(
+                    pairs, target_examples_per_update, pair_sampling_rng
+                )
+            sampled_pair_count = len(pairs)
             unique_pair_count = len(pairs)
             pairs = value_model_utils.replay_gen_value_final_actions(pairs, final_action_replay_weight)
             policy_training_steps = [int(rollout["policy_training_step"]) for rollout in rollouts]
@@ -1675,6 +1699,9 @@ def _gen_value_reinforce_loop(
                     "gen_value/batch_rollouts": len(rollouts),
                     "gen_value/batch_pairs": len(pairs),
                     "gen_value/batch_unique_pairs": unique_pair_count,
+                    "gen_value/candidate_unique_pairs": candidate_pair_count,
+                    "gen_value/sampled_unique_pairs": sampled_pair_count,
+                    "gen_value/pair_sampling_fraction": sampled_pair_count / candidate_pair_count,
                     "gen_value/final_action_replay_examples": len(pairs) - unique_pair_count,
                     "gen_value/batch_tokens": batch_response_tokens,
                     "gen_value/batch_sequence_tokens": batch_sequence_tokens,
@@ -2280,7 +2307,9 @@ def main():
             gen_value_training_queue,
             gen_value_training_progress,
             gen_value_batch_size,
+            args.gen_value_train_target_examples_per_update,
             args.gen_value_max_async_steps,
+            args.seed,
             gen_value_stop_event,
             gen_value_checkpoint_pause_event,
             gen_value_checkpoint_paused_event,

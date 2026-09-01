@@ -190,6 +190,7 @@ def test_genvalue_config_rejects_negative_reinforce_coef():
     ("field", "value"),
     [
         ("gen_value_batch_size", 0),
+        ("gen_value_train_target_examples_per_update", 0),
         ("gen_value_vllm_tensor_parallel_size", 0),
         ("gen_value_max_segments", 0),
         ("gen_value_max_new_tokens", 0),

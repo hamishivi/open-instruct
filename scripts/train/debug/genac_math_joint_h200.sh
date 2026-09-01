@@ -75,6 +75,10 @@ GEN_VALUE_TRAIN_PACK_LENGTH="${GEN_VALUE_TRAIN_PACK_LENGTH:-32768}"
 # separate multi-update serving lag after source-data staleness is bounded.
 GEN_VALUE_SYNC_FREQ="${GEN_VALUE_SYNC_FREQ:-1}"
 GEN_VALUE_MAX_ASYNC_STEPS="${GEN_VALUE_MAX_ASYNC_STEPS:-1}"
+# Zero preserves full-batch critic optimization. A positive value requests a
+# shared-state-preserving stochastic minibatch of approximately this many critic
+# examples per fresh policy batch.
+GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE="${GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE:-0}"
 # A small/positive advantage gap remains useful signal. Keep only a hard guard
 # against reversed separation; use the continuous gap to drive critic diagnostics
 # and subsequent critic-compute decisions instead of freezing at 0.20.
@@ -96,6 +100,16 @@ fi
 if [[ ! "${GEN_VALUE_SCORE_MAX}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: GEN_VALUE_SCORE_MAX must be a positive integer" >&2
     exit 1
+fi
+if [[ ! "${GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE must be a nonnegative integer" >&2
+    exit 1
+fi
+GEN_VALUE_TRAIN_TARGET_ARGS=()
+if ((GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE > 0)); then
+    GEN_VALUE_TRAIN_TARGET_ARGS+=(
+        --gen_value_train_target_examples_per_update "${GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE}"
+    )
 fi
 TOTAL_TRAINING_STEPS=$((VALUE_WARMUP_STEPS + JOINT_TRAINING_STEPS))
 TOTAL_EPISODES=$((TOTAL_TRAINING_STEPS * NUM_UNIQUE_PROMPTS_ROLLOUT * NUM_SAMPLES_PER_PROMPT_ROLLOUT))
@@ -185,6 +199,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --gen_value_final_action_replay_weight 4 \
     --gen_value_sync_freq "${GEN_VALUE_SYNC_FREQ}" \
     --gen_value_max_async_steps "${GEN_VALUE_MAX_ASYNC_STEPS}" \
+    "${GEN_VALUE_TRAIN_TARGET_ARGS[@]}" \
     --gen_value_min_advantage_gap_for_policy_update "${GEN_VALUE_MIN_ADVANTAGE_GAP}" \
     --gen_value_diagnostic_scoring_freq 0 \
     --gen_value_validation_freq 25 \

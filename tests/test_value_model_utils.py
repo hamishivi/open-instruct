@@ -1,6 +1,7 @@
 """CPU-only tests for generative-value target and replay helpers."""
 
 import json
+import random
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +24,50 @@ def _pair(
         "response_tokens_used": response_tokens_used,
         "response_token_limit": response_token_limit,
     }
+
+
+def test_sample_gen_value_training_pairs_is_uniform_and_reproducible():
+    pairs = [
+        {"identifier": index, "request_output": SimpleNamespace(prompt_token_ids=[index])} for index in range(20)
+    ]
+
+    first = value_model_utils.sample_gen_value_training_pairs(pairs, 6, random.Random(17))
+    second = value_model_utils.sample_gen_value_training_pairs(pairs, 6, random.Random(17))
+
+    assert first == second
+    assert 1 <= len(first) < len(pairs)
+    assert len({pair["identifier"] for pair in first}) == len(first)
+    assert all(pair in pairs for pair in first)
+
+
+def test_sample_gen_value_training_pairs_preserves_small_batches():
+    pairs = [
+        {"identifier": index, "request_output": SimpleNamespace(prompt_token_ids=[index])} for index in range(3)
+    ]
+
+    assert value_model_utils.sample_gen_value_training_pairs(pairs, 3, random.Random(0)) == pairs
+    assert value_model_utils.sample_gen_value_training_pairs(pairs, 4, random.Random(0)) == pairs
+
+
+def test_sample_gen_value_training_pairs_rejects_nonpositive_target():
+    with pytest.raises(ValueError, match="must be positive"):
+        value_model_utils.sample_gen_value_training_pairs([], 0, random.Random(0))
+
+
+def test_sample_gen_value_training_pairs_keeps_shared_states_together():
+    pairs = [
+        {"identifier": index, "request_output": SimpleNamespace(prompt_token_ids=[index // 3])}
+        for index in range(30)
+    ]
+
+    sampled = value_model_utils.sample_gen_value_training_pairs(pairs, 8, random.Random(5))
+
+    selected_prompts = {tuple(pair["request_output"].prompt_token_ids) for pair in sampled}
+    assert sampled
+    for prompt_ids in selected_prompts:
+        expected_group = [pair for pair in pairs if tuple(pair["request_output"].prompt_token_ids) == prompt_ids]
+        actual_group = [pair for pair in sampled if tuple(pair["request_output"].prompt_token_ids) == prompt_ids]
+        assert actual_group == expected_group
 
 
 def test_gen_value_validation_targets_use_empirical_initial_and_sampled_prefix_returns():
