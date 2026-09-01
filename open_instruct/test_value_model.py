@@ -39,6 +39,7 @@ from open_instruct.rl_utils import (
     estimate_sae_terminal_credit_retention,
 )
 from open_instruct.value_model_utils import (
+    GenValueTrainingProgressState,
     accumulation_group_token_counts,
     add_observation_segment_boundaries,
     balanced_accumulation_group_ids,
@@ -71,6 +72,7 @@ from open_instruct.value_model_utils import (
     resolve_num_siblings_to_sample,
     reward_to_unit_value,
     segment_rollout,
+    select_fresh_gen_value_rollouts,
     select_gen_value_sft_traces,
     unique_replayed_gen_value_pairs,
     unit_value_to_reward,
@@ -98,6 +100,74 @@ class TestGenValueTrainingQueueCapacity(unittest.TestCase):
     def test_explicit_capacity_covers_inclusive_freshness_window(self):
         with self.assertRaisesRegex(ValueError, "at least the inclusive freshness window"):
             gen_value_training_queue_capacity(world_size=1, max_async_steps=2, capacity_steps=2)
+
+
+class TestFreshGenValueRolloutSelection(unittest.TestCase):
+    @staticmethod
+    def _rollout(identifier: str, policy_model_version: int, policy_training_step: int) -> dict:
+        return {
+            "id": identifier,
+            "policy_model_version": policy_model_version,
+            "policy_training_step": policy_training_step,
+        }
+
+    def test_selects_latest_versions_and_steps_then_partitions_stale_rollouts(self):
+        pending = [
+            self._rollout("old", 8, 8),
+            self._rollout("v9-old-step", 9, 9),
+            self._rollout("v10-old-step", 10, 10),
+            self._rollout("v10-new-step", 10, 11),
+            self._rollout("v9-new-step", 9, 12),
+        ]
+
+        selected, retained, stale = select_fresh_gen_value_rollouts(pending, batch_size=2, max_async_steps=1)
+
+        self.assertEqual([rollout["id"] for rollout in selected], ["v10-old-step", "v10-new-step"])
+        self.assertEqual([rollout["id"] for rollout in retained], ["v9-old-step", "v9-new-step"])
+        self.assertEqual([rollout["id"] for rollout in stale], ["old"])
+
+    def test_external_newest_version_discards_samples_outside_inclusive_window(self):
+        pending = [self._rollout("v8", 8, 8), self._rollout("v9", 9, 9)]
+
+        selected, retained, stale = select_fresh_gen_value_rollouts(
+            pending, batch_size=2, max_async_steps=1, newest_policy_model_version=10
+        )
+
+        self.assertEqual(selected, [])
+        self.assertEqual([rollout["id"] for rollout in retained], ["v9"])
+        self.assertEqual([rollout["id"] for rollout in stale], ["v8"])
+
+    def test_incomplete_fresh_batch_waits_without_losing_eligible_rollouts(self):
+        pending = [self._rollout("fresh", 10, 11), self._rollout("stale", 8, 8)]
+
+        selected, retained, stale = select_fresh_gen_value_rollouts(pending, batch_size=2, max_async_steps=1)
+
+        self.assertEqual(selected, [])
+        self.assertEqual([rollout["id"] for rollout in retained], ["fresh"])
+        self.assertEqual([rollout["id"] for rollout in stale], ["stale"])
+
+
+class TestGenValueTrainingProgressState(unittest.TestCase):
+    def test_newer_completed_steps_wait_for_older_steps_to_resolve(self):
+        progress = GenValueTrainingProgressState(latest_trained_policy_step=74, policy_world_size=2)
+        for step in (75, 76):
+            progress.register_admitted_policy_step(step, policy_rank=0, num_rollouts=2)
+            progress.register_admitted_policy_step(step, policy_rank=1, num_rollouts=2)
+
+        progress.record_trained_policy_steps([76, 76, 76, 76])
+
+        self.assertEqual(progress.get_latest_processed_policy_step(), 74)
+        progress.record_discarded_policy_steps([75, 75, 75, 75])
+        self.assertEqual(progress.get_latest_processed_policy_step(), 76)
+        self.assertEqual(
+            progress.get_rollout_accounting(),
+            {
+                "latest_processed_policy_step": 76,
+                "admitted_rollouts": 8,
+                "trained_rollouts": 4,
+                "discarded_rollouts": 4,
+            },
+        )
 
 
 def _packing_example(sequence_ids, generated_ids, rollout_logprobs, reward):
