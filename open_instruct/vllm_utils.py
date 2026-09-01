@@ -909,7 +909,10 @@ class LLMRayActor:
         """Batch simple completions using the same token-preserving output shape as policy rollouts."""
 
         async def _run():
-            extra_body = {"return_token_ids": True}
+            # Prefix-cache entries depend on model weights, but vLLM's block hash does not.
+            # Give every published model version its own cache namespace so requests scored
+            # by one version can share prefixes without reusing KV states after a weight update.
+            extra_body = {"return_token_ids": True, "cache_salt": f"model-step-{self.current_model_step}"}
             if include_stop_str_in_output:
                 extra_body["include_stop_str_in_output"] = True
             max_model_len = self.llm_engine.model_config.max_model_len

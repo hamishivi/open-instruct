@@ -121,6 +121,7 @@ class TestGenerateRequestOutputs(unittest.TestCase):
         actor.llm_engine = SimpleNamespace(model_config=SimpleNamespace(max_model_len=16), tokenizer=tokenizer)
         actor.model_name = "critic"
         actor.inference_batch_size = 1
+        actor.current_model_step = 17
         token_logprobs = [-0.1, -0.2, -0.3]
         output = SimpleNamespace(
             text="<answer>7</answer>",
@@ -162,7 +163,10 @@ class TestGenerateRequestOutputs(unittest.TestCase):
         self.assertEqual(tokenizer.add_special_tokens_calls, [True])
         self.assertEqual(kwargs["temperature"], 0.5)
         self.assertEqual(kwargs["logprobs"], 1)
-        self.assertEqual(kwargs["extra_body"], {"return_token_ids": True, "include_stop_str_in_output": True})
+        self.assertEqual(
+            kwargs["extra_body"],
+            {"return_token_ids": True, "cache_salt": "model-step-17", "include_stop_str_in_output": True},
+        )
 
     def test_limits_inflight_requests_to_policy_inference_batch_size(self):
         actor = object.__new__(vllm_utils.LLMRayActor)
@@ -170,6 +174,7 @@ class TestGenerateRequestOutputs(unittest.TestCase):
         actor.llm_engine = SimpleNamespace(model_config=SimpleNamespace(max_model_len=16), tokenizer=tokenizer)
         actor.model_name = "critic"
         actor.inference_batch_size = 2
+        actor.current_model_step = 3
         active_requests = 0
         max_active_requests = 0
 
@@ -200,6 +205,10 @@ class TestGenerateRequestOutputs(unittest.TestCase):
         self.assertEqual(max_active_requests, actor.inference_batch_size)
         self.assertEqual([len(output.prompt_token_ids) for output in request_outputs], [1, 2, 3, 4, 5])
         self.assertEqual([output.outputs[0].token_ids for output in request_outputs], [[1], [2], [3], [4], [5]])
+        self.assertEqual(
+            {call.kwargs["extra_body"]["cache_salt"] for call in actor.client.completions.create.await_args_list},
+            {"model-step-3"},
+        )
 
 
 class TestProcessFromQueue(unittest.TestCase):

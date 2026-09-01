@@ -126,18 +126,66 @@ def gen_value_policy_guard_active(min_advantage_gap: float | None, observed_adva
 
 
 def gen_value_training_queue_capacity(world_size: int, max_async_steps: int) -> int:
-    """Bound queued critic batches without tying them to actor rollout asynchrony.
+    """Hold the inclusive freshness window of learner shards.
 
-    Each learner enqueues one shard per policy step. A bounded Ray queue applies
-    backpressure to the learners once ``max_async_steps`` complete global batches
-    are waiting. The consumer still trains every enqueued batch; this is a
-    staleness bound, not the stale-result dropping used by policy generation.
+    Each learner enqueues one shard per policy step. If the newest source step is
+    ``N``, samples from ``N - max_async_steps`` are still admissible, so the queue
+    needs room for ``max_async_steps + 1`` complete policy batches. Producers evict
+    the oldest shard instead of blocking when this bound is reached.
     """
     if world_size <= 0:
         raise ValueError(f"world_size must be positive, got {world_size}.")
     if max_async_steps <= 0:
         raise ValueError(f"max_async_steps must be positive, got {max_async_steps}.")
-    return world_size * max_async_steps
+    return world_size * (max_async_steps + 1)
+
+
+def select_fresh_gen_value_rollouts(
+    pending_rollouts: list[dict], batch_size: int, max_async_steps: int
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Select one latest-first critic batch and partition stale rollouts.
+
+    Staleness is measured against the newest source-policy step currently
+    available to the consumer. Samples exactly ``max_async_steps`` behind remain
+    eligible; older samples are returned separately for explicit accounting.
+    When fewer than ``batch_size`` eligible samples are available, no partial
+    optimizer batch is returned.
+    """
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}.")
+    if max_async_steps <= 0:
+        raise ValueError(f"max_async_steps must be positive, got {max_async_steps}.")
+    if not pending_rollouts:
+        return [], [], []
+
+    try:
+        source_steps = [int(rollout["policy_training_step"]) for rollout in pending_rollouts]
+    except KeyError as exc:
+        raise ValueError("Every generative-critic rollout must include policy_training_step.") from exc
+    if any(source_step < 0 for source_step in source_steps):
+        raise ValueError(f"policy_training_step must be nonnegative, got {source_steps}.")
+
+    newest_source_step = max(source_steps)
+    oldest_admissible_step = newest_source_step - max_async_steps
+    stale_indices = {index for index, source_step in enumerate(source_steps) if source_step < oldest_admissible_step}
+    eligible_indices = [index for index in range(len(pending_rollouts)) if index not in stale_indices]
+    if len(eligible_indices) < batch_size:
+        return (
+            [],
+            [pending_rollouts[index] for index in eligible_indices],
+            [pending_rollouts[index] for index in range(len(pending_rollouts)) if index in stale_indices],
+        )
+
+    selected_indices = set(sorted(eligible_indices, key=lambda index: (-source_steps[index], index))[:batch_size])
+    return (
+        [pending_rollouts[index] for index in range(len(pending_rollouts)) if index in selected_indices],
+        [
+            pending_rollouts[index]
+            for index in range(len(pending_rollouts))
+            if index not in stale_indices and index not in selected_indices
+        ],
+        [pending_rollouts[index] for index in range(len(pending_rollouts)) if index in stale_indices],
+    )
 
 
 def gen_value_source_step_is_admissible(
@@ -154,30 +202,46 @@ def gen_value_source_step_is_admissible(
 
 
 class GenValueTrainingProgressState:
-    """Track when every critic rollout from a source-policy step has trained."""
+    """Track when every critic rollout from a source-policy step is resolved."""
 
     def __init__(self, latest_trained_policy_step: int, policy_world_size: int) -> None:
         if latest_trained_policy_step < 0:
             raise ValueError(f"latest_trained_policy_step must be nonnegative, got {latest_trained_policy_step}.")
         if policy_world_size <= 0:
             raise ValueError(f"policy_world_size must be positive, got {policy_world_size}.")
-        self._latest_trained_policy_step = int(latest_trained_policy_step)
+        self._latest_processed_policy_step = int(latest_trained_policy_step)
         self._policy_world_size = int(policy_world_size)
         self._admitted_rollouts: dict[int, int] = {}
         self._trained_rollouts: dict[int, int] = {}
+        self._discarded_rollouts: dict[int, int] = {}
         self._registered_ranks: dict[int, set[int]] = {}
+        self._total_admitted_rollouts = 0
+        self._total_trained_rollouts = 0
+        self._total_discarded_rollouts = 0
 
     def get_latest_trained_policy_step(self) -> int:
-        return self._latest_trained_policy_step
+        """Compatibility alias for the latest fully processed source step."""
+        return self._latest_processed_policy_step
+
+    def get_latest_processed_policy_step(self) -> int:
+        return self._latest_processed_policy_step
+
+    def get_rollout_accounting(self) -> dict[str, int]:
+        return {
+            "latest_processed_policy_step": self._latest_processed_policy_step,
+            "admitted_rollouts": self._total_admitted_rollouts,
+            "trained_rollouts": self._total_trained_rollouts,
+            "discarded_rollouts": self._total_discarded_rollouts,
+        }
 
     def register_admitted_policy_step(self, policy_training_step: int, policy_rank: int, num_rollouts: int) -> None:
         policy_training_step = int(policy_training_step)
         policy_rank = int(policy_rank)
         num_rollouts = int(num_rollouts)
-        if policy_training_step <= self._latest_trained_policy_step:
+        if policy_training_step <= self._latest_processed_policy_step:
             raise ValueError(
                 "Cannot admit a generative-critic source step that is already complete: "
-                f"latest={self._latest_trained_policy_step}, admitted={policy_training_step}."
+                f"latest={self._latest_processed_policy_step}, admitted={policy_training_step}."
             )
         if not 0 <= policy_rank < self._policy_world_size:
             raise ValueError(f"policy_rank must be in [0, {self._policy_world_size}), got {policy_rank}.")
@@ -192,30 +256,52 @@ class GenValueTrainingProgressState:
         self._admitted_rollouts[policy_training_step] = (
             self._admitted_rollouts.get(policy_training_step, 0) + num_rollouts
         )
+        self._total_admitted_rollouts += num_rollouts
         self._advance_completed_steps()
 
     def record_trained_policy_steps(self, policy_training_steps: list[int]) -> None:
         for policy_training_step in policy_training_steps:
             policy_training_step = int(policy_training_step)
-            if policy_training_step <= self._latest_trained_policy_step:
+            if policy_training_step <= self._latest_processed_policy_step:
                 raise ValueError(
                     "Cannot record critic training for a source step that is already complete: "
-                    f"latest={self._latest_trained_policy_step}, trained={policy_training_step}."
+                    f"latest={self._latest_processed_policy_step}, trained={policy_training_step}."
                 )
             self._trained_rollouts[policy_training_step] = self._trained_rollouts.get(policy_training_step, 0) + 1
+            self._total_trained_rollouts += 1
+        self._advance_completed_steps()
+
+    def record_discarded_policy_steps(self, policy_training_steps: list[int]) -> None:
+        """Resolve rollouts removed by latest-first queue eviction or stale filtering."""
+        for policy_training_step in policy_training_steps:
+            policy_training_step = int(policy_training_step)
+            if policy_training_step <= self._latest_processed_policy_step:
+                raise ValueError(
+                    "Cannot record critic discard for a source step that is already complete: "
+                    f"latest={self._latest_processed_policy_step}, discarded={policy_training_step}."
+                )
+            self._discarded_rollouts[policy_training_step] = self._discarded_rollouts.get(policy_training_step, 0) + 1
+            self._total_discarded_rollouts += 1
         self._advance_completed_steps()
 
     def _advance_completed_steps(self) -> None:
         while True:
-            next_step = self._latest_trained_policy_step + 1
+            next_step = self._latest_processed_policy_step + 1
             if len(self._registered_ranks.get(next_step, set())) < self._policy_world_size:
                 return
             admitted = self._admitted_rollouts.get(next_step, 0)
-            if self._trained_rollouts.get(next_step, 0) < admitted:
+            processed = self._trained_rollouts.get(next_step, 0) + self._discarded_rollouts.get(next_step, 0)
+            if processed < admitted:
                 return
-            self._latest_trained_policy_step = next_step
+            if processed > admitted:
+                raise RuntimeError(
+                    "Generative-critic rollout accounting exceeded admission: "
+                    f"step={next_step}, admitted={admitted}, processed={processed}."
+                )
+            self._latest_processed_policy_step = next_step
             self._admitted_rollouts.pop(next_step, None)
             self._trained_rollouts.pop(next_step, None)
+            self._discarded_rollouts.pop(next_step, None)
             self._registered_ranks.pop(next_step, None)
 
 

@@ -317,42 +317,34 @@ class PolicyTrainerRayProcess(RayProcess):
     def set_gen_value_version(self, version: int) -> None:
         self._gen_value_version = int(version)
 
-    def _wait_for_gen_value_generation(self, policy_training_step: int) -> tuple[int | None, int | None, float]:
-        """Apply critic backpressure before inference without discarding examples.
-
-        Before asking the generative critic to score this policy step, wait until
-        its source-policy step is within ``gen_value_max_async_steps`` of the latest
-        source step that the critic has finished training. This mirrors the policy
-        rollout window. Unlike policy importance-sampling staleness handling, no
-        completed critic example is discarded: the whole step waits before critic
-        generation, then every generated example is admitted for MSE training.
-        """
+    def _get_gen_value_processed_policy_step(self) -> int | None:
+        """Snapshot critic progress without blocking policy generation."""
         if self._gen_value_training_progress is None:
-            return None, None, 0.0
+            return None
+        return int(ray.get(self._gen_value_training_progress.get_latest_processed_policy_step.remote()))
 
-        max_async_steps = int(self.args.gen_value_max_async_steps)
-        started_at = time.perf_counter()
-        latest_trained_step = int(ray.get(self._gen_value_training_progress.get_latest_trained_policy_step.remote()))
-        initial_latest_trained_step = latest_trained_step
-        last_log_time = started_at
-        while not value_model_utils.gen_value_source_step_is_admissible(
-            policy_training_step, latest_trained_step, max_async_steps
-        ):
-            now = time.perf_counter()
-            if now - last_log_time >= 60.0:
-                logger.info(
-                    "[GenValue] Policy step %d is waiting before critic generation for training at "
-                    "source-policy step %d (max async steps=%d); no critic examples will be discarded.",
-                    policy_training_step,
-                    latest_trained_step,
-                    max_async_steps,
-                )
-                last_log_time = now
-            time.sleep(0.1)
-            latest_trained_step = int(
-                ray.get(self._gen_value_training_progress.get_latest_trained_policy_step.remote())
-            )
-        return initial_latest_trained_step, latest_trained_step, time.perf_counter() - started_at
+    def _enqueue_gen_value_rollouts_latest(self, rollouts: list[dict]) -> list[dict]:
+        """Enqueue without policy backpressure, evicting oldest queued shards."""
+        if self._gen_value_training_queue is None:
+            return []
+
+        evicted_rollouts: list[dict] = []
+        while True:
+            try:
+                self._gen_value_training_queue.put(rollouts, block=False)
+                break
+            except Full:
+                try:
+                    evicted_rollouts.extend(self._gen_value_training_queue.get(block=False))
+                except Empty:
+                    # Another learner or the critic consumer won the race for the
+                    # oldest item. Retry the nonblocking put against fresh state.
+                    continue
+
+        if evicted_rollouts and self._gen_value_training_progress is not None:
+            evicted_policy_steps = [int(rollout["policy_training_step"]) for rollout in evicted_rollouts]
+            ray.get(self._gen_value_training_progress.record_discarded_policy_steps.remote(evicted_policy_steps))
+        return evicted_rollouts
 
     def _update_gen_value_icc_success_rate(self, data_BT: data_types.CollatedBatchData) -> tuple[float, float]:
         """Update the globally consistent EMA used to policy-condition the generative critic."""
@@ -2150,24 +2142,13 @@ class PolicyTrainerRayProcess(RayProcess):
         # the value function for GAE instead of the scalar value head.
         _gen_value_training_rollouts: list[dict] = []
         if _use_gen_value and self._gen_value_training_queue is not None:
-            (latest_trained_before_generation, latest_trained_at_generation, generation_backpressure_seconds) = (
-                self._wait_for_gen_value_generation(training_step)
-            )
-            sae_step_metrics["gen_value/generation_backpressure_seconds"] = generation_backpressure_seconds
-            # Keep the original metric as a compatibility alias for existing
-            # dashboards while making its pre-inference meaning explicit above.
-            sae_step_metrics["gen_value/staleness_backpressure_seconds"] = generation_backpressure_seconds
-            if latest_trained_before_generation is not None:
-                sae_step_metrics["gen_value/latest_trained_before_generation"] = float(
-                    latest_trained_before_generation
-                )
+            latest_processed_step = self._get_gen_value_processed_policy_step()
+            sae_step_metrics["gen_value/generation_backpressure_seconds"] = 0.0
+            sae_step_metrics["gen_value/staleness_backpressure_seconds"] = 0.0
+            if latest_processed_step is not None:
+                sae_step_metrics["gen_value/latest_processed_before_generation"] = float(latest_processed_step)
                 sae_step_metrics["gen_value/source_step_lag_before_generation"] = float(
-                    max(training_step - latest_trained_before_generation, 0)
-                )
-            if latest_trained_at_generation is not None:
-                sae_step_metrics["gen_value/latest_trained_at_generation"] = float(latest_trained_at_generation)
-                sae_step_metrics["gen_value/source_step_lag_at_generation"] = float(
-                    max(training_step - latest_trained_at_generation, 0)
+                    max(training_step - latest_processed_step, 0)
                 )
 
         if _use_gen_value and bool(getattr(self.args, "gen_value_use_icc", False)):
@@ -2586,8 +2567,9 @@ class PolicyTrainerRayProcess(RayProcess):
                 sae_step_metrics["value/separation_early_to_late_delta"] = (
                     progress_deltas["correct"] - progress_deltas["incorrect"]
                 )
-            # Pipe complete rollouts to the independent critic loop. The bounded
-            # queue provides backpressure instead of silently dropping critic data.
+            # Pipe complete rollouts to the independent critic loop. This is a
+            # latest-wins queue: policy training never waits for critic training,
+            # and the oldest queued shard is explicitly discarded under pressure.
             if _use_gen_value and self._gen_value_training_queue is not None:
                 if _gen_value_training_rollouts:
                     sae_step_metrics.update(
@@ -2600,13 +2582,18 @@ class PolicyTrainerRayProcess(RayProcess):
                         )
                     )
                 critic_enqueue_started_at = time.perf_counter()
-                self._gen_value_training_queue.put(_gen_value_training_rollouts)
+                evicted_rollouts = self._enqueue_gen_value_rollouts_latest(_gen_value_training_rollouts)
                 sae_step_metrics["gen_value/training_queue_backpressure_seconds"] = (
                     time.perf_counter() - critic_enqueue_started_at
                 )
                 sae_step_metrics["gen_value/max_async_steps"] = float(self.args.gen_value_max_async_steps)
                 self._gen_value_latest_enqueued_policy_training_step = training_step
                 sae_step_metrics["gen_value/enqueued_rollouts"] = float(len(_gen_value_training_rollouts))
+                sae_step_metrics["gen_value/queue_evicted_rollouts"] = float(len(evicted_rollouts))
+                if evicted_rollouts:
+                    evicted_steps = [int(rollout["policy_training_step"]) for rollout in evicted_rollouts]
+                    sae_step_metrics["gen_value/queue_evicted_source_step_min"] = float(min(evicted_steps))
+                    sae_step_metrics["gen_value/queue_evicted_source_step_max"] = float(max(evicted_steps))
                 sae_step_metrics["gen_value/training_queue_size"] = float(self._gen_value_training_queue.qsize())
             if self._gen_value_latest_enqueued_policy_training_step is not None:
                 sae_step_metrics["gen_value/latest_enqueued_policy_training_step"] = float(

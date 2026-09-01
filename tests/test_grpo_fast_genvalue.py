@@ -362,47 +362,43 @@ def test_critic_pool_shards_round_robin_and_restores_request_order(monkeypatch):
     assert {pair["critic_version"] for _, pairs in results for pair in pairs} == {11}
 
 
-def test_gen_value_generation_waits_for_critic_source_step(monkeypatch):
+def test_gen_value_generation_progress_snapshot_does_not_wait(monkeypatch):
     trainer_cls = grpo_fast.PolicyTrainerRayProcess.__ray_metadata__.modified_class
     trainer = object.__new__(trainer_cls)
-    trainer.args = SimpleNamespace(gen_value_max_async_steps=1)
-
-    class RemoteMethod:
-        def __init__(self, values):
-            self._values = iter(values)
-
-        def remote(self):
-            return next(self._values)
-
-    trainer._gen_value_training_progress = SimpleNamespace(
-        get_latest_trained_policy_step=RemoteMethod([0, 1])
-    )
-    monkeypatch.setattr(grpo_fast.ray, "get", lambda value: value)
-    monkeypatch.setattr(grpo_fast.time, "sleep", lambda _: None)
-
-    before, after, wait_seconds = trainer._wait_for_gen_value_generation(policy_training_step=2)
-
-    assert before == 0
-    assert after == 1
-    assert wait_seconds >= 0.0
-
-
-def test_gen_value_generation_does_not_wait_within_window(monkeypatch):
-    trainer_cls = grpo_fast.PolicyTrainerRayProcess.__ray_metadata__.modified_class
-    trainer = object.__new__(trainer_cls)
-    trainer.args = SimpleNamespace(gen_value_max_async_steps=1)
 
     class RemoteMethod:
         def remote(self):
             return 4
 
-    trainer._gen_value_training_progress = SimpleNamespace(get_latest_trained_policy_step=RemoteMethod())
+    trainer._gen_value_training_progress = SimpleNamespace(
+        get_latest_processed_policy_step=RemoteMethod()
+    )
     monkeypatch.setattr(grpo_fast.ray, "get", lambda value: value)
 
-    before, after, _ = trainer._wait_for_gen_value_generation(policy_training_step=5)
+    assert trainer._get_gen_value_processed_policy_step() == 4
 
-    assert before == 4
-    assert after == 4
+
+def test_gen_value_latest_enqueue_evicts_oldest_shard_and_records_discard(monkeypatch):
+    trainer_cls = grpo_fast.PolicyTrainerRayProcess.__ray_metadata__.modified_class
+    trainer = object.__new__(trainer_cls)
+    trainer._gen_value_training_queue = Queue(maxsize=1)
+    old_rollouts = [{"policy_training_step": 7, "identifier": "old"}]
+    new_rollouts = [{"policy_training_step": 9, "identifier": "new"}]
+    trainer._gen_value_training_queue.put(old_rollouts)
+    discarded_steps: list[int] = []
+
+    class RemoteMethod:
+        def remote(self, policy_steps):
+            discarded_steps.extend(policy_steps)
+
+    trainer._gen_value_training_progress = SimpleNamespace(record_discarded_policy_steps=RemoteMethod())
+    monkeypatch.setattr(grpo_fast.ray, "get", lambda value: value)
+
+    evicted = trainer._enqueue_gen_value_rollouts_latest(new_rollouts)
+
+    assert evicted == old_rollouts
+    assert trainer._gen_value_training_queue.get(block=False) == new_rollouts
+    assert discarded_steps == [7]
 
 
 def test_gen_value_publish_barrier_releases_after_serving_version_advances():

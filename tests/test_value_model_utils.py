@@ -277,7 +277,7 @@ def test_gen_value_policy_guard_rejects_invalid_threshold():
         value_model_utils.gen_value_policy_guard_active(-0.1, 0.3)
 
 
-@pytest.mark.parametrize(("world_size", "max_async_steps", "expected"), [(1, 1, 1), (4, 1, 4), (2, 3, 6)])
+@pytest.mark.parametrize(("world_size", "max_async_steps", "expected"), [(1, 1, 2), (4, 1, 8), (2, 3, 8)])
 def test_gen_value_training_queue_capacity(world_size: int, max_async_steps: int, expected: int):
     assert value_model_utils.gen_value_training_queue_capacity(world_size, max_async_steps) == expected
 
@@ -311,6 +311,49 @@ def test_gen_value_source_step_admission_rejects_invalid_values(
         value_model_utils.gen_value_source_step_is_admissible(policy_step, latest_trained_step, max_async_steps)
 
 
+def _rollouts_for_steps(*source_steps: int) -> list[dict]:
+    return [
+        {"policy_training_step": source_step, "identifier": index}
+        for index, source_step in enumerate(source_steps)
+    ]
+
+
+def test_select_fresh_gen_value_rollouts_prefers_newest_and_discards_outside_window():
+    pending = _rollouts_for_steps(8, 9, 10, 10, 9)
+
+    selected, retained, stale = value_model_utils.select_fresh_gen_value_rollouts(
+        pending, batch_size=2, max_async_steps=1
+    )
+
+    assert [rollout["identifier"] for rollout in selected] == [2, 3]
+    assert [rollout["identifier"] for rollout in retained] == [1, 4]
+    assert [rollout["identifier"] for rollout in stale] == [0]
+
+
+def test_select_fresh_gen_value_rollouts_keeps_inclusive_async_boundary():
+    pending = _rollouts_for_steps(8, 9, 10)
+
+    selected, retained, stale = value_model_utils.select_fresh_gen_value_rollouts(
+        pending, batch_size=4, max_async_steps=2
+    )
+
+    assert selected == []
+    assert retained == pending
+    assert stale == []
+
+
+def test_select_fresh_gen_value_rollouts_discards_stale_without_partial_batch():
+    pending = _rollouts_for_steps(7, 8, 10)
+
+    selected, retained, stale = value_model_utils.select_fresh_gen_value_rollouts(
+        pending, batch_size=3, max_async_steps=1
+    )
+
+    assert selected == []
+    assert [rollout["policy_training_step"] for rollout in retained] == [10]
+    assert [rollout["policy_training_step"] for rollout in stale] == [7, 8]
+
+
 def test_gen_value_training_progress_waits_for_all_admitted_rollouts():
     progress = value_model_utils.GenValueTrainingProgressState(latest_trained_policy_step=3, policy_world_size=2)
 
@@ -321,6 +364,25 @@ def test_gen_value_training_progress_waits_for_all_admitted_rollouts():
 
     progress.record_trained_policy_steps([4])
     assert progress.get_latest_trained_policy_step() == 4
+
+
+def test_gen_value_training_progress_counts_trained_and_discarded_rollouts():
+    progress = value_model_utils.GenValueTrainingProgressState(latest_trained_policy_step=3, policy_world_size=2)
+
+    progress.register_admitted_policy_step(policy_training_step=4, policy_rank=0, num_rollouts=2)
+    progress.register_admitted_policy_step(policy_training_step=4, policy_rank=1, num_rollouts=1)
+    progress.record_trained_policy_steps([4])
+    progress.record_discarded_policy_steps([4])
+    assert progress.get_latest_processed_policy_step() == 3
+
+    progress.record_discarded_policy_steps([4])
+    assert progress.get_latest_processed_policy_step() == 4
+    assert progress.get_rollout_accounting() == {
+        "latest_processed_policy_step": 4,
+        "admitted_rollouts": 3,
+        "trained_rollouts": 1,
+        "discarded_rollouts": 2,
+    }
 
 
 def test_gen_value_training_progress_handles_training_before_registration():

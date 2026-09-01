@@ -57,7 +57,6 @@ import queue as queue_lib
 import random
 import threading
 import time
-from collections import deque
 from collections.abc import Callable
 from concurrent import futures
 from dataclasses import dataclass
@@ -804,11 +803,10 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
     # Independent critic update cadence. The default critic batch contains the same
     # number of complete rollouts as one global policy batch, irrespective of policy world size.
     gen_value_batch_size: int | None = None
-    # Maximum number of complete policy batches that may wait for critic training.
-    # This is intentionally independent of the policy rollout pipeline's async_steps:
-    # actor generation can be usefully asynchronous without allowing critic training
-    # data to become equally stale. Enqueue blocks at this limit; unlike policy
-    # generation, no stale critic batch is discarded.
+    # Maximum source-policy lag retained for critic training. This is intentionally
+    # independent of the policy rollout pipeline's async_steps: enqueue never
+    # blocks policy training, the consumer prefers the freshest available
+    # policy-sized batch, and samples more than this many steps stale are discarded.
     gen_value_max_async_steps: int = 1
     # Conditioning for the gen-value prompt: one of none, gt, correct_demo, rollout_context.
     gen_value_conditioning: str = "none"
@@ -1339,6 +1337,7 @@ def _gen_value_reinforce_loop(
     training_queue: ray_queue.Queue,
     training_progress: Any,
     batch_size: int,
+    max_async_steps: int,
     stop_event: threading.Event,
     metrics_Q: Queue,
     progress_state: dict[str, Any],
@@ -1354,15 +1353,21 @@ def _gen_value_reinforce_loop(
     sync_freq: int,
     publish_complete_event: threading.Event,
 ) -> None:
-    """Pipe queued rollouts into fixed-size critic batches and update asynchronously."""
-    logger.info("[GenValue] asynchronous critic trainer started.")
-    pending_rollouts: deque[dict[str, Any]] = deque()
+    """Continuously train policy-sized, latest-first critic batches."""
+    logger.info(
+        "[GenValue] latest-first asynchronous critic trainer started (batch_size=%d, max_async_steps=%d).",
+        batch_size,
+        max_async_steps,
+    )
+    pending_rollouts: list[dict[str, Any]] = []
     admitted_rollouts = 0
     trained_rollouts = 0
+    discarded_stale_rollouts = 0
+    discarded_since_update = 0
 
     while True:
         try:
-            published_rollouts = training_queue.get(timeout=0.1)
+            published_shards = [training_queue.get(timeout=0.1)]
         except queue_lib.Empty:
             if stop_event.is_set():
                 break
@@ -1370,11 +1375,49 @@ def _gen_value_reinforce_loop(
                 progress_state["training_queue_size"] = training_queue.qsize()
                 progress_state["pending_rollouts"] = len(pending_rollouts)
             continue
-        pending_rollouts.extend(published_rollouts)
-        admitted_rollouts += len(published_rollouts)
+        # Drain everything that arrived during the preceding optimizer step, then
+        # select against the freshest source-policy step currently visible.
+        while True:
+            try:
+                published_shards.append(training_queue.get(block=False))
+            except queue_lib.Empty:
+                break
+        for published_rollouts in published_shards:
+            pending_rollouts.extend(published_rollouts)
+            admitted_rollouts += len(published_rollouts)
 
-        while len(pending_rollouts) >= batch_size:
-            rollouts = [pending_rollouts.popleft() for _ in range(batch_size)]
+        while pending_rollouts:
+            # An optimizer step and its publication barrier can take longer than
+            # policy generation. Re-drain before every selection so an old local
+            # remainder never wins over newly available policy rollouts.
+            while True:
+                try:
+                    published_rollouts = training_queue.get(block=False)
+                except queue_lib.Empty:
+                    break
+                pending_rollouts.extend(published_rollouts)
+                admitted_rollouts += len(published_rollouts)
+            available_source_steps = [int(rollout["policy_training_step"]) for rollout in pending_rollouts]
+            newest_available_source_step = max(available_source_steps)
+            rollouts, pending_rollouts, stale_rollouts = value_model_utils.select_fresh_gen_value_rollouts(
+                pending_rollouts, batch_size, max_async_steps
+            )
+            if stale_rollouts:
+                stale_policy_steps = [int(rollout["policy_training_step"]) for rollout in stale_rollouts]
+                ray.get(training_progress.record_discarded_policy_steps.remote(stale_policy_steps))
+                discarded_stale_rollouts += len(stale_rollouts)
+                discarded_since_update += len(stale_rollouts)
+                logger.info(
+                    "[GenValue] discarded %d stale critic rollout(s) from source steps %d..%d; "
+                    "newest available step=%d, max async steps=%d.",
+                    len(stale_rollouts),
+                    min(stale_policy_steps),
+                    max(stale_policy_steps),
+                    newest_available_source_step,
+                    max_async_steps,
+                )
+            if not rollouts:
+                break
             trained_rollouts += len(rollouts)
 
             capture_metrics: dict[str, float] = {}
@@ -1479,10 +1522,9 @@ def _gen_value_reinforce_loop(
                 progress_state["pending_rollouts"] = len(pending_rollouts)
                 progress_state["admitted_rollouts"] = admitted_rollouts
                 progress_state["trained_rollouts"] = trained_rollouts
-            # Advance source-policy progress only after the optimizer step
-            # succeeds. The progress actor knows exactly how many rollouts every
-            # learner admitted for each source step, so partial and mixed-source
-            # critic batches cannot release generation prematurely.
+                progress_state["discarded_stale_rollouts"] = discarded_stale_rollouts
+            # Resolve selected rollouts only after the optimizer succeeds. Stale
+            # and queue-evicted rollouts are resolved through the discard path.
             ray.get(training_progress.record_trained_policy_steps.remote(policy_training_steps))
             metrics.update(
                 {
@@ -1490,6 +1532,13 @@ def _gen_value_reinforce_loop(
                     "gen_value/source_policy_training_step_max": max(policy_training_steps),
                     "gen_value/source_policy_training_step_spread": max(policy_training_steps)
                     - min(policy_training_steps),
+                    "gen_value/newest_available_source_policy_step": newest_available_source_step,
+                    "gen_value/source_policy_lag_min": max(
+                        newest_available_source_step - max(policy_training_steps), 0
+                    ),
+                    "gen_value/source_policy_lag_max": max(
+                        newest_available_source_step - min(policy_training_steps), 0
+                    ),
                     "gen_value/source_value_version_min": min(source_versions),
                     "gen_value/source_value_version_max": max(source_versions),
                     "gen_value/source_value_version_spread": max(source_versions) - min(source_versions),
@@ -1505,6 +1554,8 @@ def _gen_value_reinforce_loop(
                     "gen_value/pending_rollouts": len(pending_rollouts),
                     "gen_value/admitted_rollouts": admitted_rollouts,
                     "gen_value/trained_rollouts": trained_rollouts,
+                    "gen_value/discarded_stale_rollouts": discarded_stale_rollouts,
+                    "gen_value/discarded_stale_rollouts_since_update": discarded_since_update,
                     "gen_value/synced_version": synced_version,
                     "gen_value/serving_version_lag": max(critic_version - synced_version, 0),
                 }
@@ -1519,11 +1570,19 @@ def _gen_value_reinforce_loop(
             _put_gen_value_metrics(
                 metrics_Q, {"gen_value/publish_barrier_seconds": publish_barrier_seconds}, "publication"
             )
+            discarded_since_update = 0
             logger.debug("[GenValue] REINFORCE step: %s", metrics)
 
+    if pending_rollouts:
+        pending_policy_steps = [int(rollout["policy_training_step"]) for rollout in pending_rollouts]
+        ray.get(training_progress.record_discarded_policy_steps.remote(pending_policy_steps))
+        discarded_stale_rollouts += len(pending_rollouts)
+        logger.info("[GenValue] discarded %d incomplete-batch rollout(s) during shutdown.", len(pending_rollouts))
+        pending_rollouts = []
     with progress_lock:
         progress_state["training_queue_size"] = training_queue.qsize()
         progress_state["pending_rollouts"] = len(pending_rollouts)
+        progress_state["discarded_stale_rollouts"] = discarded_stale_rollouts
     logger.info("[GenValue] asynchronous critic trainer stopped.")
 
 
@@ -1833,7 +1892,7 @@ def main():
             gen_value_model_path,
             gen_value_model_revision,
             args.seed,
-            False,  # no prefix caching for value scoring
+            vllm_config.vllm_enable_prefix_caching,
             args.gen_value_max_model_len,
             vllm_config.vllm_gpu_memory_utilization,
             False,  # gen-value pool never shares GPU with learners
@@ -1883,11 +1942,12 @@ def main():
         )
         logger.info(
             "======== ✅ Gen-value vLLM pool ready (%d engine(s), model=%s, max_model_len=%d, "
-            "train_pack_length=%d) =========",
+            "train_pack_length=%d, prefix_caching=%s) =========",
             len(gen_value_vllm_engines),
             gen_value_model_path,
             gen_value_max_model_len,
             gen_value_train_pack_length,
+            vllm_config.vllm_enable_prefix_caching,
         )
     else:
         logger.warning(
@@ -2022,7 +2082,7 @@ def main():
         )
         logger.info(
             "Gen-value injection wired: %d engine(s), critic batch=%d, queue capacity=%d "
-            "(max async critic steps=%d; stale batches retained) → %d policy actor(s).",
+            "(max async critic steps=%d; latest-first with stale eviction) → %d policy actor(s).",
             len(gen_value_vllm_engines),
             gen_value_batch_size,
             queue_capacity,
@@ -2047,6 +2107,7 @@ def main():
         "pending_rollouts": 0,
         "admitted_rollouts": 0,
         "trained_rollouts": 0,
+        "discarded_stale_rollouts": 0,
         "pending_publish_version": None,
     }
     gen_value_validation_lock = threading.Lock()
@@ -2083,6 +2144,7 @@ def main():
             gen_value_training_queue,
             gen_value_training_progress,
             gen_value_batch_size,
+            args.gen_value_max_async_steps,
             gen_value_stop_event,
             gen_value_metrics_Q,
             gen_value_progress_state,
@@ -2192,6 +2254,7 @@ def main():
                 with gen_value_progress_lock:
                     trainer_progress = dict(gen_value_progress_state)
                 synced_version = int(trainer_progress["synced_version"])
+                rollout_accounting = ray.get(gen_value_training_progress.get_rollout_accounting.remote())
 
                 progress_metrics.update(
                     {
@@ -2204,6 +2267,13 @@ def main():
                         "gen_value/pending_rollouts": trainer_progress["pending_rollouts"],
                         "gen_value/admitted_rollouts": trainer_progress["admitted_rollouts"],
                         "gen_value/trained_rollouts": trainer_progress["trained_rollouts"],
+                        "gen_value/discarded_stale_rollouts": trainer_progress["discarded_stale_rollouts"],
+                        "gen_value/total_admitted_rollouts": rollout_accounting["admitted_rollouts"],
+                        "gen_value/total_trained_rollouts": rollout_accounting["trained_rollouts"],
+                        "gen_value/total_discarded_rollouts": rollout_accounting["discarded_rollouts"],
+                        "gen_value/latest_processed_policy_training_step": rollout_accounting[
+                            "latest_processed_policy_step"
+                        ],
                     }
                 )
                 pending_publish_version = trainer_progress["pending_publish_version"]
