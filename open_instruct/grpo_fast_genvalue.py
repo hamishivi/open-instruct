@@ -267,22 +267,39 @@ class GenValueTrainerActor:
     def _load_checkpoint(self, checkpoint_path: str, checkpoint_tag: str | None) -> None:
         if checkpoint_tag is None:
             raise ValueError("Generative-value DeepSpeed checkpoints require an explicit checkpoint tag.")
+        optimizer_state_available = value_model_utils.gen_value_checkpoint_has_optimizer_state(
+            checkpoint_path, checkpoint_tag
+        )
+        if not optimizer_state_available:
+            # Stage-0 BF16 checkpoints written before the critic switched to ZeRO-1
+            # contain model weights and client state but no optimizer shard. Asking a
+            # ZeRO-1 engine to load optimizer state from that layout fails inside
+            # DeepSpeed before it can fall back to the loaded BF16 weights. Load the
+            # module only instead; DeepSpeed then rebuilds the FP32 masters from those
+            # weights and intentionally starts Adam from a clean state.
+            logger.warning(
+                "[GenValue] Checkpoint %s/%s has no optimizer-state shard; loading model weights and "
+                "cold-starting the critic optimizer.",
+                checkpoint_path,
+                checkpoint_tag,
+            )
         loaded_path, client_state = self._model.load_checkpoint(
             checkpoint_path,
             tag=checkpoint_tag,
             load_module_strict=True,
-            load_optimizer_states=True,
+            load_optimizer_states=optimizer_state_available,
             load_lr_scheduler_states=False,
-            load_module_only=False,
+            load_module_only=not optimizer_state_available,
         )
         if loaded_path is None:
             raise ValueError(f"Failed to load generative-value DeepSpeed checkpoint from {checkpoint_path}.")
         self._step_count = int(client_state.get("gen_value_version", client_state.get("reinforce_steps", 0)))
         logger.info(
-            "[GenValue] Restored trainer checkpoint %s/%s at critic version %d.",
+            "[GenValue] Restored trainer checkpoint %s/%s at critic version %d (optimizer_state=%s).",
             checkpoint_path,
             checkpoint_tag,
             self._step_count,
+            "restored" if optimizer_state_available else "cold_start",
         )
 
     def save_checkpoint(self, checkpoint_state_dir: str, policy_step: int) -> dict[str, Any]:

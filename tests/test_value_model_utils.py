@@ -124,6 +124,23 @@ def test_gen_value_validation_requires_both_sampled_outcome_classes_before_captu
     assert value_model_utils.gen_value_validation_has_both_sampled_outcomes(mixed)
 
 
+def test_gen_value_checkpoint_detects_legacy_weights_only_layout(tmp_path):
+    checkpoint_dir = tmp_path / "global_step75"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "mp_rank_00_model_states.pt").touch()
+
+    assert not value_model_utils.gen_value_checkpoint_has_optimizer_state(str(tmp_path), "global_step75")
+
+
+def test_gen_value_checkpoint_detects_zero_optimizer_shard(tmp_path):
+    checkpoint_dir = tmp_path / "global_step100"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "mp_rank_00_model_states.pt").touch()
+    (checkpoint_dir / "bf16_zero_pp_rank_0_mp_rank_00_optim_states.pt").touch()
+
+    assert value_model_utils.gen_value_checkpoint_has_optimizer_state(str(tmp_path), "global_step100")
+
+
 def test_final_action_replay_does_not_distort_leave_one_out_baseline():
     first = {"state_kind": "final_action"}
     second = {"state_kind": "segment_start"}

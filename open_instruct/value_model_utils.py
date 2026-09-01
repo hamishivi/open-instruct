@@ -1014,6 +1014,12 @@ def gen_value_validation_has_both_sampled_outcomes(examples: Sequence[dict[str, 
     return sampled_outcomes == {False, True}
 
 
+def gen_value_checkpoint_has_optimizer_state(checkpoint_path: str, checkpoint_tag: str) -> bool:
+    """Whether a DeepSpeed critic checkpoint contains a separate optimizer shard."""
+    checkpoint_dir = pathlib.Path(checkpoint_path) / checkpoint_tag
+    return any(checkpoint_dir.glob("*optim_states.pt"))
+
+
 def gen_value_validation_metrics(
     examples: list[dict[str, Any]], predictions: Sequence[float | None]
 ) -> dict[str, float]:
