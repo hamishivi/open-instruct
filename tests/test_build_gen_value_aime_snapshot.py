@@ -42,6 +42,7 @@ def test_aime_snapshot_covers_every_problem_and_balances_available_outcomes():
     assert sum(example["target"] == 1.0 for example in sampled) == 4
     assert sum(example["target"] == 0.0 for example in sampled) == 8
     assert {example["trajectory_fraction"] for example in sampled} == {0.25, 0.5, 0.75, 1.0}
+    assert {example["response_tokens_used"] for example in sampled if example["kind"] == "final_action"} == {39}
     assert all("The active actor is actor." in example["prompt"] for example in examples)
     assert all("25.0%" in example["prompt"] for example in examples)
 

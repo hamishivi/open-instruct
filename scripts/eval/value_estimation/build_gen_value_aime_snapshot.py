@@ -168,20 +168,27 @@ def build_aime_validation_examples(
             ]
             if not response_token_ids:
                 continue
-            final_token_count = len(response_token_ids)
+            # Online GenAC's final-action state is causal: it is immediately before
+            # the last sampled response token, not after observing termination. Match
+            # that exact definition here so the sampled terminal return remains an
+            # unbiased target for V(s) under the actor's final-action distribution.
+            final_response_tokens_used = max(len(response_token_ids) - 1, 0)
             state_specs: list[tuple[int, float, str]] = []
             seen_prefix_lengths: set[int] = set()
             for fraction in (0.25, 0.5, 0.75):
-                prefix_length = max(1, min(final_token_count, round(final_token_count * fraction)))
+                prefix_length = max(
+                    0,
+                    min(final_response_tokens_used, round(final_response_tokens_used * fraction)),
+                )
                 if prefix_length in seen_prefix_lengths:
                     continue
                 seen_prefix_lengths.add(prefix_length)
                 state_specs.append((prefix_length, fraction, "segment_start"))
-            state_specs.append((final_token_count, 1.0, "final_action"))
+            state_specs.append((final_response_tokens_used, 1.0, "final_action"))
 
             for response_tokens_used, trajectory_fraction, kind in state_specs:
                 partial_response = tokenizer.decode(
-                    response_token_ids[:response_tokens_used], skip_special_tokens=True
+                    response_token_ids[:response_tokens_used], skip_special_tokens=False
                 )
                 examples.append(
                     {
