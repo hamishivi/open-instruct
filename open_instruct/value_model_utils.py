@@ -22,7 +22,8 @@ import math
 import pathlib
 import random
 import re
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from typing import Any, overload
 
 import torch
@@ -231,6 +232,42 @@ def gen_value_source_step_is_admissible(
     return policy_training_step - latest_trained_policy_step <= max_async_steps
 
 
+def wait_for_gen_value_source_window(
+    get_latest_trained_policy_step: Callable[[], int],
+    policy_training_step: int,
+    max_async_steps: int,
+    timeout_s: float,
+    poll_interval_s: float = 1.0,
+) -> tuple[int, float]:
+    """Wait until policy execution is within the critic's trained-source window.
+
+    Queue freshness alone does not prevent policy execution from outrunning critic
+    optimization: a latest-first queue can keep discarding old batches while the
+    critic remains several policy steps behind. This barrier bounds that lag using
+    the newest source-policy step that completed an optimizer update. It does not
+    require every rollout from older steps to be retained or trained.
+    """
+    if timeout_s <= 0.0:
+        raise ValueError(f"timeout_s must be positive, got {timeout_s}.")
+    if poll_interval_s < 0.0:
+        raise ValueError(f"poll_interval_s must be nonnegative, got {poll_interval_s}.")
+
+    started_at = time.perf_counter()
+    while True:
+        latest_trained_policy_step = int(get_latest_trained_policy_step())
+        if gen_value_source_step_is_admissible(policy_training_step, latest_trained_policy_step, max_async_steps):
+            return latest_trained_policy_step, time.perf_counter() - started_at
+        elapsed_s = time.perf_counter() - started_at
+        if elapsed_s >= timeout_s:
+            raise TimeoutError(
+                "Timed out waiting for generative critic freshness: "
+                f"policy_training_step={policy_training_step}, "
+                f"latest_trained_policy_step={latest_trained_policy_step}, "
+                f"max_async_steps={max_async_steps}, timeout_s={timeout_s}."
+            )
+        time.sleep(min(poll_interval_s, max(timeout_s - elapsed_s, 0.0)))
+
+
 class GenValueTrainingProgressState:
     """Track when every critic rollout from a source-policy step is resolved."""
 
@@ -240,6 +277,7 @@ class GenValueTrainingProgressState:
         if policy_world_size <= 0:
             raise ValueError(f"policy_world_size must be positive, got {policy_world_size}.")
         self._latest_processed_policy_step = int(latest_trained_policy_step)
+        self._latest_trained_policy_step = int(latest_trained_policy_step)
         self._policy_world_size = int(policy_world_size)
         self._admitted_rollouts: dict[int, int] = {}
         self._trained_rollouts: dict[int, int] = {}
@@ -250,8 +288,8 @@ class GenValueTrainingProgressState:
         self._total_discarded_rollouts = 0
 
     def get_latest_trained_policy_step(self) -> int:
-        """Compatibility alias for the latest fully processed source step."""
-        return self._latest_processed_policy_step
+        """Return the newest source-policy step used by a completed critic update."""
+        return self._latest_trained_policy_step
 
     def get_latest_processed_policy_step(self) -> int:
         return self._latest_processed_policy_step
@@ -259,6 +297,7 @@ class GenValueTrainingProgressState:
     def get_rollout_accounting(self) -> dict[str, int]:
         return {
             "latest_processed_policy_step": self._latest_processed_policy_step,
+            "latest_trained_policy_step": self._latest_trained_policy_step,
             "admitted_rollouts": self._total_admitted_rollouts,
             "trained_rollouts": self._total_trained_rollouts,
             "discarded_rollouts": self._total_discarded_rollouts,
@@ -299,6 +338,7 @@ class GenValueTrainingProgressState:
                 )
             self._trained_rollouts[policy_training_step] = self._trained_rollouts.get(policy_training_step, 0) + 1
             self._total_trained_rollouts += 1
+            self._latest_trained_policy_step = max(self._latest_trained_policy_step, policy_training_step)
         self._advance_completed_steps()
 
     def record_discarded_policy_steps(self, policy_training_steps: list[int]) -> None:

@@ -505,6 +505,32 @@ def test_gen_value_source_step_admission_rejects_invalid_values(
         value_model_utils.gen_value_source_step_is_admissible(policy_step, latest_trained_step, max_async_steps)
 
 
+def test_wait_for_gen_value_source_window_blocks_until_critic_catches_up():
+    observed_steps = iter([3, 3, 4])
+
+    latest_trained_step, waited_seconds = value_model_utils.wait_for_gen_value_source_window(
+        lambda: next(observed_steps),
+        policy_training_step=5,
+        max_async_steps=1,
+        timeout_s=1.0,
+        poll_interval_s=0.0,
+    )
+
+    assert latest_trained_step == 4
+    assert waited_seconds >= 0.0
+
+
+def test_wait_for_gen_value_source_window_times_out_explicitly():
+    with pytest.raises(TimeoutError, match="latest_trained_policy_step=3"):
+        value_model_utils.wait_for_gen_value_source_window(
+            lambda: 3,
+            policy_training_step=5,
+            max_async_steps=1,
+            timeout_s=1e-6,
+            poll_interval_s=0.0,
+        )
+
+
 def _rollouts_for_steps(*source_steps: int) -> list[dict]:
     return [
         {
@@ -638,7 +664,8 @@ def test_gen_value_training_progress_waits_for_all_admitted_rollouts():
     progress.register_admitted_policy_step(policy_training_step=4, policy_rank=0, num_rollouts=2)
     progress.register_admitted_policy_step(policy_training_step=4, policy_rank=1, num_rollouts=1)
     progress.record_trained_policy_steps([4, 4])
-    assert progress.get_latest_trained_policy_step() == 3
+    assert progress.get_latest_trained_policy_step() == 4
+    assert progress.get_latest_processed_policy_step() == 3
 
     progress.record_trained_policy_steps([4])
     assert progress.get_latest_trained_policy_step() == 4
@@ -657,6 +684,7 @@ def test_gen_value_training_progress_counts_trained_and_discarded_rollouts():
     assert progress.get_latest_processed_policy_step() == 4
     assert progress.get_rollout_accounting() == {
         "latest_processed_policy_step": 4,
+        "latest_trained_policy_step": 4,
         "admitted_rollouts": 3,
         "trained_rollouts": 1,
         "discarded_rollouts": 2,
@@ -667,11 +695,12 @@ def test_gen_value_training_progress_handles_training_before_registration():
     progress = value_model_utils.GenValueTrainingProgressState(latest_trained_policy_step=4, policy_world_size=2)
 
     progress.record_trained_policy_steps([5, 5])
+    assert progress.get_latest_trained_policy_step() == 5
     progress.register_admitted_policy_step(policy_training_step=5, policy_rank=0, num_rollouts=1)
-    assert progress.get_latest_trained_policy_step() == 4
+    assert progress.get_latest_processed_policy_step() == 4
 
     progress.register_admitted_policy_step(policy_training_step=5, policy_rank=1, num_rollouts=1)
-    assert progress.get_latest_trained_policy_step() == 5
+    assert progress.get_latest_processed_policy_step() == 5
 
 
 def test_gen_value_training_progress_rejects_duplicate_rank_registration():

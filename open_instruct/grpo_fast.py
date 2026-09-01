@@ -324,6 +324,17 @@ class PolicyTrainerRayProcess(RayProcess):
             return None
         return int(ray.get(self._gen_value_training_progress.get_latest_processed_policy_step.remote()))
 
+    def _wait_for_gen_value_source_window(self, policy_training_step: int) -> tuple[int | None, float]:
+        """Bound policy progress by the newest source step trained by the critic."""
+        if self._gen_value_training_progress is None:
+            return None, 0.0
+        return value_model_utils.wait_for_gen_value_source_window(
+            lambda: int(ray.get(self._gen_value_training_progress.get_latest_trained_policy_step.remote())),
+            policy_training_step,
+            self.args.gen_value_max_async_steps,
+            timeout_s=WEIGHT_SYNC_TIMEOUT_S,
+        )
+
     def _enqueue_gen_value_rollouts_latest(self, rollouts: list[dict]) -> list[dict]:
         """Enqueue without policy backpressure, evicting oldest queued shards."""
         if self._gen_value_training_queue is None:
@@ -2144,8 +2155,14 @@ class PolicyTrainerRayProcess(RayProcess):
         _gen_value_training_rollouts: list[dict] = []
         if _use_gen_value and self._gen_value_training_queue is not None:
             latest_processed_step = self._get_gen_value_processed_policy_step()
-            sae_step_metrics["gen_value/generation_backpressure_seconds"] = 0.0
-            sae_step_metrics["gen_value/staleness_backpressure_seconds"] = 0.0
+            latest_trained_step, staleness_backpressure_seconds = self._wait_for_gen_value_source_window(training_step)
+            sae_step_metrics["gen_value/generation_backpressure_seconds"] = staleness_backpressure_seconds
+            sae_step_metrics["gen_value/staleness_backpressure_seconds"] = staleness_backpressure_seconds
+            if latest_trained_step is not None:
+                sae_step_metrics["gen_value/latest_trained_before_generation"] = float(latest_trained_step)
+                sae_step_metrics["gen_value/trained_source_step_lag_before_generation"] = float(
+                    max(training_step - latest_trained_step, 0)
+                )
             if latest_processed_step is not None:
                 sae_step_metrics["gen_value/latest_processed_before_generation"] = float(latest_processed_step)
                 sae_step_metrics["gen_value/source_step_lag_before_generation"] = float(
@@ -2579,9 +2596,10 @@ class PolicyTrainerRayProcess(RayProcess):
                 sae_step_metrics["value/separation_early_to_late_delta"] = (
                     progress_deltas["correct"] - progress_deltas["incorrect"]
                 )
-            # Pipe complete rollouts to the independent critic loop. This is a
-            # latest-wins queue: policy training never waits for critic training,
-            # and the oldest queued shard is explicitly discarded under pressure.
+            # Pipe complete rollouts to the independent critic loop. Enqueueing is
+            # latest-wins and nonblocking; the separate trained-source barrier at
+            # the next step bounds policy progress while still allowing overlap.
+            # The oldest queued shard is explicitly discarded under pressure.
             if _use_gen_value and self._gen_value_training_queue is not None:
                 if _gen_value_training_rollouts:
                     sae_step_metrics.update(

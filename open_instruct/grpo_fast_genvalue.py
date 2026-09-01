@@ -2517,6 +2517,9 @@ def main():
                         "gen_value/latest_processed_policy_training_step": rollout_accounting[
                             "latest_processed_policy_step"
                         ],
+                        "gen_value/latest_optimizer_source_policy_training_step": rollout_accounting[
+                            "latest_trained_policy_step"
+                        ],
                     }
                 )
                 pending_publish_version = trainer_progress["pending_publish_version"]
