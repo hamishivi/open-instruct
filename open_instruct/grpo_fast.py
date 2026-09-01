@@ -302,6 +302,7 @@ class PolicyTrainerRayProcess(RayProcess):
         self._gen_value_training_progress = None
         self._gen_value_version = 0
         self._gen_value_latest_enqueued_policy_training_step: int | None = None
+        self._gen_value_latest_enqueued_policy_model_version: int | None = None
         self._gen_value_icc_success_rate: float | None = None
 
     def set_gen_value_engines(self, engines: list) -> None:
@@ -2315,6 +2316,16 @@ class PolicyTrainerRayProcess(RayProcess):
                             gen_value_source_BT.position_ids[i],
                             gen_value_source_BT.response_masks[i],
                         )
+                        if gen_value_source_BT.policy_model_versions is None:
+                            raise RuntimeError(
+                                "Generative-critic rollouts require the sampled policy model version metadata."
+                            )
+                        policy_model_versions = gen_value_source_BT.policy_model_versions[i][0]
+                        if len(policy_model_versions) != len(subseqs_for_outcome):
+                            raise RuntimeError(
+                                "Sampled policy model versions do not align with packed sub-sequences: "
+                                f"got {len(policy_model_versions)} versions for {len(subseqs_for_outcome)} sub-sequences."
+                            )
                         subseq_outcomes: list[float] = []
                         for sub in subseqs_for_outcome:
                             s_off = sub["offset_in_pack"]
@@ -2346,6 +2357,7 @@ class PolicyTrainerRayProcess(RayProcess):
                                 {
                                     "rollout_id": f"{training_step}:{self.rank}:{i}:{subseq_idx}",
                                     "policy_training_step": training_step,
+                                    "policy_model_version": int(policy_model_versions[subseq_idx]),
                                     "policy_rank": self.rank,
                                     "critic_version": critic_versions.pop(),
                                     "pairs": rollout_pairs,
@@ -2590,14 +2602,36 @@ class PolicyTrainerRayProcess(RayProcess):
                 self._gen_value_latest_enqueued_policy_training_step = training_step
                 sae_step_metrics["gen_value/enqueued_rollouts"] = float(len(_gen_value_training_rollouts))
                 sae_step_metrics["gen_value/queue_evicted_rollouts"] = float(len(evicted_rollouts))
+                if _gen_value_training_rollouts:
+                    enqueued_policy_versions = [
+                        int(rollout["policy_model_version"]) for rollout in _gen_value_training_rollouts
+                    ]
+                    self._gen_value_latest_enqueued_policy_model_version = max(enqueued_policy_versions)
+                    sae_step_metrics["gen_value/enqueued_policy_model_version_min"] = float(
+                        min(enqueued_policy_versions)
+                    )
+                    sae_step_metrics["gen_value/enqueued_policy_model_version_max"] = float(
+                        max(enqueued_policy_versions)
+                    )
                 if evicted_rollouts:
                     evicted_steps = [int(rollout["policy_training_step"]) for rollout in evicted_rollouts]
+                    evicted_policy_versions = [int(rollout["policy_model_version"]) for rollout in evicted_rollouts]
                     sae_step_metrics["gen_value/queue_evicted_source_step_min"] = float(min(evicted_steps))
                     sae_step_metrics["gen_value/queue_evicted_source_step_max"] = float(max(evicted_steps))
+                    sae_step_metrics["gen_value/queue_evicted_policy_model_version_min"] = float(
+                        min(evicted_policy_versions)
+                    )
+                    sae_step_metrics["gen_value/queue_evicted_policy_model_version_max"] = float(
+                        max(evicted_policy_versions)
+                    )
                 sae_step_metrics["gen_value/training_queue_size"] = float(self._gen_value_training_queue.qsize())
             if self._gen_value_latest_enqueued_policy_training_step is not None:
                 sae_step_metrics["gen_value/latest_enqueued_policy_training_step"] = float(
                     self._gen_value_latest_enqueued_policy_training_step
+                )
+            if self._gen_value_latest_enqueued_policy_model_version is not None:
+                sae_step_metrics["gen_value/latest_enqueued_policy_model_version"] = float(
+                    self._gen_value_latest_enqueued_policy_model_version
                 )
             # Compute global regression diagnostics from additive sufficient
             # statistics, including the second moments needed for exact variance.
@@ -3210,9 +3244,16 @@ def aggregate_worker_scalar_metrics(metrics: tuple[dict[str, float], ...]) -> di
         "val/ratio_var",
     }
     sum_metrics = {"gen_value/enqueued_rollouts", "gen_value/queue_evicted_rollouts"}
-    min_metrics = {"gen_value/queue_evicted_source_step_min"}
+    min_metrics = {
+        "gen_value/enqueued_policy_model_version_min",
+        "gen_value/queue_evicted_policy_model_version_min",
+        "gen_value/queue_evicted_source_step_min",
+    }
     max_metrics = {
+        "gen_value/enqueued_policy_model_version_max",
+        "gen_value/latest_enqueued_policy_model_version",
         "gen_value/latest_enqueued_policy_training_step",
+        "gen_value/queue_evicted_policy_model_version_max",
         "gen_value/queue_evicted_source_step_max",
         "gen_value/training_queue_size",
         "gen_value/training_queue_backpressure_seconds",
@@ -3355,6 +3396,7 @@ def setup_runtime_variables(
     # Sync value-model flags down into the streaming config so the DataPreparationActor
     # knows whether to populate rewards / dones / GT / siblings / SAE boundaries.
     streaming_config.use_value_model = args.use_value_model
+    streaming_config.use_generative_value_model = getattr(args, "use_generative_value_model", False)
     streaming_config.use_sae = args.use_sae
     streaming_config.sae_threshold = args.sae_threshold
     streaming_config.value_model_ground_truth_conditioning = args.value_model_ground_truth_conditioning

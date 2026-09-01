@@ -382,8 +382,8 @@ def test_gen_value_latest_enqueue_evicts_oldest_shard_and_records_discard(monkey
     trainer_cls = grpo_fast.PolicyTrainerRayProcess.__ray_metadata__.modified_class
     trainer = object.__new__(trainer_cls)
     trainer._gen_value_training_queue = Queue(maxsize=1)
-    old_rollouts = [{"policy_training_step": 7, "identifier": "old"}]
-    new_rollouts = [{"policy_training_step": 9, "identifier": "new"}]
+    old_rollouts = [{"policy_training_step": 7, "policy_model_version": 5, "identifier": "old"}]
+    new_rollouts = [{"policy_training_step": 9, "policy_model_version": 6, "identifier": "new"}]
     trainer._gen_value_training_queue.put(old_rollouts)
     discarded_steps: list[int] = []
 

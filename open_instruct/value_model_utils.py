@@ -141,33 +141,50 @@ def gen_value_training_queue_capacity(world_size: int, max_async_steps: int) -> 
 
 
 def select_fresh_gen_value_rollouts(
-    pending_rollouts: list[dict], batch_size: int, max_async_steps: int
+    pending_rollouts: list[dict], batch_size: int, max_async_steps: int, newest_policy_model_version: int | None = None
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """Select one latest-first critic batch and partition stale rollouts.
 
-    Staleness is measured against the newest source-policy step currently
-    available to the consumer. Samples exactly ``max_async_steps`` behind remain
+    Staleness is measured against the actual policy-weight version that generated
+    each sample, not the outer policy training-step counter. This distinction is
+    important during critic-only warmup: many fresh batches can share one frozen
+    policy version. Samples exactly ``max_async_steps`` versions behind remain
     eligible; older samples are returned separately for explicit accounting.
-    When fewer than ``batch_size`` eligible samples are available, no partial
-    optimizer batch is returned.
+    Within the admissible version window, newer policy batches win ties. When
+    fewer than ``batch_size`` eligible samples are available, no partial optimizer
+    batch is returned.
     """
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}.")
     if max_async_steps <= 0:
         raise ValueError(f"max_async_steps must be positive, got {max_async_steps}.")
+    if newest_policy_model_version is not None and newest_policy_model_version < 0:
+        raise ValueError(
+            f"newest_policy_model_version must be nonnegative when set, got {newest_policy_model_version}."
+        )
     if not pending_rollouts:
         return [], [], []
 
     try:
+        source_versions = [int(rollout["policy_model_version"]) for rollout in pending_rollouts]
+    except KeyError as exc:
+        raise ValueError("Every generative-critic rollout must include policy_model_version.") from exc
+    try:
         source_steps = [int(rollout["policy_training_step"]) for rollout in pending_rollouts]
     except KeyError as exc:
         raise ValueError("Every generative-critic rollout must include policy_training_step.") from exc
+    if any(source_version < 0 for source_version in source_versions):
+        raise ValueError(f"policy_model_version must be nonnegative, got {source_versions}.")
     if any(source_step < 0 for source_step in source_steps):
         raise ValueError(f"policy_training_step must be nonnegative, got {source_steps}.")
 
-    newest_source_step = max(source_steps)
-    oldest_admissible_step = newest_source_step - max_async_steps
-    stale_indices = {index for index, source_step in enumerate(source_steps) if source_step < oldest_admissible_step}
+    newest_source_version = max(source_versions)
+    if newest_policy_model_version is not None:
+        newest_source_version = max(newest_source_version, newest_policy_model_version)
+    oldest_admissible_version = newest_source_version - max_async_steps
+    stale_indices = {
+        index for index, source_version in enumerate(source_versions) if source_version < oldest_admissible_version
+    }
     eligible_indices = [index for index in range(len(pending_rollouts)) if index not in stale_indices]
     if len(eligible_indices) < batch_size:
         return (
@@ -176,7 +193,9 @@ def select_fresh_gen_value_rollouts(
             [pending_rollouts[index] for index in range(len(pending_rollouts)) if index in stale_indices],
         )
 
-    selected_indices = set(sorted(eligible_indices, key=lambda index: (-source_steps[index], index))[:batch_size])
+    selected_indices = set(
+        sorted(eligible_indices, key=lambda index: (-source_versions[index], -source_steps[index], index))[:batch_size]
+    )
     return (
         [pending_rollouts[index] for index in range(len(pending_rollouts)) if index in selected_indices],
         [

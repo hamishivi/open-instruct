@@ -1203,7 +1203,11 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
         if total_mass > 0.0:
             merged["gen_value/reinforce_correct_abs_token_weight_mass_frac"] = float(correct_mass) / total_mass
 
-    for prefix in ("gen_value/source_policy_training_step", "gen_value/source_value_version"):
+    for prefix in (
+        "gen_value/source_policy_training_step",
+        "gen_value/source_policy_model_version",
+        "gen_value/source_value_version",
+    ):
         minima = [float(update[f"{prefix}_min"]) for update in reinforce_updates if f"{prefix}_min" in update]
         maxima = [float(update[f"{prefix}_max"]) for update in reinforce_updates if f"{prefix}_max" in update]
         if minima and maxima:
@@ -1211,7 +1215,11 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
             merged[f"{prefix}_max"] = max(maxima)
             merged[f"{prefix}_spread"] = max(maxima) - min(minima)
 
-    for prefix in ("gen_value/source_value_lag", "gen_value/source_policy_lag"):
+    for prefix in (
+        "gen_value/source_value_lag",
+        "gen_value/source_policy_lag",
+        "gen_value/source_policy_training_step_age",
+    ):
         for suffix, reducer in (("min", min), ("max", max)):
             metric = f"{prefix}_{suffix}"
             values = [float(update[metric]) for update in reinforce_updates if metric in update]
@@ -1224,6 +1232,13 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
     ]
     if newest_available_steps:
         merged["gen_value/newest_available_source_policy_step"] = max(newest_available_steps)
+    for metric in (
+        "gen_value/newest_available_source_policy_model_version",
+        "gen_value/newest_seen_source_policy_model_version",
+    ):
+        versions = [float(update[metric]) for update in reinforce_updates if metric in update]
+        if versions:
+            merged[metric] = max(versions)
     max_pack_tokens = [
         float(update["gen_value/train_max_pack_tokens"])
         for update in reinforce_updates
@@ -1373,6 +1388,7 @@ def _gen_value_reinforce_loop(
     trained_rollouts = 0
     discarded_stale_rollouts = 0
     discarded_since_update = 0
+    newest_seen_policy_model_version: int | None = None
 
     while True:
         try:
@@ -1385,7 +1401,7 @@ def _gen_value_reinforce_loop(
                 progress_state["pending_rollouts"] = len(pending_rollouts)
             continue
         # Drain everything that arrived during the preceding optimizer step, then
-        # select against the freshest source-policy step currently visible.
+        # select against the freshest source-policy weight version currently visible.
         while True:
             try:
                 published_shards.append(training_queue.get(block=False))
@@ -1407,22 +1423,35 @@ def _gen_value_reinforce_loop(
                 pending_rollouts.extend(published_rollouts)
                 admitted_rollouts += len(published_rollouts)
             available_source_steps = [int(rollout["policy_training_step"]) for rollout in pending_rollouts]
+            available_policy_versions = [int(rollout["policy_model_version"]) for rollout in pending_rollouts]
             newest_available_source_step = max(available_source_steps)
+            newest_available_policy_version = max(available_policy_versions)
+            newest_seen_policy_model_version = (
+                newest_available_policy_version
+                if newest_seen_policy_model_version is None
+                else max(newest_seen_policy_model_version, newest_available_policy_version)
+            )
             rollouts, pending_rollouts, stale_rollouts = value_model_utils.select_fresh_gen_value_rollouts(
-                pending_rollouts, batch_size, max_async_steps
+                pending_rollouts,
+                batch_size,
+                max_async_steps,
+                newest_policy_model_version=newest_seen_policy_model_version,
             )
             if stale_rollouts:
                 stale_policy_steps = [int(rollout["policy_training_step"]) for rollout in stale_rollouts]
+                stale_policy_versions = [int(rollout["policy_model_version"]) for rollout in stale_rollouts]
                 ray.get(training_progress.record_discarded_policy_steps.remote(stale_policy_steps))
                 discarded_stale_rollouts += len(stale_rollouts)
                 discarded_since_update += len(stale_rollouts)
                 logger.info(
-                    "[GenValue] discarded %d stale critic rollout(s) from source steps %d..%d; "
-                    "newest available step=%d, max async steps=%d.",
+                    "[GenValue] discarded %d stale critic rollout(s) from policy versions %d..%d "
+                    "(source training steps %d..%d); newest seen policy version=%d, max async steps=%d.",
                     len(stale_rollouts),
+                    min(stale_policy_versions),
+                    max(stale_policy_versions),
                     min(stale_policy_steps),
                     max(stale_policy_steps),
-                    newest_available_source_step,
+                    newest_seen_policy_model_version,
                     max_async_steps,
                 )
             if not rollouts:
@@ -1477,6 +1506,7 @@ def _gen_value_reinforce_loop(
             unique_pair_count = len(pairs)
             pairs = value_model_utils.replay_gen_value_final_actions(pairs, final_action_replay_weight)
             policy_training_steps = [int(rollout["policy_training_step"]) for rollout in rollouts]
+            policy_model_versions = [int(rollout["policy_model_version"]) for rollout in rollouts]
             source_versions = [int(rollout["critic_version"]) for rollout in rollouts]
             batch_sequence_tokens = sum(
                 len(pair["request_output"].prompt_token_ids)
@@ -1542,10 +1572,22 @@ def _gen_value_reinforce_loop(
                     "gen_value/source_policy_training_step_spread": max(policy_training_steps)
                     - min(policy_training_steps),
                     "gen_value/newest_available_source_policy_step": newest_available_source_step,
+                    "gen_value/newest_available_source_policy_model_version": newest_available_policy_version,
+                    "gen_value/newest_seen_source_policy_model_version": newest_seen_policy_model_version,
+                    "gen_value/source_policy_model_version_min": min(policy_model_versions),
+                    "gen_value/source_policy_model_version_max": max(policy_model_versions),
+                    "gen_value/source_policy_model_version_spread": max(policy_model_versions)
+                    - min(policy_model_versions),
                     "gen_value/source_policy_lag_min": max(
-                        newest_available_source_step - max(policy_training_steps), 0
+                        newest_seen_policy_model_version - max(policy_model_versions), 0
                     ),
                     "gen_value/source_policy_lag_max": max(
+                        newest_seen_policy_model_version - min(policy_model_versions), 0
+                    ),
+                    "gen_value/source_policy_training_step_age_min": max(
+                        newest_available_source_step - max(policy_training_steps), 0
+                    ),
+                    "gen_value/source_policy_training_step_age_max": max(
                         newest_available_source_step - min(policy_training_steps), 0
                     ),
                     "gen_value/source_value_version_min": min(source_versions),

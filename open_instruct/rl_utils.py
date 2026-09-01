@@ -220,6 +220,8 @@ class PackedSequences(Generic[T]):
     hints: list[list[str | None]] | None = None
     """per-pack list of per-sub-sequence hint strings. Populated when the dataset has a hint column
     and answer_prefix conditioning is used."""
+    policy_model_versions: list[list[int]] | None = None
+    """per-pack list of the vLLM policy-weight version that generated each sub-sequence."""
     segment_boundaries: list[torch.Tensor] | None = None
     """packed SAE segment boundary mask (batch_size, pack_length); 1 at a boundary token."""
 

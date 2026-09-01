@@ -129,6 +129,9 @@ class CollatedBatchData:
     hints: list[list[list[str | None]]] | None = None
     """Per-microbatch list of packs containing per-sub-sequence hint strings from the dataset's
     hint column. Used by answer-prefix conditioning when the dataset provides hints."""
+    policy_model_versions: list[list[list[int]]] | None = None
+    """Per-microbatch list of packs containing the vLLM policy-weight version that generated
+    each sub-sequence. This is the staleness clock for asynchronous critic training."""
     segment_boundaries: list[torch.Tensor] | None = None
     """Per-token boolean mask (1 where a SAE segment starts, 0 elsewhere). None when SAE is off."""
 

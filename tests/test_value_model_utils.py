@@ -328,7 +328,11 @@ def test_gen_value_source_step_admission_rejects_invalid_values(
 
 def _rollouts_for_steps(*source_steps: int) -> list[dict]:
     return [
-        {"policy_training_step": source_step, "identifier": index}
+        {
+            "policy_training_step": source_step,
+            "policy_model_version": source_step,
+            "identifier": index,
+        }
         for index, source_step in enumerate(source_steps)
     ]
 
@@ -367,6 +371,58 @@ def test_select_fresh_gen_value_rollouts_discards_stale_without_partial_batch():
     assert selected == []
     assert [rollout["policy_training_step"] for rollout in retained] == [10]
     assert [rollout["policy_training_step"] for rollout in stale] == [7, 8]
+
+
+def test_select_fresh_gen_value_rollouts_reuses_frozen_policy_batches():
+    pending = [
+        {"policy_training_step": step, "policy_model_version": 0, "identifier": step}
+        for step in (1, 12, 25)
+    ]
+
+    selected, retained, stale = value_model_utils.select_fresh_gen_value_rollouts(
+        pending, batch_size=2, max_async_steps=1
+    )
+
+    assert [rollout["identifier"] for rollout in selected] == [12, 25]
+    assert [rollout["identifier"] for rollout in retained] == [1]
+    assert stale == []
+
+
+def test_select_fresh_gen_value_rollouts_uses_model_version_before_batch_recency():
+    pending = [
+        {"policy_training_step": 20, "policy_model_version": 3, "identifier": "old-weights-new-batch"},
+        {"policy_training_step": 18, "policy_model_version": 4, "identifier": "new-weights-old-batch"},
+    ]
+
+    selected, retained, stale = value_model_utils.select_fresh_gen_value_rollouts(
+        pending, batch_size=1, max_async_steps=1
+    )
+
+    assert [rollout["identifier"] for rollout in selected] == ["new-weights-old-batch"]
+    assert [rollout["identifier"] for rollout in retained] == ["old-weights-new-batch"]
+    assert stale == []
+
+
+def test_select_fresh_gen_value_rollouts_requires_policy_model_version():
+    with pytest.raises(ValueError, match="policy_model_version"):
+        value_model_utils.select_fresh_gen_value_rollouts(
+            [{"policy_training_step": 1}], batch_size=1, max_async_steps=1
+        )
+
+
+def test_select_fresh_gen_value_rollouts_does_not_regress_newest_seen_version():
+    pending = [{"policy_training_step": 20, "policy_model_version": 8, "identifier": "old-remainder"}]
+
+    selected, retained, stale = value_model_utils.select_fresh_gen_value_rollouts(
+        pending,
+        batch_size=1,
+        max_async_steps=1,
+        newest_policy_model_version=10,
+    )
+
+    assert selected == []
+    assert retained == []
+    assert stale == pending
 
 
 def test_gen_value_training_progress_waits_for_all_admitted_rollouts():

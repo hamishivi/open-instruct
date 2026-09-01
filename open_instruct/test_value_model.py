@@ -474,6 +474,20 @@ class TestSiblingAssembly(unittest.TestCase):
         got = _extract_subseq_indices_per_pack(rm)
         self.assertEqual(got, [[1, 2], [3]])
 
+    def test_populate_policy_model_versions_uses_packed_subsequence_indices(self):
+        from open_instruct.data_loader import populate_policy_model_versions  # noqa: PLC0415
+
+        ps = PackedSequences(
+            query_responses=[torch.tensor([[0, 1, 2, 3]])],
+            attention_masks=[torch.tensor([[1, 1, 2, 2]])],
+            response_masks=[torch.tensor([[0, 1, 0, 2]])],
+            original_responses=[[1], [3]],
+        )
+
+        populate_policy_model_versions(ps, [7, 11])
+
+        self.assertEqual(ps.policy_model_versions, [[7, 11]])
+
     def test_populate_value_model_fields_minimal(self):
         from open_instruct.data_loader import populate_value_model_fields  # noqa: PLC0415
 

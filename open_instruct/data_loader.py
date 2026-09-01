@@ -502,6 +502,7 @@ class StreamingDataLoaderConfig:
     # Value-model related (populated from GRPOExperimentConfig via setup_runtime_variables so the
     # DataPreparationActor knows whether to carry rewards/dones/GT/siblings/SAE boundaries).
     use_value_model: bool = field(default=False, init=False)
+    use_generative_value_model: bool = field(default=False, init=False)
     use_sae: bool = field(default=False, init=False)
     sae_threshold: float = field(default=0.2, init=False)
     value_model_ground_truth_conditioning: bool = field(default=False, init=False)
@@ -1100,6 +1101,27 @@ def _extract_subseq_indices_per_pack(response_masks: list[torch.Tensor]) -> list
     return result
 
 
+def populate_policy_model_versions(packed_sequences: PackedSequences, model_steps: list[int]) -> None:
+    """Attach the sampled policy-weight version to every packed sub-sequence."""
+    subseq_indices_per_pack = _extract_subseq_indices_per_pack(packed_sequences.response_masks)
+    packed_versions: list[list[int]] = []
+    for pack_subseqs in subseq_indices_per_pack:
+        pack_versions: list[int] = []
+        for one_based_idx in pack_subseqs:
+            sample_idx = one_based_idx - 1
+            if sample_idx < 0 or sample_idx >= len(model_steps):
+                raise ValueError(
+                    "Packed sub-sequence index is not represented in batch.model_steps: "
+                    f"sample_idx={sample_idx}, num_model_steps={len(model_steps)}."
+                )
+            model_version = int(model_steps[sample_idx])
+            if model_version < 0:
+                raise ValueError(f"Policy model versions must be nonnegative, got {model_version}.")
+            pack_versions.append(model_version)
+        packed_versions.append(pack_versions)
+    packed_sequences.policy_model_versions = packed_versions
+
+
 def populate_value_model_fields(
     packed_sequences: PackedSequences,
     scores: np.ndarray,
@@ -1249,6 +1271,7 @@ def prepare_collated_data_for_workers(
     packed_gt = packed_sequences.ground_truths
     packed_siblings = packed_sequences.sibling_rollouts
     packed_hints = packed_sequences.hints
+    packed_policy_model_versions = packed_sequences.policy_model_versions
 
     for i in range(dp_world_size):
         per_device_packed_query_responses = packed_sequences.query_responses[B * i : B * (i + 1)]
@@ -1263,6 +1286,9 @@ def prepare_collated_data_for_workers(
         per_device_packed_gt = packed_gt[B * i : B * (i + 1)] if packed_gt is not None else None
         per_device_packed_siblings = packed_siblings[B * i : B * (i + 1)] if packed_siblings is not None else None
         per_device_packed_hints = packed_hints[B * i : B * (i + 1)] if packed_hints is not None else None
+        per_device_policy_model_versions = (
+            packed_policy_model_versions[B * i : B * (i + 1)] if packed_policy_model_versions is not None else None
+        )
 
         # Shuffle the batch and collate the data
         b_inds = np.random.permutation(len(per_device_packed_query_responses))
@@ -1278,6 +1304,9 @@ def prepare_collated_data_for_workers(
         collated_gt: list[list[list[str]]] | None = [] if packed_gt is not None else None
         collated_siblings: list[list[list[list[dict]]]] | None = [] if packed_siblings is not None else None
         collated_hints: list[list[list[str | None]]] | None = [] if packed_hints is not None else None
+        collated_policy_model_versions: list[list[list[int]]] | None = (
+            [] if packed_policy_model_versions is not None else None
+        )
         for j in range(0, len(per_device_packed_query_responses), per_device_train_batch_size):
             micro_range = b_inds[j : j + per_device_train_batch_size]
             collated_query_responses.append(
@@ -1321,6 +1350,9 @@ def prepare_collated_data_for_workers(
             if collated_hints is not None:
                 assert per_device_packed_hints is not None
                 collated_hints.append([per_device_packed_hints[idx] for idx in micro_range])
+            if collated_policy_model_versions is not None:
+                assert per_device_policy_model_versions is not None
+                collated_policy_model_versions.append([per_device_policy_model_versions[idx] for idx in micro_range])
         collated_data.append(
             data_types.CollatedBatchData(
                 query_responses=collated_query_responses,
@@ -1335,6 +1367,7 @@ def prepare_collated_data_for_workers(
                 ground_truths=collated_gt,
                 sibling_rollouts=collated_siblings,
                 hints=collated_hints,
+                policy_model_versions=collated_policy_model_versions,
             )
         )
     return collated_data
@@ -1592,6 +1625,8 @@ class DataPreparationActor:
                 mask_tool_use=self.config.mask_tool_use,
                 min_num_batches=self.dp_world_size,
             )
+            if self.config.use_generative_value_model:
+                populate_policy_model_versions(packed_sequences, batch.model_steps)
             lookup_advantages = np.zeros(len(advantages) + 1, dtype=np.float32)
             lookup_advantages[1:] = advantages
             packed_advantages = [
