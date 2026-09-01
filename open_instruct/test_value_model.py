@@ -488,6 +488,33 @@ class TestSiblingAssembly(unittest.TestCase):
 
         self.assertEqual(ps.policy_model_versions, [[7, 11]])
 
+    def test_policy_model_versions_survive_worker_collation(self):
+        from open_instruct.data_loader import prepare_collated_data_for_workers  # noqa: PLC0415
+
+        ps = PackedSequences(
+            query_responses=[torch.tensor([1, 2]), torch.tensor([3, 4])],
+            attention_masks=[torch.ones(2, dtype=torch.long), torch.ones(2, dtype=torch.long)],
+            response_masks=[torch.tensor([0, 1]), torch.tensor([0, 2])],
+            original_responses=[[2], [4]],
+            advantages=[torch.zeros(2), torch.zeros(2)],
+            position_ids=[torch.arange(2), torch.arange(2)],
+            vllm_logprobs=[torch.zeros(2), torch.zeros(2)],
+            policy_model_versions=[[7], [11]],
+        )
+
+        worker_data = prepare_collated_data_for_workers(
+            ps, dp_world_size=1, per_device_train_batch_size=1, pad_token_id=0, pin_memory=False
+        )[0]
+
+        self.assertIsNotNone(worker_data.policy_model_versions)
+        collated_versions = sorted(
+            version
+            for microbatch in worker_data.policy_model_versions or []
+            for pack in microbatch
+            for version in pack
+        )
+        self.assertEqual(collated_versions, [7, 11])
+
     def test_populate_value_model_fields_minimal(self):
         from open_instruct.data_loader import populate_value_model_fields  # noqa: PLC0415
 
