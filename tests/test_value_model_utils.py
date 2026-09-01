@@ -164,6 +164,32 @@ def test_shared_state_returns_pool_unique_continuations_without_dropping_replays
     }
 
 
+def test_generative_value_reinforce_outcome_mass_metrics_include_tokens_and_replays():
+    metrics = value_model_utils.generative_value_reinforce_outcome_mass_metrics(
+        weights=[0.5, -0.25, 0.5],
+        outcomes=[1.0, 0.0, 1.0],
+        generated_token_counts=[4, 8, 2],
+    )
+
+    assert metrics == {
+        "gen_value/reinforce_correct_examples": 2.0,
+        "gen_value/reinforce_correct_tokens": 6.0,
+        "gen_value/reinforce_correct_abs_weight_sum": 1.0,
+        "gen_value/reinforce_correct_abs_token_weight_mass": 3.0,
+        "gen_value/reinforce_incorrect_examples": 1.0,
+        "gen_value/reinforce_incorrect_tokens": 8.0,
+        "gen_value/reinforce_incorrect_abs_weight_sum": 0.25,
+        "gen_value/reinforce_incorrect_abs_token_weight_mass": 2.0,
+        "gen_value/reinforce_correct_abs_token_weight_mass_frac": 0.6,
+    }
+
+
+@pytest.mark.parametrize("token_count", [-1, True, 1.5])
+def test_generative_value_reinforce_outcome_mass_metrics_reject_invalid_token_counts(token_count):
+    with pytest.raises(ValueError, match="nonnegative integers"):
+        value_model_utils.generative_value_reinforce_outcome_mass_metrics([0.5], [1.0], [token_count])
+
+
 @pytest.mark.parametrize("outcome", [float("nan"), -0.1, 1.1])
 def test_shared_state_return_pooling_rejects_invalid_outcomes(outcome: float):
     pair = _pair([1, 2], outcome, state_kind="segment_start", response_tokens_used=0)

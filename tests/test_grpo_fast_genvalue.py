@@ -586,6 +586,15 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
             "gen_value/optimization_mse": 0.25,
             "gen_value/train_tokens": 2,
             "gen_value/train_examples": 1,
+            "gen_value/reinforce_correct_examples": 1,
+            "gen_value/reinforce_incorrect_examples": 0,
+            "gen_value/reinforce_correct_tokens": 2,
+            "gen_value/reinforce_incorrect_tokens": 0,
+            "gen_value/reinforce_correct_abs_weight_sum": 0.5,
+            "gen_value/reinforce_incorrect_abs_weight_sum": 0.0,
+            "gen_value/reinforce_correct_abs_token_weight_mass": 1.0,
+            "gen_value/reinforce_incorrect_abs_token_weight_mass": 0.0,
+            "gen_value/reinforce_correct_abs_token_weight_mass_frac": 1.0,
             "gen_value/parsed_examples": 1,
             "gen_value/unique_examples": 1,
             "gen_value/unique_parsed_examples": 1,
@@ -615,6 +624,15 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
             "gen_value/optimization_mse": 0.5,
             "gen_value/train_tokens": 6,
             "gen_value/train_examples": 3,
+            "gen_value/reinforce_correct_examples": 1,
+            "gen_value/reinforce_incorrect_examples": 2,
+            "gen_value/reinforce_correct_tokens": 2,
+            "gen_value/reinforce_incorrect_tokens": 4,
+            "gen_value/reinforce_correct_abs_weight_sum": 1.0,
+            "gen_value/reinforce_incorrect_abs_weight_sum": 1.5,
+            "gen_value/reinforce_correct_abs_token_weight_mass": 2.0,
+            "gen_value/reinforce_incorrect_abs_token_weight_mass": 3.0,
+            "gen_value/reinforce_correct_abs_token_weight_mass_frac": 0.4,
             "gen_value/parsed_examples": 2,
             "gen_value/unique_examples": 2,
             "gen_value/unique_parsed_examples": 1,
@@ -644,6 +662,15 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
     assert metrics["gen_value/optimization_mse"] == pytest.approx((0.25 + 2 * 0.5) / 3)
     assert metrics["gen_value/train_tokens"] == 8
     assert metrics["gen_value/train_examples"] == 4
+    assert metrics["gen_value/reinforce_correct_examples"] == 2
+    assert metrics["gen_value/reinforce_incorrect_examples"] == 2
+    assert metrics["gen_value/reinforce_correct_tokens"] == 4
+    assert metrics["gen_value/reinforce_incorrect_tokens"] == 4
+    assert metrics["gen_value/reinforce_correct_abs_weight_sum"] == pytest.approx(1.5)
+    assert metrics["gen_value/reinforce_incorrect_abs_weight_sum"] == pytest.approx(1.5)
+    assert metrics["gen_value/reinforce_correct_abs_token_weight_mass"] == pytest.approx(3.0)
+    assert metrics["gen_value/reinforce_incorrect_abs_token_weight_mass"] == pytest.approx(3.0)
+    assert metrics["gen_value/reinforce_correct_abs_token_weight_mass_frac"] == pytest.approx(0.5)
     assert metrics["gen_value/parsed_examples"] == 3
     assert metrics["gen_value/unique_examples"] == 3
     assert metrics["gen_value/unique_parsed_examples"] == 2

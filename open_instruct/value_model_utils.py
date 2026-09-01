@@ -541,6 +541,53 @@ def generative_value_reinforce_weights_with_replay(
     return [unique_weights[identity_to_unique_index[int(sample_id)]] for sample_id in sample_ids]
 
 
+def generative_value_reinforce_outcome_mass_metrics(
+    weights: Sequence[float], outcomes: Sequence[float], generated_token_counts: Sequence[int]
+) -> dict[str, float]:
+    """Measure optimizer signal mass separately for successful and unsuccessful traces.
+
+    The by-outcome leave-one-out baseline removes each class's reward offset, but it
+    does not equalize the amount of gradient contributed by the two classes.  The
+    actual loss repeats one scalar weight over every generated critic token, so
+    example counts alone cannot reveal whether the majority outcome dominates an
+    update.  These metrics include replay copies and generation lengths to match the
+    optimizer inputs without changing their weights.
+    """
+    if len(weights) != len(outcomes) or len(weights) != len(generated_token_counts):
+        raise ValueError(
+            "REINFORCE weights, outcomes, and generated-token counts must have the same length "
+            f"({len(weights)}, {len(outcomes)}, {len(generated_token_counts)})."
+        )
+
+    buckets = {
+        "correct": {"examples": 0, "tokens": 0, "abs_weight": 0.0, "abs_token_weight": 0.0},
+        "incorrect": {"examples": 0, "tokens": 0, "abs_weight": 0.0, "abs_token_weight": 0.0},
+    }
+    for weight, outcome, token_count in zip(weights, outcomes, generated_token_counts, strict=True):
+        if isinstance(token_count, bool) or not isinstance(token_count, int) or token_count < 0:
+            raise ValueError(f"Generated-token counts must be nonnegative integers, got {token_count!r}.")
+        bucket = buckets["correct" if float(outcome) > 0.5 else "incorrect"]
+        absolute_weight = abs(float(weight))
+        bucket["examples"] += 1
+        bucket["tokens"] += token_count
+        bucket["abs_weight"] += absolute_weight
+        bucket["abs_token_weight"] += absolute_weight * token_count
+
+    metrics: dict[str, float] = {}
+    for name, bucket in buckets.items():
+        metrics[f"gen_value/reinforce_{name}_examples"] = float(bucket["examples"])
+        metrics[f"gen_value/reinforce_{name}_tokens"] = float(bucket["tokens"])
+        metrics[f"gen_value/reinforce_{name}_abs_weight_sum"] = float(bucket["abs_weight"])
+        metrics[f"gen_value/reinforce_{name}_abs_token_weight_mass"] = float(bucket["abs_token_weight"])
+
+    total_mass = sum(float(bucket["abs_token_weight"]) for bucket in buckets.values())
+    if total_mass > 0.0:
+        metrics["gen_value/reinforce_correct_abs_token_weight_mass_frac"] = (
+            float(buckets["correct"]["abs_token_weight"]) / total_mass
+        )
+    return metrics
+
+
 _GEN_VALUE_SAMPLE_ID_KEY = "_gen_value_sample_id"
 
 

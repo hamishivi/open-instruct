@@ -648,6 +648,11 @@ class GenValueTrainerActor:
             "gen_value/reinforce_step_seconds": reinforce_step_seconds,
             "gen_value/lr": self._optimizer.param_groups[0]["lr"],
         }
+        metrics.update(
+            value_model_utils.generative_value_reinforce_outcome_mass_metrics(
+                reinforce_weights, outcomes, [len(example["generated_ids"]) for example in validated_examples]
+            )
+        )
         metrics.update(pooling_metrics)
         if self._trace_reservoir_size > 0:
             metrics["gen_value/trace_examples_seen"] = sum(self._trace_seen_by_outcome.values())
@@ -1163,6 +1168,14 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
         "gen_value/batch_sequence_tokens",
         "gen_value/train_tokens",
         "gen_value/train_examples",
+        "gen_value/reinforce_correct_examples",
+        "gen_value/reinforce_incorrect_examples",
+        "gen_value/reinforce_correct_tokens",
+        "gen_value/reinforce_incorrect_tokens",
+        "gen_value/reinforce_correct_abs_weight_sum",
+        "gen_value/reinforce_incorrect_abs_weight_sum",
+        "gen_value/reinforce_correct_abs_token_weight_mass",
+        "gen_value/reinforce_incorrect_abs_token_weight_mass",
         "gen_value/parsed_examples",
         "gen_value/unique_examples",
         "gen_value/unique_parsed_examples",
@@ -1183,6 +1196,13 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
         values = [float(update[metric]) for update in reinforce_updates if metric in update]
         if values:
             merged[metric] = sum(values)
+
+    correct_mass = merged.get("gen_value/reinforce_correct_abs_token_weight_mass")
+    incorrect_mass = merged.get("gen_value/reinforce_incorrect_abs_token_weight_mass")
+    if isinstance(correct_mass, int | float) and isinstance(incorrect_mass, int | float):
+        total_mass = float(correct_mass) + float(incorrect_mass)
+        if total_mass > 0.0:
+            merged["gen_value/reinforce_correct_abs_token_weight_mass_frac"] = float(correct_mass) / total_mass
 
     for prefix in ("gen_value/source_policy_training_step", "gen_value/source_value_version"):
         minima = [float(update[f"{prefix}_min"]) for update in reinforce_updates if f"{prefix}_min" in update]
