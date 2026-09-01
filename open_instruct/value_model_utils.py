@@ -705,49 +705,70 @@ def generative_value_reinforce_outcome_mass_metrics(
 
 
 _GEN_VALUE_SAMPLE_ID_KEY = "_gen_value_sample_id"
+_GEN_VALUE_OPTIMIZER_SELECTED_KEY = "_gen_value_optimizer_selected"
 
 
-def sample_gen_value_training_pairs(
+def mark_gen_value_training_pairs_for_optimizer(
     training_pairs: Sequence[dict[str, Any]], target_examples: int, rng: random.Random
-) -> list[dict[str, Any]]:
-    """Sample a critic minibatch while retaining exact shared-state groups.
+) -> tuple[list[dict[str, Any]], float, int]:
+    """Mark an unbiased critic minibatch while retaining shared-state groups.
 
     The asynchronous queue selects fresh *rollouts*. A complete policy-sized
     rollout batch can nevertheless contain thousands of segment-state critic
     examples, making one optimizer update substantially slower than a policy step.
 
     Each token-identical prompt group is independently retained with probability
-    ``target_examples / len(training_pairs)``. Every pair therefore has the same
-    inclusion probability, preserving the existing pair-weighted objective in
-    expectation, while all continuations of a shared state remain available for
-    empirical Monte Carlo return pooling. The realized minibatch may differ
-    slightly from the target; this avoids splitting groups or biasing toward small
-    groups merely to hit an exact count.
+    ``target_examples / len(training_pairs)``. If the Bernoulli draw is empty, one
+    group is chosen uniformly. The returned inclusion probability accounts for
+    that fallback exactly, so the trainer can use a Horvitz-Thompson gradient scale.
+    All pairs are returned: unselected pairs still define the original shared-state
+    return targets and leave-one-out baseline, while only marked pairs participate
+    in the expensive forward/backward pass. This makes the stochastic gradient an
+    unbiased estimate of the existing full-batch token objective rather than a
+    differently normalized ratio estimator.
 
-    Returning every pair when the target covers the batch avoids perturbing historical
-    runs. The caller owns ``rng`` so successive updates consume a reproducible
-    random stream rather than repeatedly selecting the same subset.
+    Returning every pair with inclusion probability one when the target covers the
+    batch avoids perturbing historical runs. The caller owns ``rng`` so successive
+    updates consume a reproducible random stream rather than repeatedly selecting
+    the same subset.
     """
     if target_examples <= 0:
         raise ValueError(f"Generative-value training target examples must be positive, got {target_examples}.")
     if len(training_pairs) <= target_examples:
-        return list(training_pairs)
+        return (
+            [dict(pair, **{_GEN_VALUE_OPTIMIZER_SELECTED_KEY: True}) for pair in training_pairs],
+            1.0,
+            len(training_pairs),
+        )
 
-    grouped_indices: dict[tuple[int, ...], list[int]] = {}
-    for index, pair in enumerate(training_pairs):
+    grouped_pairs: dict[tuple[int, ...], list[dict[str, Any]]] = {}
+    for pair in training_pairs:
         prompt_ids = tuple(int(token_id) for token_id in pair["request_output"].prompt_token_ids)
-        grouped_indices.setdefault(prompt_ids, []).append(index)
+        grouped_pairs.setdefault(prompt_ids, []).append(pair)
 
-    inclusion_probability = target_examples / len(training_pairs)
-    retained_groups = {prompt_ids for prompt_ids in grouped_indices if rng.random() < inclusion_probability}
+    base_probability = target_examples / len(training_pairs)
+    retained_groups = {prompt_ids for prompt_ids in grouped_pairs if rng.random() < base_probability}
+    empty_draw_probability = (1.0 - base_probability) ** len(grouped_pairs)
+    inclusion_probability = base_probability + empty_draw_probability / len(grouped_pairs)
     if not retained_groups:
-        fallback_pair = rng.choice(list(training_pairs))
-        retained_groups.add(tuple(int(token_id) for token_id in fallback_pair["request_output"].prompt_token_ids))
-    return [
-        pair
-        for pair in training_pairs
-        if tuple(int(token_id) for token_id in pair["request_output"].prompt_token_ids) in retained_groups
-    ]
+        retained_groups.add(rng.choice(list(grouped_pairs)))
+
+    marked_pairs = []
+    selected_examples = 0
+    for pair in training_pairs:
+        prompt_ids = tuple(int(token_id) for token_id in pair["request_output"].prompt_token_ids)
+        optimizer_selected = prompt_ids in retained_groups
+        marked_pairs.append(dict(pair, **{_GEN_VALUE_OPTIMIZER_SELECTED_KEY: optimizer_selected}))
+        selected_examples += int(optimizer_selected)
+    return marked_pairs, inclusion_probability, selected_examples
+
+
+def gen_value_optimizer_selected(pair: dict[str, Any]) -> bool:
+    """Whether a critic pair was selected for the optimizer forward/backward pass."""
+    selected = pair.get(_GEN_VALUE_OPTIMIZER_SELECTED_KEY, True)
+    if not isinstance(selected, bool):
+        raise ValueError(f"Generative-value optimizer selection flag must be boolean, got {selected!r}.")
+    return selected
 
 
 def gen_value_pair_sample_id(pair: dict[str, Any]) -> int:

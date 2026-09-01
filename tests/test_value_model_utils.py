@@ -26,48 +26,86 @@ def _pair(
     }
 
 
-def test_sample_gen_value_training_pairs_is_uniform_and_reproducible():
+def test_mark_gen_value_training_pairs_for_optimizer_is_uniform_and_reproducible():
     pairs = [
         {"identifier": index, "request_output": SimpleNamespace(prompt_token_ids=[index])} for index in range(20)
     ]
 
-    first = value_model_utils.sample_gen_value_training_pairs(pairs, 6, random.Random(17))
-    second = value_model_utils.sample_gen_value_training_pairs(pairs, 6, random.Random(17))
+    first, first_probability, first_count = value_model_utils.mark_gen_value_training_pairs_for_optimizer(
+        pairs, 6, random.Random(17)
+    )
+    second, second_probability, second_count = value_model_utils.mark_gen_value_training_pairs_for_optimizer(
+        pairs, 6, random.Random(17)
+    )
 
     assert first == second
-    assert 1 <= len(first) < len(pairs)
-    assert len({pair["identifier"] for pair in first}) == len(first)
-    assert all(pair in pairs for pair in first)
+    assert first_probability == second_probability == pytest.approx(0.3 + 0.7**20 / 20)
+    assert first_count == second_count
+    assert len(first) == len(pairs)
+    selected = [pair for pair in first if value_model_utils.gen_value_optimizer_selected(pair)]
+    assert 1 <= len(selected) < len(pairs)
+    assert len({pair["identifier"] for pair in selected}) == len(selected)
 
 
-def test_sample_gen_value_training_pairs_preserves_small_batches():
+def test_mark_gen_value_training_pairs_for_optimizer_preserves_small_batches():
     pairs = [
         {"identifier": index, "request_output": SimpleNamespace(prompt_token_ids=[index])} for index in range(3)
     ]
 
-    assert value_model_utils.sample_gen_value_training_pairs(pairs, 3, random.Random(0)) == pairs
-    assert value_model_utils.sample_gen_value_training_pairs(pairs, 4, random.Random(0)) == pairs
+    for target in (3, 4):
+        marked, inclusion_probability, selected_count = (
+            value_model_utils.mark_gen_value_training_pairs_for_optimizer(pairs, target, random.Random(0))
+        )
+        assert [pair["identifier"] for pair in marked] == [0, 1, 2]
+        assert all(value_model_utils.gen_value_optimizer_selected(pair) for pair in marked)
+        assert inclusion_probability == 1.0
+        assert selected_count == 3
 
 
-def test_sample_gen_value_training_pairs_rejects_nonpositive_target():
+def test_mark_gen_value_training_pairs_for_optimizer_rejects_nonpositive_target():
     with pytest.raises(ValueError, match="must be positive"):
-        value_model_utils.sample_gen_value_training_pairs([], 0, random.Random(0))
+        value_model_utils.mark_gen_value_training_pairs_for_optimizer([], 0, random.Random(0))
 
 
-def test_sample_gen_value_training_pairs_keeps_shared_states_together():
+def test_mark_gen_value_training_pairs_for_optimizer_keeps_shared_states_together():
     pairs = [
         {"identifier": index, "request_output": SimpleNamespace(prompt_token_ids=[index // 3])}
         for index in range(30)
     ]
 
-    sampled = value_model_utils.sample_gen_value_training_pairs(pairs, 8, random.Random(5))
+    marked, _, selected_count = value_model_utils.mark_gen_value_training_pairs_for_optimizer(
+        pairs, 8, random.Random(5)
+    )
+    sampled = [pair for pair in marked if value_model_utils.gen_value_optimizer_selected(pair)]
 
     selected_prompts = {tuple(pair["request_output"].prompt_token_ids) for pair in sampled}
     assert sampled
+    assert selected_count == len(sampled)
     for prompt_ids in selected_prompts:
         expected_group = [pair for pair in pairs if tuple(pair["request_output"].prompt_token_ids) == prompt_ids]
         actual_group = [pair for pair in sampled if tuple(pair["request_output"].prompt_token_ids) == prompt_ids]
-        assert actual_group == expected_group
+        assert [pair["identifier"] for pair in actual_group] == [pair["identifier"] for pair in expected_group]
+
+
+def test_mark_gen_value_training_pairs_for_optimizer_fallback_probability_is_exact():
+    class EmptyDrawRng(random.Random):
+        def random(self):
+            return 1.0
+
+        def choice(self, values):
+            return values[0]
+
+    pairs = [
+        {"identifier": index, "request_output": SimpleNamespace(prompt_token_ids=[index])} for index in range(4)
+    ]
+    marked, inclusion_probability, selected_count = value_model_utils.mark_gen_value_training_pairs_for_optimizer(
+        pairs, 1, EmptyDrawRng()
+    )
+
+    assert inclusion_probability == pytest.approx(0.25 + 0.75**4 / 4)
+    assert selected_count == 1
+    assert value_model_utils.gen_value_optimizer_selected(marked[0])
+    assert not any(value_model_utils.gen_value_optimizer_selected(pair) for pair in marked[1:])
 
 
 def test_gen_value_validation_targets_use_empirical_initial_and_sampled_prefix_returns():

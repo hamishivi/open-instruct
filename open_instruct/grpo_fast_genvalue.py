@@ -405,7 +405,7 @@ class GenValueTrainerActor:
             output_dir, self._step_count, examples, self._trace_seen_by_outcome
         )
 
-    def reinforce_step(self, training_pairs: list[dict]) -> dict:
+    def reinforce_step(self, training_pairs: list[dict], optimizer_inclusion_probability: float = 1.0) -> dict:
         """Apply one REINFORCE gradient step with the MSE-shaped critic reward.
 
         Exact token-identical states first share their empirical Monte Carlo
@@ -416,6 +416,11 @@ class GenValueTrainerActor:
         reinforce_step_started_at = time.perf_counter()
         if not training_pairs:
             return {"gen_value/version": self._step_count, "gen_value/reinforce_steps": self._step_count}
+        if not 0.0 < optimizer_inclusion_probability <= 1.0:
+            raise ValueError(
+                "Generative-critic optimizer inclusion probability must be in (0, 1], got "
+                f"{optimizer_inclusion_probability}."
+            )
 
         pairs_with_outcomes = [pair for pair in training_pairs if pair["outcome"] is not None]
         if self._pool_shared_state_returns:
@@ -442,8 +447,6 @@ class GenValueTrainerActor:
         # Optimizer inputs include intentional final-action replay copies.  Keep
         # separate unique-sample diagnostics so replaying easy terminal states
         # cannot make the reported critic calibration look artificially strong.
-        optimization_mses: list[float] = []
-        optimization_v_hats: list[float] = []
         unique_rewards: list[float] = []
         unique_outcomes: list[float] = []
         unique_sampled_outcomes: list[float] = []
@@ -483,8 +486,6 @@ class GenValueTrainerActor:
             sampled_outcome = max(0.0, min(1.0, float(pair["outcome"])))
             outcome = return_targets[sample_id]
             v_hat = self._score_from_text(completion.text)
-            if v_hat is not None:
-                optimization_v_hats.append(v_hat)
             reward, squared_error = value_model_utils.generative_value_reinforce_reward(outcome, v_hat)
             sampled_squared_error = None if v_hat is None else (v_hat - sampled_outcome) ** 2
             is_first_replay = sample_id in diagnostic_pair_ids
@@ -510,12 +511,14 @@ class GenValueTrainerActor:
                     squared_error,
                     reward,
                 )
-            if squared_error is not None:
-                optimization_mses.append(squared_error)
-                if is_first_replay and value_model_utils.is_gen_value_near_horizon_incorrect(pair):
-                    near_horizon_incorrect_v_hats.append(v_hat)
-                    assert sampled_squared_error is not None
-                    near_horizon_incorrect_mses.append(sampled_squared_error)
+            if (
+                squared_error is not None
+                and is_first_replay
+                and value_model_utils.is_gen_value_near_horizon_incorrect(pair)
+            ):
+                near_horizon_incorrect_v_hats.append(v_hat)
+                assert sampled_squared_error is not None
+                near_horizon_incorrect_mses.append(sampled_squared_error)
             validated_examples.append(
                 {
                     "sequence_ids": sequence_ids,
@@ -524,6 +527,10 @@ class GenValueTrainerActor:
                     "outcome": outcome,
                     "reward": reward,
                     "source_pair_id": sample_id,
+                    "optimizer_selected": value_model_utils.gen_value_optimizer_selected(pair),
+                    "parsed": v_hat is not None,
+                    "prediction": v_hat,
+                    "squared_error": squared_error,
                 }
             )
 
@@ -541,18 +548,36 @@ class GenValueTrainerActor:
         for example, reinforce_weight in zip(validated_examples, reinforce_weights):
             example["reward"] = reinforce_weight
 
+        optimizer_examples = [example for example in validated_examples if example["optimizer_selected"]]
+        if not optimizer_examples:
+            raise RuntimeError("Generative-critic optimizer sampling selected no valid examples.")
+        optimizer_raw_rewards = [
+            raw_reward
+            for example, raw_reward in zip(validated_examples, raw_rewards, strict=True)
+            if example["optimizer_selected"]
+        ]
+        optimizer_weights = [float(example["reward"]) for example in optimizer_examples]
+        optimizer_outcomes = [float(example["outcome"]) for example in optimizer_examples]
+        optimizer_mses = [
+            float(example["squared_error"]) for example in optimizer_examples if example["squared_error"] is not None
+        ]
+        optimizer_v_hats = [
+            float(example["prediction"]) for example in optimizer_examples if example["prediction"] is not None
+        ]
+        optimizer_sample_ids = {int(example["source_pair_id"]) for example in optimizer_examples}
+
         training_preparation_seconds = time.perf_counter() - reinforce_step_started_at
         packing_started_at = time.perf_counter()
-        packs = value_model_utils.pack_gen_value_examples(validated_examples, self._pack_length)
+        packs = value_model_utils.pack_gen_value_examples(optimizer_examples, self._pack_length)
         training_packing_seconds = time.perf_counter() - packing_started_at
         # DeepSpeed's BF16 optimizer owns the FP32 accumulation buffers, so clear
         # it directly rather than only clearing the BF16 module gradients.
         self._optimizer.zero_grad()
-        reinforce_token_denominator = sum(len(example["generated_ids"]) for example in validated_examples)
-        gradient_scale = self._reinforce_coef / max(reinforce_token_denominator, 1)
+        candidate_reinforce_tokens = sum(len(example["generated_ids"]) for example in validated_examples)
+        optimizer_reinforce_tokens = sum(len(example["generated_ids"]) for example in optimizer_examples)
+        gradient_scale = self._reinforce_coef / (max(candidate_reinforce_tokens, 1) * optimizer_inclusion_probability)
         total_loss = 0.0
-        rewards = raw_rewards
-        optimization_parsed_count = len(optimization_v_hats)
+        optimization_parsed_count = sum(bool(example["parsed"]) for example in optimizer_examples)
         unique_parsed_count = len(unique_v_hats)
         has_effective_training_signal = False
         reinforce_token_count = 0
@@ -638,37 +663,43 @@ class GenValueTrainerActor:
         metrics = {
             "gen_value/reinforce_loss": total_loss,
             "gen_value/reward_mean": sum(unique_rewards) / len(unique_rewards),
-            "gen_value/optimization_reward_mean": sum(rewards) / len(rewards),
-            "gen_value/reinforce_weight_mean": sum(reinforce_weights) / len(reinforce_weights),
-            "gen_value/reinforce_weight_abs_mean": sum(abs(weight) for weight in reinforce_weights)
-            / len(reinforce_weights),
-            "gen_value/reinforce_weight_positive_frac": sum(weight > 0.0 for weight in reinforce_weights)
-            / len(reinforce_weights),
-            "gen_value/reinforce_weight_negative_frac": sum(weight < 0.0 for weight in reinforce_weights)
-            / len(reinforce_weights),
+            "gen_value/optimization_reward_mean": sum(optimizer_raw_rewards) / len(optimizer_raw_rewards),
+            "gen_value/reinforce_weight_mean": sum(optimizer_weights) / len(optimizer_weights),
+            "gen_value/reinforce_weight_abs_mean": sum(abs(weight) for weight in optimizer_weights)
+            / len(optimizer_weights),
+            "gen_value/reinforce_weight_positive_frac": sum(weight > 0.0 for weight in optimizer_weights)
+            / len(optimizer_weights),
+            "gen_value/reinforce_weight_negative_frac": sum(weight < 0.0 for weight in optimizer_weights)
+            / len(optimizer_weights),
             "gen_value/outcome_mean": sum(unique_outcomes) / len(unique_outcomes),
             "gen_value/sampled_outcome_mean": sum(unique_sampled_outcomes) / len(unique_sampled_outcomes),
-            "gen_value/optimization_outcome_mean": sum(outcomes) / len(outcomes),
+            "gen_value/optimization_outcome_mean": sum(optimizer_outcomes) / len(optimizer_outcomes),
             "gen_value/mse": sum(unique_mses) / len(unique_mses) if unique_mses else float("nan"),
             "gen_value/sampled_mse": (
                 sum(unique_sampled_mses) / len(unique_sampled_mses) if unique_sampled_mses else float("nan")
             ),
             "gen_value/optimization_mse": (
-                sum(optimization_mses) / len(optimization_mses) if optimization_mses else float("nan")
+                sum(optimizer_mses) / len(optimizer_mses) if optimizer_mses else float("nan")
             ),
             "gen_value/parse_rate": unique_parsed_count / len(unique_rewards),
-            "gen_value/optimization_parse_rate": optimization_parsed_count / len(rewards),
+            "gen_value/optimization_parse_rate": optimization_parsed_count / len(optimizer_examples),
             "gen_value/version": self._step_count,
             "gen_value/reinforce_steps": self._step_count,
             "gen_value/train_tokens": reinforce_token_count,
-            "gen_value/train_examples": len(rewards),
+            "gen_value/candidate_train_tokens": candidate_reinforce_tokens,
+            "gen_value/candidate_train_examples": len(validated_examples),
+            "gen_value/train_examples": len(optimizer_examples),
             "gen_value/parsed_examples": optimization_parsed_count,
             "gen_value/unique_examples": len(unique_rewards),
+            "gen_value/optimizer_unique_examples": len(optimizer_sample_ids),
             "gen_value/unique_parsed_examples": unique_parsed_count,
+            "gen_value/optimizer_inclusion_probability": optimizer_inclusion_probability,
+            "gen_value/optimizer_token_sampling_fraction": optimizer_reinforce_tokens
+            / max(candidate_reinforce_tokens, 1),
             "gen_value/train_packs": len(packs),
             "gen_value/train_pack_target_tokens": self._pack_length,
             "gen_value/train_pack_tokens": sum(pack_token_counts),
-            "gen_value/train_examples_per_pack": len(rewards) / len(packs),
+            "gen_value/train_examples_per_pack": len(optimizer_examples) / len(packs),
             "gen_value/train_mean_pack_tokens": sum(pack_token_counts) / len(packs),
             "gen_value/train_max_pack_tokens": max(pack_token_counts),
             "gen_value/training_preparation_seconds": training_preparation_seconds,
@@ -679,7 +710,9 @@ class GenValueTrainerActor:
         }
         metrics.update(
             value_model_utils.generative_value_reinforce_outcome_mass_metrics(
-                reinforce_weights, outcomes, [len(example["generated_ids"]) for example in validated_examples]
+                optimizer_weights,
+                optimizer_outcomes,
+                [len(example["generated_ids"]) for example in optimizer_examples],
             )
         )
         metrics.update(pooling_metrics)
@@ -704,8 +737,8 @@ class GenValueTrainerActor:
             # vs. ``outcome_mean`` and whether it's moving over training. Undefined when
             # no pair parsed this step, so we only emit the key when we have signal.
             metrics["gen_value/v_hat_mean"] = sum(unique_v_hats) / len(unique_v_hats)
-        if optimization_v_hats:
-            metrics["gen_value/optimization_v_hat_mean"] = sum(optimization_v_hats) / len(optimization_v_hats)
+        if optimizer_v_hats:
+            metrics["gen_value/optimization_v_hat_mean"] = sum(optimizer_v_hats) / len(optimizer_v_hats)
         if near_horizon_incorrect_v_hats:
             metrics["gen_value/near_horizon_incorrect_v_hat_mean"] = sum(near_horizon_incorrect_v_hats) / len(
                 near_horizon_incorrect_v_hats
@@ -834,11 +867,12 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
     # number of complete rollouts as one global policy batch, irrespective of policy world size.
     gen_value_batch_size: int | None = None
     # Optional optimizer-minibatch target applied after selecting a fresh policy-sized
-    # rollout batch and before final-action replay. A uniform subset leaves the
-    # pair-weighted REINFORCE objective unchanged in expectation while allowing the
-    # critic to take frequent fresh updates instead of accumulating every segment
-    # example (often several thousand) into one very slow optimizer step. Exact
-    # shared-state groups remain intact, so the realized size can vary around the target.
+    # rollout batch and before final-action replay. Full-batch shared-state targets
+    # and leave-one-out weights are retained, then a prompt-group Bernoulli subset
+    # receives an exact Horvitz-Thompson gradient scale. This leaves the full-batch
+    # token objective unchanged in expectation while allowing frequent fresh updates
+    # instead of accumulating every segment example into one slow optimizer step.
+    # Exact shared-state groups remain intact, so realized size varies around the target.
     gen_value_train_target_examples_per_update: int | None = None
     # Maximum source-policy lag retained for critic training. This is intentionally
     # independent of the policy rollout pipeline's async_steps: enqueue never
@@ -1205,6 +1239,9 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
         "gen_value/optimization_mse": "gen_value/parsed_examples",
         "gen_value/v_hat_mean": "gen_value/unique_parsed_examples",
         "gen_value/optimization_v_hat_mean": "gen_value/parsed_examples",
+        "gen_value/optimizer_pair_sampling_fraction": "gen_value/candidate_unique_pairs",
+        "gen_value/optimizer_token_sampling_fraction": "gen_value/candidate_train_tokens",
+        "gen_value/optimizer_inclusion_probability": "gen_value/candidate_unique_pairs",
         "gen_value/near_horizon_incorrect_v_hat_mean": "gen_value/near_horizon_incorrect_examples",
         "gen_value/near_horizon_incorrect_mse": "gen_value/near_horizon_incorrect_examples",
         "gen_value/tis_ratio": "gen_value/tis_tokens",
@@ -1225,6 +1262,9 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
         "gen_value/final_action_replay_examples",
         "gen_value/batch_tokens",
         "gen_value/batch_sequence_tokens",
+        "gen_value/candidate_batch_sequence_tokens",
+        "gen_value/candidate_train_tokens",
+        "gen_value/candidate_train_examples",
         "gen_value/train_tokens",
         "gen_value/train_examples",
         "gen_value/reinforce_correct_examples",
@@ -1237,7 +1277,10 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
         "gen_value/reinforce_incorrect_abs_token_weight_mass",
         "gen_value/parsed_examples",
         "gen_value/unique_examples",
+        "gen_value/optimizer_unique_examples",
         "gen_value/unique_parsed_examples",
+        "gen_value/candidate_unique_pairs",
+        "gen_value/optimizer_unique_pairs",
         "gen_value/shared_state_unique_examples",
         "gen_value/shared_state_groups",
         "gen_value/shared_state_pooled_groups",
@@ -1594,23 +1637,33 @@ def _gen_value_reinforce_loop(
                 else:
                     pairs = [pair for rollout in rollouts for pair in rollout["pairs"]]
             candidate_pair_count = len(pairs)
+            optimizer_inclusion_probability = 1.0
+            optimizer_unique_pair_count = candidate_pair_count
             if target_examples_per_update is not None:
-                pairs = value_model_utils.sample_gen_value_training_pairs(
-                    pairs, target_examples_per_update, pair_sampling_rng
+                pairs, optimizer_inclusion_probability, optimizer_unique_pair_count = (
+                    value_model_utils.mark_gen_value_training_pairs_for_optimizer(
+                        pairs, target_examples_per_update, pair_sampling_rng
+                    )
                 )
-            sampled_pair_count = len(pairs)
-            unique_pair_count = len(pairs)
+            unique_pair_count = candidate_pair_count
             pairs = value_model_utils.replay_gen_value_final_actions(pairs, final_action_replay_weight)
+            optimizer_pairs = [pair for pair in pairs if value_model_utils.gen_value_optimizer_selected(pair)]
             policy_training_steps = [int(rollout["policy_training_step"]) for rollout in rollouts]
             policy_model_versions = [int(rollout["policy_model_version"]) for rollout in rollouts]
             source_versions = [int(rollout["critic_version"]) for rollout in rollouts]
-            batch_sequence_tokens = sum(
+            candidate_batch_sequence_tokens = sum(
                 len(pair["request_output"].prompt_token_ids)
                 + sum(len(completion.token_ids) for completion in pair["request_output"].outputs)
                 for pair in pairs
             )
+            batch_sequence_tokens = sum(
+                len(pair["request_output"].prompt_token_ids)
+                + sum(len(completion.token_ids) for completion in pair["request_output"].outputs)
+                for pair in optimizer_pairs
+            )
             batch_response_tokens = sum(
-                sum(len(completion.token_ids) for completion in pair["request_output"].outputs) for pair in pairs
+                sum(len(completion.token_ids) for completion in pair["request_output"].outputs)
+                for pair in optimizer_pairs
             )
             # The checkpoint request can arrive after selection but before the
             # actor RPC. A second hold here closes that race without discarding
@@ -1618,17 +1671,18 @@ def _gen_value_reinforce_loop(
             _hold_gen_value_training_for_checkpoint(checkpoint_pause_event, checkpoint_paused_event, stop_event)
             trained_rollouts += len(rollouts)
             metrics, _ = utils.ray_get_with_progress(
-                [trainer_actor.reinforce_step.remote(pairs)],
+                [trainer_actor.reinforce_step.remote(pairs, optimizer_inclusion_probability)],
                 desc="Training generative critic",
                 enable=False,
                 timeout=_GEN_VALUE_OPERATION_TIMEOUT_S,
             )
             metrics = metrics[0]
             reported_train_examples = metrics.get("gen_value/train_examples")
-            if reported_train_examples != len(pairs):
+            if reported_train_examples != len(optimizer_pairs):
                 raise RuntimeError(
                     "Generative-critic trainer example accounting diverged across the Ray boundary: "
-                    f"driver sent {len(pairs)} examples, trainer reported {reported_train_examples}."
+                    f"driver selected {len(optimizer_pairs)} optimizer examples, trainer reported "
+                    f"{reported_train_examples}."
                 )
             reported_unique_examples = metrics.get("gen_value/unique_examples")
             if reported_unique_examples != unique_pair_count:
@@ -1636,6 +1690,13 @@ def _gen_value_reinforce_loop(
                     "Generative-critic replay identity diverged across the Ray boundary: "
                     f"driver sent {unique_pair_count} unique examples, trainer reported "
                     f"{reported_unique_examples}."
+                )
+            reported_optimizer_unique_examples = metrics.get("gen_value/optimizer_unique_examples")
+            if reported_optimizer_unique_examples != optimizer_unique_pair_count:
+                raise RuntimeError(
+                    "Generative-critic optimizer selection diverged across the Ray boundary: "
+                    f"driver selected {optimizer_unique_pair_count} unique examples, trainer reported "
+                    f"{reported_optimizer_unique_examples}."
                 )
             critic_version = int(metrics["gen_value/version"])
             if model_snapshot_freq > 0 and critic_version % model_snapshot_freq == 0:
@@ -1700,11 +1761,14 @@ def _gen_value_reinforce_loop(
                     "gen_value/batch_pairs": len(pairs),
                     "gen_value/batch_unique_pairs": unique_pair_count,
                     "gen_value/candidate_unique_pairs": candidate_pair_count,
-                    "gen_value/sampled_unique_pairs": sampled_pair_count,
-                    "gen_value/pair_sampling_fraction": sampled_pair_count / candidate_pair_count,
+                    "gen_value/optimizer_unique_pairs": optimizer_unique_pair_count,
+                    "gen_value/optimizer_pair_sampling_fraction": optimizer_unique_pair_count
+                    / max(candidate_pair_count, 1),
+                    "gen_value/optimizer_inclusion_probability": optimizer_inclusion_probability,
                     "gen_value/final_action_replay_examples": len(pairs) - unique_pair_count,
                     "gen_value/batch_tokens": batch_response_tokens,
                     "gen_value/batch_sequence_tokens": batch_sequence_tokens,
+                    "gen_value/candidate_batch_sequence_tokens": candidate_batch_sequence_tokens,
                     "gen_value/training_queue_size": training_queue.qsize(),
                     "gen_value/pending_rollouts": len(pending_rollouts),
                     "gen_value/admitted_rollouts": admitted_rollouts,
