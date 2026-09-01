@@ -225,7 +225,13 @@ class GenValueTrainerActor:
         ds_config = utils.get_train_ds_config(
             offload=False,
             adam_offload=False,
-            stage=0,
+            # DeepSpeed's BF16 stage-0 wrapper stores optimizer state outside the
+            # model checkpoint but does not enable the corresponding save/load
+            # path.  In particular, a resumed trainer can load BF16 module
+            # weights while leaving its FP32 master weights at initialization.
+            # ZeRO stage 1 is equivalent for this single-GPU actor, and makes
+            # DeepSpeed save/restore the FP32 masters and Adam moments.
+            stage=1,
             bf16=True,
             max_norm=max_grad_norm,
             zpg=1,
