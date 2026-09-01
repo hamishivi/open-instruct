@@ -12,13 +12,14 @@ import torch
 
 pytest.importorskip("vllm")
 
-from open_instruct import grpo_fast
+from open_instruct import grpo_fast, value_model_utils
 from open_instruct.dataset_transformation import INPUT_IDS_PROMPT_KEY, TokenizerConfig
 from open_instruct.grpo_fast_genvalue import (
     GenValueTrainingProgress,
     GenValueExperimentConfig,
     _build_sample_scoring_prompts,
     _drain_gen_value_metrics,
+    _gen_value_reinforce_loop,
     _gen_value_scoring_loop,
     _hold_gen_value_training_for_checkpoint,
     _put_gen_value_metrics,
@@ -401,6 +402,115 @@ def test_gen_value_latest_enqueue_evicts_oldest_shard_and_records_discard(monkey
     assert evicted == old_rollouts
     assert trainer._gen_value_training_queue.get(block=False) == new_rollouts
     assert discarded_steps == [7]
+
+
+def test_gen_value_reinforce_loop_trains_queued_batches_consecutively_freshest_first(monkeypatch, tmp_path):
+    training_queue = Queue()
+    stop_event = threading.Event()
+    trained_policy_steps: list[list[int]] = []
+    discarded_policy_steps: list[list[int]] = []
+    optimizer_calls: list[dict[str, object]] = []
+
+    class RecordedRemoteMethod:
+        def __init__(self, calls: list[list[int]]):
+            self.calls = calls
+
+        def remote(self, policy_steps):
+            self.calls.append(list(policy_steps))
+            return None
+
+    class ReinforceRemoteMethod:
+        def remote(self, pairs, inclusion_probability):
+            selected_pairs = [pair for pair in pairs if value_model_utils.gen_value_optimizer_selected(pair)]
+            optimizer_calls.append(
+                {
+                    "markers": [int(pair["marker"]) for pair in pairs],
+                    "selected_markers": [int(pair["marker"]) for pair in selected_pairs],
+                    "inclusion_probability": inclusion_probability,
+                }
+            )
+            version = len(optimizer_calls)
+            if version == 2:
+                stop_event.set()
+            return {
+                "gen_value/train_examples": len(selected_pairs),
+                "gen_value/unique_examples": len(pairs),
+                "gen_value/optimizer_unique_examples": len(selected_pairs),
+                "gen_value/version": version,
+            }
+
+    training_progress = SimpleNamespace(
+        record_trained_policy_steps=RecordedRemoteMethod(trained_policy_steps),
+        record_discarded_policy_steps=RecordedRemoteMethod(discarded_policy_steps),
+    )
+    trainer_actor = SimpleNamespace(reinforce_step=ReinforceRemoteMethod())
+
+    def make_rollout(policy_step: int, marker: int):
+        request_output = SimpleNamespace(
+            prompt_token_ids=[marker], outputs=[SimpleNamespace(token_ids=[marker, marker + 1])]
+        )
+        return {
+            "policy_training_step": policy_step,
+            "policy_model_version": policy_step,
+            "critic_version": 0,
+            "pairs": [{"marker": marker, "request_output": request_output}],
+        }
+
+    # Both complete policy tranches are visible when the consumer starts. The
+    # latest-first loop must optimize the newer tranche first, then immediately
+    # consume the still-admissible older tranche without waiting for generation.
+    training_queue.put([make_rollout(1, 10), make_rollout(1, 11)])
+    training_queue.put([make_rollout(2, 20), make_rollout(2, 21)])
+
+    monkeypatch.setattr(
+        "open_instruct.grpo_fast_genvalue.utils.ray_get_with_progress", lambda refs, **_: (refs, None)
+    )
+    monkeypatch.setattr("open_instruct.grpo_fast_genvalue.ray.get", lambda value: value)
+    monkeypatch.setattr(
+        "open_instruct.grpo_fast_genvalue._wait_for_gen_value_publish_barrier", lambda *_args, **_kwargs: 0.0
+    )
+
+    _gen_value_reinforce_loop(
+        trainer_actor=trainer_actor,
+        training_queue=training_queue,
+        training_progress=training_progress,
+        batch_size=2,
+        target_examples_per_update=1,
+        max_async_steps=4,
+        training_seed=0,
+        stop_event=stop_event,
+        checkpoint_pause_event=threading.Event(),
+        checkpoint_paused_event=threading.Event(),
+        metrics_Q=Queue(),
+        progress_state={
+            "version": 0,
+            "synced_version": 0,
+            "latest_source_policy_training_step": None,
+            "training_queue_size": 0,
+            "pending_rollouts": 0,
+            "admitted_rollouts": 0,
+            "trained_rollouts": 0,
+            "discarded_stale_rollouts": 0,
+            "pending_publish_version": None,
+        },
+        progress_lock=threading.Lock(),
+        validation_max_examples=0,
+        validation_seed=0,
+        validation_prompt_holdout_fraction=0.0,
+        final_action_replay_weight=1,
+        model_snapshot_freq=0,
+        output_dir=str(tmp_path),
+        validation_state={"captured": False, "examples": []},
+        validation_lock=threading.Lock(),
+        sync_freq=1,
+        publish_complete_event=threading.Event(),
+    )
+
+    assert [call["markers"] for call in optimizer_calls] == [[20, 21], [10, 11]]
+    assert [len(call["selected_markers"]) for call in optimizer_calls] == [1, 1]
+    assert [call["inclusion_probability"] for call in optimizer_calls] == [pytest.approx(0.625)] * 2
+    assert trained_policy_steps == [[2, 2], [1, 1]]
+    assert discarded_policy_steps == []
 
 
 def test_gen_value_publish_barrier_releases_after_serving_version_advances():
