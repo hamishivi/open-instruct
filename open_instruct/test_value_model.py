@@ -163,6 +163,7 @@ class TestGenValueTrainingProgressState(unittest.TestCase):
             progress.get_rollout_accounting(),
             {
                 "latest_processed_policy_step": 76,
+                "latest_trained_policy_step": 76,
                 "admitted_rollouts": 8,
                 "trained_rollouts": 4,
                 "discarded_rollouts": 4,
@@ -1331,6 +1332,90 @@ class TestValueLoss(unittest.TestCase):
         self.assertEqual(selected_positions, set(positions))
         self.assertEqual(sum(example["outcome"] == 0.0 for example in selected), 4)
         self.assertEqual(sum(example["outcome"] == 1.0 for example in selected), 4)
+
+    def test_gen_value_sft_trace_selection_prefers_pooled_training_target_error(self):
+        shared_state = {
+            "source_critic_version": 25,
+            "prediction": 0.5,
+            "training_target": 0.5,
+            "training_target_squared_error": 0.0,
+            "state_kind": "segment_start",
+            "trajectory_fraction": 0.5,
+        }
+        examples = [
+            {
+                **shared_state,
+                "outcome": 1.0,
+                "squared_error": 0.25,
+                "prompt": "ambiguous-correct-prefix",
+                "generation": "calibrated reasoning <answer>5</answer>",
+            },
+            {
+                **shared_state,
+                "outcome": 0.0,
+                "squared_error": 0.25,
+                "prompt": "ambiguous-incorrect-prefix",
+                "generation": "calibrated reasoning <answer>5</answer>",
+            },
+        ]
+
+        selected = select_gen_value_sft_traces(examples, max_squared_error=0.04, seed=5)
+
+        self.assertEqual(len(selected), 2)
+        self.assertEqual({example["outcome"] for example in selected}, {0.0, 1.0})
+
+    def test_gen_value_sft_trace_selection_deduplicates_by_pooled_training_target_error(self):
+        examples = [
+            {
+                "source_critic_version": 25,
+                "outcome": 1.0,
+                "prediction": 1.0,
+                "squared_error": 0.0,
+                "training_target": 0.5,
+                "training_target_squared_error": 0.25,
+                "prompt": "shared-prefix",
+                "generation": "sample-accurate but pooled-inaccurate <answer>10</answer>",
+            },
+            {
+                "source_critic_version": 25,
+                "outcome": 1.0,
+                "prediction": 0.5,
+                "squared_error": 0.25,
+                "training_target": 0.5,
+                "training_target_squared_error": 0.0,
+                "prompt": "shared-prefix",
+                "generation": "pooled-accurate <answer>5</answer>",
+            },
+        ]
+
+        selected = select_gen_value_sft_traces(examples, max_squared_error=0.3, balance_outcomes=False, seed=5)
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["generation"], "pooled-accurate <answer>5</answer>")
+
+    def test_gen_value_sft_trace_selection_falls_back_to_sampled_error(self):
+        examples = [
+            {
+                "source_critic_version": 25,
+                "outcome": 1.0,
+                "prediction": 0.9,
+                "squared_error": 0.01,
+                "prompt": "legacy-correct-prefix",
+                "generation": "legacy reasoning <answer>9</answer>",
+            },
+            {
+                "source_critic_version": 25,
+                "outcome": 0.0,
+                "prediction": 0.1,
+                "squared_error": 0.01,
+                "prompt": "legacy-incorrect-prefix",
+                "generation": "legacy reasoning <answer>1</answer>",
+            },
+        ]
+
+        selected = select_gen_value_sft_traces(examples, max_squared_error=0.04, seed=5)
+
+        self.assertEqual(len(selected), 2)
 
     def test_final_action_prefix_retains_observations_and_is_causal(self):
         prefix, response_tokens_used = causal_final_action_prefix_token_ids(

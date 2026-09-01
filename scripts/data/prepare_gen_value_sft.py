@@ -64,7 +64,10 @@ def parse_args() -> argparse.Namespace:
         "--max_squared_error",
         type=float,
         default=0.04,
-        help="Retain traces whose parsed scalar prediction is within sqrt(threshold) of the outcome.",
+        help=(
+            "Retain traces whose parsed scalar prediction is within sqrt(threshold) of the pooled training target, "
+            "falling back to the sampled outcome for older reservoirs."
+        ),
     )
     parser.add_argument("--min_critic_version", type=int, default=0)
     parser.add_argument("--max_examples_per_outcome", type=int)

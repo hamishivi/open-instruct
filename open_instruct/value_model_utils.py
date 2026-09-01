@@ -1414,13 +1414,19 @@ def select_gen_value_sft_traces(
     balance_positions: bool = True,
     seed: int = 0,
 ) -> list[dict[str, Any]]:
-    """Select parsed, accurate critic traces for prompt-preserving SFT.
+    """Select parsed, training-target-accurate critic traces for prompt-preserving SFT.
 
     Each retained prompt is used at most once so SFT cannot see contradictory
     completions for the same state. By default, sampling after the accuracy gate
     balances both outcomes and trajectory positions. This prevents final-action
     replay from crowding intermediate states out of the SFT set and explicitly
     retains the early-to-late coverage needed to learn value propagation.
+
+    New reservoirs record error against both the sampled return and the pooled
+    shared-state training target. Prefer the latter so a calibrated prediction
+    for an ambiguous shared prefix is not rejected merely because one sibling
+    rollout happened to succeed or fail. Older reservoirs fall back to their
+    sampled-return ``squared_error`` field.
     """
     if max_squared_error < 0:
         raise ValueError(f"max_squared_error must be nonnegative, got {max_squared_error}.")
@@ -1430,11 +1436,14 @@ def select_gen_value_sft_traces(
         raise ValueError(f"max_examples_per_outcome must be positive when set, got {max_examples_per_outcome}.")
 
     best_by_prompt: dict[str, dict[str, Any]] = {}
+    best_error_by_prompt: dict[str, float] = {}
     for example in examples:
         prompt = example.get("prompt")
         generation = example.get("generation")
         prediction = example.get("prediction")
-        squared_error = example.get("squared_error")
+        squared_error = example.get("training_target_squared_error")
+        if not isinstance(squared_error, (float, int)) or not math.isfinite(float(squared_error)):
+            squared_error = example.get("squared_error")
         outcome = example.get("outcome")
         critic_version = example.get("source_critic_version", 0)
         if not isinstance(prompt, str) or not prompt or not isinstance(generation, str) or not generation:
@@ -1449,9 +1458,10 @@ def select_gen_value_sft_traces(
             continue
         if float(squared_error) > max_squared_error:
             continue
-        previous = best_by_prompt.get(prompt)
-        if previous is None or float(squared_error) < float(previous["squared_error"]):
+        previous_error = best_error_by_prompt.get(prompt)
+        if previous_error is None or float(squared_error) < previous_error:
             best_by_prompt[prompt] = dict(example)
+            best_error_by_prompt[prompt] = float(squared_error)
 
     def position_bucket(example: dict[str, Any]) -> str:
         if example.get("state_kind") == "final_action":
