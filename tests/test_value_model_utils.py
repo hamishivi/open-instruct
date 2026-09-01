@@ -451,6 +451,44 @@ def test_read_gen_value_validation_snapshot_rejects_invalid_rows(tmp_path, row, 
         value_model_utils.read_gen_value_validation_snapshot(snapshot_path)
 
 
+def test_gen_value_validation_panel_round_trips_exact_examples(tmp_path):
+    examples = [
+        {
+            "prompt_token_ids": [1, 2, 3],
+            "kind": "segment_start",
+            "target": 0.75,
+            "target_source": "empirical_sibling_return",
+        },
+        {
+            "prompt_token_ids": [4, 5],
+            "kind": "final_action",
+            "target": 0.0,
+            "target_source": "single_sample_return",
+        },
+    ]
+
+    panel_path = value_model_utils.write_gen_value_validation_panel(str(tmp_path), examples)
+
+    assert panel_path == tmp_path / "gen_value_validation/panel.jsonl"
+    assert value_model_utils.read_gen_value_validation_panel(panel_path) == examples
+
+
+@pytest.mark.parametrize(
+    "row, message",
+    [
+        ({"prompt_token_ids": [], "target": 1.0}, "integer prompt_token_ids"),
+        ({"prompt_token_ids": [1, True], "target": 1.0}, "integer prompt_token_ids"),
+        ({"prompt_token_ids": [1, 2]}, "numeric target"),
+    ],
+)
+def test_read_gen_value_validation_panel_rejects_invalid_rows(tmp_path, row, message):
+    panel_path = tmp_path / "panel.jsonl"
+    panel_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        value_model_utils.read_gen_value_validation_panel(panel_path)
+
+
 @pytest.mark.parametrize(
     ("threshold", "observed", "expected"),
     [

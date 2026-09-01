@@ -2338,7 +2338,24 @@ def main():
         "pending_publish_version": None,
     }
     gen_value_validation_lock = threading.Lock()
-    gen_value_validation_state: dict[str, Any] = {"captured": False, "examples": []}
+    restored_validation_examples: list[dict[str, Any]] = []
+    if checkpoint_state:
+        validation_panel_path = checkpoint_state.get("gen_value_validation_panel")
+        if validation_panel_path:
+            if not os.path.isabs(validation_panel_path):
+                validation_panel_path = os.path.join(args.checkpoint_state_dir, validation_panel_path)
+            restored_validation_examples = value_model_utils.read_gen_value_validation_panel(
+                pathlib.Path(validation_panel_path)
+            )
+            logger.info(
+                "Restored fixed generative-critic validation panel with %d examples from %s.",
+                len(restored_validation_examples),
+                validation_panel_path,
+            )
+    gen_value_validation_state: dict[str, Any] = {
+        "captured": bool(restored_validation_examples),
+        "examples": restored_validation_examples,
+    }
     gen_value_scoring_future: futures.Future | None = None
     gen_value_reinforce_future: futures.Future | None = None
 
@@ -2620,7 +2637,23 @@ def main():
             desc="Saving generative critic checkpoint",
             timeout=_GEN_VALUE_OPERATION_TIMEOUT_S,
         )
-        return results[0]
+        checkpoint_metadata = results[0]
+        with gen_value_validation_lock:
+            validation_examples = list(gen_value_validation_state["examples"])
+        if validation_examples:
+            panel_path = value_model_utils.write_gen_value_validation_panel(checkpoint_state_dir, validation_examples)
+            checkpoint_metadata.update(
+                {
+                    "gen_value_validation_panel": str(panel_path.relative_to(checkpoint_state_dir)),
+                    "gen_value_validation_examples": len(validation_examples),
+                }
+            )
+            logger.info(
+                "Saved fixed generative-critic validation panel with %d examples to %s.",
+                len(validation_examples),
+                panel_path,
+            )
+        return checkpoint_metadata
 
     def _commit_gen_value_checkpoint(checkpoint_state_dir: str, training_step: int) -> None:
         del training_step

@@ -1358,6 +1358,57 @@ def write_gen_value_validation_snapshot(
     return snapshot_path
 
 
+def write_gen_value_validation_panel(checkpoint_state_dir: str, examples: Sequence[dict[str, Any]]) -> pathlib.Path:
+    """Persist the exact fixed critic panel alongside resumable trainer state."""
+    panel_dir = pathlib.Path(checkpoint_state_dir) / "gen_value_validation"
+    panel_dir.mkdir(parents=True, exist_ok=True)
+    panel_path = panel_dir / "panel.jsonl"
+    temporary_path = panel_path.with_suffix(".jsonl.tmp")
+    with temporary_path.open("w", encoding="utf-8") as panel_file:
+        for index, example in enumerate(examples):
+            prompt_token_ids = example.get("prompt_token_ids")
+            if (
+                not isinstance(prompt_token_ids, list)
+                or not prompt_token_ids
+                or not all(
+                    isinstance(token_id, int) and not isinstance(token_id, bool) for token_id in prompt_token_ids
+                )
+            ):
+                raise ValueError(f"Validation panel example {index} is missing integer prompt_token_ids.")
+            if not isinstance(example.get("target"), int | float):
+                raise ValueError(f"Validation panel example {index} is missing a numeric target.")
+            panel_file.write(json.dumps(example, ensure_ascii=False) + "\n")
+    temporary_path.replace(panel_path)
+    return panel_path
+
+
+def read_gen_value_validation_panel(path: pathlib.Path) -> list[dict[str, Any]]:
+    """Read the exact fixed critic panel saved in a resumable checkpoint."""
+    examples: list[dict[str, Any]] = []
+    with path.open(encoding="utf-8") as panel_file:
+        for line_number, line in enumerate(panel_file, start=1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                raise ValueError(f"Expected an object at {path}:{line_number}, got {type(row).__name__}.")
+            prompt_token_ids = row.get("prompt_token_ids")
+            if (
+                not isinstance(prompt_token_ids, list)
+                or not prompt_token_ids
+                or not all(
+                    isinstance(token_id, int) and not isinstance(token_id, bool) for token_id in prompt_token_ids
+                )
+            ):
+                raise ValueError(f"Missing integer prompt_token_ids at {path}:{line_number}.")
+            if not isinstance(row.get("target"), int | float):
+                raise ValueError(f"Missing numeric target at {path}:{line_number}.")
+            examples.append(row)
+    if not examples:
+        raise ValueError(f"Validation panel is empty: {path}.")
+    return examples
+
+
 def read_gen_value_validation_snapshot(path: pathlib.Path) -> list[dict[str, Any]]:
     """Read and validate a persisted fixed generative-critic holdout."""
     examples: list[dict[str, Any]] = []
