@@ -11,9 +11,13 @@ from scripts.data.synthesize_gen_value_sft import (
     extract_response_text,
     make_batch_request,
     prepare,
+    prompt_has_ground_truth_conditioning,
     select_teacher_consensus,
     select_teacher_states,
+    strip_ground_truth_conditioning,
 )
+
+from open_instruct.value_model_utils import build_generative_value_prompt
 
 
 class TestGenValueSFTSynthesis(unittest.TestCase):
@@ -439,6 +443,77 @@ class TestGenValueSFTSynthesis(unittest.TestCase):
                         allow_ground_truth_conditioning=False,
                     )
                 )
+
+    def test_strip_ground_truth_conditioning_reconstructs_exact_none_prompt(self):
+        gt_prompt = build_generative_value_prompt(
+            partial_response="The correct answer is not obvious, so continue.",
+            conditioning="gt",
+            ground_truth="42",
+            problem="A problem whose prose says: The correct answer is requested.",
+            actor_model_name="Qwen/Qwen3-4B-Base",
+            actor_success_rate=0.2,
+            response_tokens_used=128,
+            response_token_limit=8192,
+        )
+        expected = build_generative_value_prompt(
+            partial_response="The correct answer is not obvious, so continue.",
+            conditioning="none",
+            ground_truth="42",
+            problem="A problem whose prose says: The correct answer is requested.",
+            actor_model_name="Qwen/Qwen3-4B-Base",
+            actor_success_rate=0.2,
+            response_tokens_used=128,
+            response_token_limit=8192,
+        )
+
+        actual, stripped = strip_ground_truth_conditioning(gt_prompt)
+
+        self.assertTrue(stripped)
+        self.assertEqual(actual, expected)
+        self.assertIn("The correct answer is requested", actual)
+        self.assertIn("The correct answer is not obvious", actual)
+
+        unchanged, stripped = strip_ground_truth_conditioning(expected)
+        self.assertFalse(stripped)
+        self.assertEqual(unchanged, expected)
+
+    def test_prepare_can_strip_online_ground_truth_conditioning_for_teacher_sft(self):
+        example = self._state(0.0, "early")
+        example["prompt"] = build_generative_value_prompt(
+            partial_response="A partial derivation.",
+            conditioning="gt",
+            ground_truth="7",
+            problem="Compute the quantity.",
+        )
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            input_path = root / "snapshot.jsonl"
+            input_path.write_text(json.dumps(example) + "\n")
+
+            prepare(
+                argparse.Namespace(
+                    inputs=[input_path],
+                    batch_output=root / "batch.jsonl",
+                    metadata_output=root / "metadata.jsonl",
+                    model="gpt-5",
+                    reasoning_effort="medium",
+                    max_output_tokens=1024,
+                    exclude_problem_dataset=None,
+                    min_critic_version=25,
+                    max_examples_per_outcome=1,
+                    seed=0,
+                    allow_ground_truth_conditioning=False,
+                    strip_ground_truth_conditioning=True,
+                )
+            )
+
+            metadata = json.loads((root / "metadata.jsonl").read_text().splitlines()[0])
+            batch = json.loads((root / "batch.jsonl").read_text().splitlines()[0])
+            teacher_prompt = metadata["source"]["prompt"]
+            self.assertFalse(prompt_has_ground_truth_conditioning(teacher_prompt))
+            self.assertNotIn("The correct answer is 7", teacher_prompt)
+            self.assertEqual(metadata["source"]["teacher_prompt_conditioning"], "none")
+            self.assertEqual(batch["body"]["input"], teacher_prompt)
 
     def test_prepare_allows_answer_phrase_inside_actor_rollout(self):
         example = self._state(0.0, "final_action")

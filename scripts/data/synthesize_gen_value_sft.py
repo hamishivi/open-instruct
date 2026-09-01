@@ -46,7 +46,7 @@ that supports the label. Do not mention the verifier, the supplied label, or acc
 generated trace. Because this supervision applies only at the final sampled action, end with exactly
 <answer>{score}</answer>."""
 GROUND_TRUTH_CONDITIONING_MARKER = "\n\nThe correct answer is "
-PARTIAL_RESPONSE_MARKER = "\n\nPartial response:\n<rollout>"
+PARTIAL_RESPONSE_MARKER = "Partial response:\n<rollout>"
 
 
 def read_jsonl(paths: Sequence[pathlib.Path]) -> list[dict[str, Any]]:
@@ -83,6 +83,30 @@ def prompt_has_ground_truth_conditioning(prompt: str) -> bool:
     """
     prefix, delimiter, _ = prompt.partition(PARTIAL_RESPONSE_MARKER)
     return GROUND_TRUTH_CONDITIONING_MARKER in (prefix if delimiter else prompt)
+
+
+def strip_ground_truth_conditioning(prompt: str) -> tuple[str, bool]:
+    """Remove the exact online ``gt`` conditioning line from a critic prompt.
+
+    Only the final conditioning line before the structured partial-response
+    delimiter is eligible. Phrases inside the math problem or actor rollout are
+    preserved, and callers must explicitly opt into this conversion.
+    """
+    prefix, delimiter, suffix = prompt.partition(PARTIAL_RESPONSE_MARKER)
+    if not delimiter:
+        return prompt, False
+    marker_index = prefix.rfind(GROUND_TRUTH_CONDITIONING_MARKER)
+    if marker_index < 0:
+        return prompt, False
+    conditioning_line = prefix[marker_index + 2 :]
+    conditioning_prefix = "The correct answer is "
+    if not conditioning_line.startswith(conditioning_prefix) or not conditioning_line.endswith(". \n"):
+        return prompt, False
+    ground_truth = conditioning_line[len(conditioning_prefix) : -3]
+    if not ground_truth or "\n" in ground_truth or "\r" in ground_truth:
+        return prompt, False
+    unconditioned_prefix = prefix[:marker_index].rstrip() + "\n\n"
+    return unconditioned_prefix + delimiter + suffix, True
 
 
 def is_declared_horizon_repeat_group(examples: Sequence[dict[str, Any]]) -> bool:
@@ -251,6 +275,22 @@ def prepare(args: argparse.Namespace) -> None:
             else:
                 retained_examples.append(example)
         examples = retained_examples
+    stripped_ground_truth_conditioning = 0
+    if getattr(args, "strip_ground_truth_conditioning", False):
+        unconditioned_examples: list[dict[str, Any]] = []
+        for example in examples:
+            prompt = example.get("prompt")
+            if not isinstance(prompt, str) or not prompt:
+                unconditioned_examples.append(example)
+                continue
+            unconditioned_prompt, stripped = strip_ground_truth_conditioning(prompt)
+            candidate = dict(example)
+            candidate["prompt"] = unconditioned_prompt
+            if stripped:
+                candidate["teacher_prompt_conditioning"] = "none"
+                stripped_ground_truth_conditioning += 1
+            unconditioned_examples.append(candidate)
+        examples = unconditioned_examples
     selected = select_teacher_states(
         examples,
         min_critic_version=args.min_critic_version,
@@ -318,6 +358,7 @@ def prepare(args: argparse.Namespace) -> None:
                 "selected_correct": sum(float(example["outcome"]) > 0.5 for example in selected),
                 "selected_incorrect": sum(float(example["outcome"]) <= 0.5 for example in selected),
                 "outcome_conditioned_terminal_examples": outcome_conditioned_terminal_examples,
+                "stripped_ground_truth_conditioning": stripped_ground_truth_conditioning,
             },
             indent=2,
             sort_keys=True,
@@ -618,6 +659,14 @@ def parse_args() -> argparse.Namespace:
         "--allow_ground_truth_conditioning",
         action="store_true",
         help="Allow answer-conditioned prompts for an explicit non-paper ablation.",
+    )
+    prepare_parser.add_argument(
+        "--strip_ground_truth_conditioning",
+        action="store_true",
+        help=(
+            "Convert the exact final online gt-conditioning line into the paper-style unconditioned critic prompt "
+            "before teacher synthesis. Phrases inside the problem or rollout are preserved."
+        ),
     )
     prepare_parser.add_argument(
         "--condition_terminal_teacher_on_outcome",
