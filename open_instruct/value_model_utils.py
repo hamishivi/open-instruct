@@ -835,6 +835,22 @@ def build_gen_value_validation_holdout(
     return validation_examples, training_pairs
 
 
+def gen_value_validation_has_both_sampled_outcomes(examples: Sequence[dict[str, Any]]) -> bool:
+    """Whether a fixed critic panel can measure correct-vs-incorrect ranking.
+
+    Initial-state targets can be fractional sibling averages, so they do not
+    establish that the panel contains both realized outcome classes.  Require
+    both classes among the single-sample trajectory states before freezing an
+    online validation panel.
+    """
+    sampled_outcomes = {
+        float(example["target"]) > 0.5
+        for example in examples
+        if example.get("target_source") == "single_sample_return"
+    }
+    return sampled_outcomes == {False, True}
+
+
 def gen_value_validation_metrics(
     examples: list[dict[str, Any]], predictions: Sequence[float | None]
 ) -> dict[str, float]:

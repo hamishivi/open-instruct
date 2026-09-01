@@ -1361,21 +1361,45 @@ def _gen_value_reinforce_loop(
             with validation_lock:
                 should_capture_validation = validation_max_examples > 0 and not validation_state["captured"]
                 if should_capture_validation:
-                    validation_examples, pairs = value_model_utils.build_gen_value_validation_holdout(
+                    validation_examples, heldout_training_pairs = value_model_utils.build_gen_value_validation_holdout(
                         rollouts, validation_max_examples, validation_seed, validation_prompt_holdout_fraction
                     )
-                    validation_state["examples"] = validation_examples
-                    validation_state["captured"] = True
-                    capture_metrics = {
-                        "gen_value/validation_examples": float(len(validation_examples)),
-                        "gen_value/validation_heldout_prompt_groups": float(
-                            sum(example["kind"] == "initial" for example in validation_examples)
-                        ),
-                        "gen_value/validation_heldout_pairs": float(
-                            sum(len(rollout["pairs"]) for rollout in rollouts) - len(pairs)
-                        ),
-                        "gen_value/validation_training_pairs": float(len(pairs)),
-                    }
+                    if value_model_utils.gen_value_validation_has_both_sampled_outcomes(validation_examples):
+                        pairs = heldout_training_pairs
+                        validation_state["examples"] = validation_examples
+                        validation_state["captured"] = True
+                        capture_metrics = {
+                            "gen_value/validation_examples": float(len(validation_examples)),
+                            "gen_value/validation_heldout_prompt_groups": float(
+                                sum(example["kind"] == "initial" for example in validation_examples)
+                            ),
+                            "gen_value/validation_heldout_pairs": float(
+                                sum(len(rollout["pairs"]) for rollout in rollouts) - len(pairs)
+                            ),
+                            "gen_value/validation_training_pairs": float(len(pairs)),
+                            "gen_value/validation_capture_deferred": 0.0,
+                        }
+                    else:
+                        # A one-class snapshot cannot diagnose ranking collapse and
+                        # makes lower all-zero predictions look like calibration
+                        # progress. Train on the complete batch and retry capture on
+                        # the next batch rather than freezing a misleading panel.
+                        pairs = [pair for rollout in rollouts for pair in rollout["pairs"]]
+                        sampled_targets = [
+                            float(example["target"])
+                            for example in validation_examples
+                            if example.get("target_source") == "single_sample_return"
+                        ]
+                        capture_metrics = {
+                            "gen_value/validation_capture_deferred": 1.0,
+                            "gen_value/validation_candidate_examples": float(len(validation_examples)),
+                            "gen_value/validation_candidate_positive_examples": float(
+                                sum(target > 0.5 for target in sampled_targets)
+                            ),
+                            "gen_value/validation_candidate_negative_examples": float(
+                                sum(target <= 0.5 for target in sampled_targets)
+                            ),
+                        }
                 else:
                     pairs = [pair for rollout in rollouts for pair in rollout["pairs"]]
             unique_pair_count = len(pairs)

@@ -112,6 +112,18 @@ def test_gen_value_validation_preserves_near_horizon_and_both_outcomes():
     assert any(value_model_utils.is_gen_value_near_horizon_incorrect(example) for example in sampled)
 
 
+def test_gen_value_validation_requires_both_sampled_outcome_classes_before_capture():
+    one_class = [
+        {"target": 0.0, "target_source": "sibling_empirical_return"},
+        {"target": 0.0, "target_source": "single_sample_return"},
+        {"target": 0.0, "target_source": "single_sample_return"},
+    ]
+    mixed = one_class + [{"target": 1.0, "target_source": "single_sample_return"}]
+
+    assert not value_model_utils.gen_value_validation_has_both_sampled_outcomes(one_class)
+    assert value_model_utils.gen_value_validation_has_both_sampled_outcomes(mixed)
+
+
 def test_final_action_replay_does_not_distort_leave_one_out_baseline():
     first = {"state_kind": "final_action"}
     second = {"state_kind": "segment_start"}
