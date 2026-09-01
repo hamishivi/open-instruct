@@ -20,6 +20,7 @@ from open_instruct.grpo_fast_genvalue import (
     _build_sample_scoring_prompts,
     _drain_gen_value_metrics,
     _gen_value_scoring_loop,
+    _hold_gen_value_training_for_checkpoint,
     _put_gen_value_metrics,
     _resolve_gen_value_model,
     _resolve_gen_value_train_pack_length,
@@ -453,6 +454,61 @@ def test_gen_value_publish_barrier_shutdown_does_not_deadlock():
 
     assert wait_seconds >= 0.0
     assert progress_state["pending_publish_version"] is None
+
+
+def test_gen_value_checkpoint_hold_acknowledges_idle_trainer_until_release():
+    pause_event = threading.Event()
+    paused_event = threading.Event()
+    stop_event = threading.Event()
+    pause_event.set()
+    result: list[float] = []
+
+    waiter = threading.Thread(
+        target=lambda: result.append(
+            _hold_gen_value_training_for_checkpoint(pause_event, paused_event, stop_event)
+        )
+    )
+    waiter.start()
+
+    assert paused_event.wait(timeout=1.0)
+    assert waiter.is_alive()
+    pause_event.clear()
+    waiter.join(timeout=1.0)
+
+    assert not waiter.is_alive()
+    assert not paused_event.is_set()
+    assert result and result[0] >= 0.0
+
+
+def test_gen_value_checkpoint_hold_shutdown_releases_waiter():
+    pause_event = threading.Event()
+    paused_event = threading.Event()
+    stop_event = threading.Event()
+    pause_event.set()
+
+    waiter = threading.Thread(
+        target=_hold_gen_value_training_for_checkpoint,
+        args=(pause_event, paused_event, stop_event),
+    )
+    waiter.start()
+
+    assert paused_event.wait(timeout=1.0)
+    stop_event.set()
+    waiter.join(timeout=1.0)
+
+    assert not waiter.is_alive()
+    assert not paused_event.is_set()
+
+
+def test_gen_value_checkpoint_hold_is_noop_without_pause():
+    paused_event = threading.Event()
+
+    wait_seconds = _hold_gen_value_training_for_checkpoint(
+        threading.Event(), paused_event, threading.Event()
+    )
+
+    assert wait_seconds == 0.0
+    assert not paused_event.is_set()
 
 
 def test_gen_value_training_progress_is_monotonic():

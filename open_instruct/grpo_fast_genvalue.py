@@ -1338,6 +1338,29 @@ def _wait_for_gen_value_publish_barrier(
     return time.perf_counter() - started_at
 
 
+def _hold_gen_value_training_for_checkpoint(
+    pause_event: threading.Event, paused_event: threading.Event, stop_event: threading.Event
+) -> float:
+    """Keep the critic trainer actor idle while a checkpoint is being written.
+
+    The acknowledgement is raised only from the reinforce thread, at points where
+    no trainer-actor RPC is in flight. This lets the main thread enqueue a
+    checkpoint RPC without racing a newly queued optimizer step. Shutdown always
+    releases the hold so final draining cannot deadlock.
+    """
+    if not pause_event.is_set() or stop_event.is_set():
+        return 0.0
+
+    started_at = time.perf_counter()
+    paused_event.set()
+    try:
+        while pause_event.is_set() and not stop_event.is_set():
+            stop_event.wait(timeout=0.1)
+    finally:
+        paused_event.clear()
+    return time.perf_counter() - started_at
+
+
 def _gen_value_scoring_loop(
     args: GenValueExperimentConfig,
     tokenizer: Any,
@@ -1409,6 +1432,8 @@ def _gen_value_reinforce_loop(
     batch_size: int,
     max_async_steps: int,
     stop_event: threading.Event,
+    checkpoint_pause_event: threading.Event,
+    checkpoint_paused_event: threading.Event,
     metrics_Q: Queue,
     progress_state: dict[str, Any],
     progress_lock: threading.Lock,
@@ -1437,6 +1462,7 @@ def _gen_value_reinforce_loop(
     newest_seen_policy_model_version: int | None = None
 
     while True:
+        _hold_gen_value_training_for_checkpoint(checkpoint_pause_event, checkpoint_paused_event, stop_event)
         try:
             published_shards = [training_queue.get(timeout=0.1)]
         except queue_lib.Empty:
@@ -1458,6 +1484,7 @@ def _gen_value_reinforce_loop(
             admitted_rollouts += len(published_rollouts)
 
         while pending_rollouts:
+            _hold_gen_value_training_for_checkpoint(checkpoint_pause_event, checkpoint_paused_event, stop_event)
             # An optimizer step and its publication barrier can take longer than
             # policy generation. Re-drain before every selection so an old local
             # remainder never wins over newly available policy rollouts.
@@ -1502,7 +1529,6 @@ def _gen_value_reinforce_loop(
                 )
             if not rollouts:
                 break
-            trained_rollouts += len(rollouts)
 
             capture_metrics: dict[str, float] = {}
             with validation_lock:
@@ -1562,6 +1588,11 @@ def _gen_value_reinforce_loop(
             batch_response_tokens = sum(
                 sum(len(completion.token_ids) for completion in pair["request_output"].outputs) for pair in pairs
             )
+            # The checkpoint request can arrive after selection but before the
+            # actor RPC. A second hold here closes that race without discarding
+            # the selected, still-fresh batch.
+            _hold_gen_value_training_for_checkpoint(checkpoint_pause_event, checkpoint_paused_event, stop_event)
+            trained_rollouts += len(rollouts)
             metrics, _ = utils.ray_get_with_progress(
                 [trainer_actor.reinforce_step.remote(pairs)],
                 desc="Training generative critic",
@@ -1661,6 +1692,10 @@ def _gen_value_reinforce_loop(
             # Publish optimizer metrics before blocking so the policy callback
             # cannot race past and defer the whole update to its next W&B step.
             _put_gen_value_metrics(metrics_Q, metrics, "REINFORCE")
+            # The optimizer RPC is complete and the actor is idle. A checkpoint
+            # may safely run before this version is published to the serving pool;
+            # publication resumes at the next policy boundary after the hold.
+            _hold_gen_value_training_for_checkpoint(checkpoint_pause_event, checkpoint_paused_event, stop_event)
             publish_barrier_seconds = _wait_for_gen_value_publish_barrier(
                 critic_version, sync_freq, stop_event, publish_complete_event, progress_state, progress_lock
             )
@@ -2193,6 +2228,8 @@ def main():
     gen_value_step_trigger = threading.Event()
     gen_value_stop_event = threading.Event()
     gen_value_publish_complete_event = threading.Event()
+    gen_value_checkpoint_pause_event = threading.Event()
+    gen_value_checkpoint_paused_event = threading.Event()
     # Cross-thread metrics shuttle: background threads put() per-step metric
     # dicts here; _one_training_step_with_genvalue drains them and merges into
     # data_thread_metrics so they land in the main pretty-print + wandb log.
@@ -2245,6 +2282,8 @@ def main():
             gen_value_batch_size,
             args.gen_value_max_async_steps,
             gen_value_stop_event,
+            gen_value_checkpoint_pause_event,
+            gen_value_checkpoint_paused_event,
             gen_value_metrics_Q,
             gen_value_progress_state,
             gen_value_progress_lock,
@@ -2306,6 +2345,18 @@ def main():
 
         def _critic_post_training_metrics_callback() -> dict[str, Any]:
             nonlocal last_gen_value_validation_version
+            checkpoint_due = (
+                args.checkpoint_state_freq > 0
+                and policy_step % args.checkpoint_state_freq == 0
+                and args.checkpoint_state_dir is not None
+                and policy_step < args.num_training_steps
+            )
+            if checkpoint_due:
+                # Set this before publishing the completed critic version. The
+                # reinforce thread acknowledges only once its trainer actor is
+                # idle, preventing the next optimizer RPC from overtaking the
+                # checkpoint callback after one_training_step returns.
+                gen_value_checkpoint_pause_event.set()
             # Drain critic updates exactly once per policy step. A second earlier drain
             # can split two updates across dictionaries and let the later one overwrite
             # the first when one_training_step merges its callback results.
@@ -2452,6 +2503,22 @@ def main():
     def _save_gen_value_checkpoint(checkpoint_state_dir: str, training_step: int) -> dict[str, Any]:
         if gen_value_trainer is None:
             return {}
+        if training_step < args.num_training_steps:
+            gen_value_checkpoint_pause_event.set()
+            pause_started_at = time.perf_counter()
+            pause_deadline = pause_started_at + _GEN_VALUE_OPERATION_TIMEOUT_S
+            while not gen_value_checkpoint_paused_event.wait(timeout=0.1):
+                _raise_if_gen_value_background_failed()
+                _check_gen_value_engines(gen_value_vllm_engines)
+                if gen_value_reinforce_future is not None and gen_value_reinforce_future.done():
+                    break
+                if time.perf_counter() >= pause_deadline:
+                    raise TimeoutError("Timed out pausing generative critic training for checkpointing.")
+            logger.info(
+                "Paused asynchronous generative-critic training for checkpoint at policy step %d in %.2fs.",
+                training_step,
+                time.perf_counter() - pause_started_at,
+            )
         results, _ = utils.ray_get_with_progress(
             [gen_value_trainer.save_checkpoint.remote(checkpoint_state_dir, training_step)],
             desc="Saving generative critic checkpoint",
@@ -2461,11 +2528,13 @@ def main():
 
     def _commit_gen_value_checkpoint(checkpoint_state_dir: str, training_step: int) -> None:
         del training_step
-        if gen_value_trainer is None or args.keep_last_n_checkpoints < 0:
-            return
-        utils.clean_last_n_checkpoints_deepspeed(
-            os.path.join(checkpoint_state_dir, "gen_value_model", "deepspeed"), args.keep_last_n_checkpoints
-        )
+        try:
+            if gen_value_trainer is not None and args.keep_last_n_checkpoints >= 0:
+                utils.clean_last_n_checkpoints_deepspeed(
+                    os.path.join(checkpoint_state_dir, "gen_value_model", "deepspeed"), args.keep_last_n_checkpoints
+                )
+        finally:
+            gen_value_checkpoint_pause_event.clear()
 
     def _save_gen_value_model(output_dir: str, training_step: int) -> None:
         if gen_value_trainer is None:
@@ -2526,6 +2595,7 @@ def main():
         raise
     finally:
         _grpo_fast.one_training_step = _original_one_training_step
+        gen_value_checkpoint_pause_event.clear()
         gen_value_stop_event.set()
         gen_value_step_trigger.set()
         _grpo_fast.cleanup_training_resources(
