@@ -575,28 +575,32 @@ class TestGenerativeValueScoreComparison(unittest.TestCase):
                 "problem": "a",
                 "rollout_is_correct": True,
                 "state_kind": "intermediate",
-                "target": 1.0,
+                "trajectory_band": "early",
+                "target": 0.2,
                 "prediction": 0.6,
             },
             {
                 "problem": "a",
                 "rollout_is_correct": False,
                 "state_kind": "intermediate",
-                "target": 0.0,
+                "trajectory_band": "early",
+                "target": 0.8,
                 "prediction": 0.5,
             },
             {
                 "problem": "b",
                 "rollout_is_correct": True,
                 "state_kind": "intermediate",
-                "target": 1.0,
+                "trajectory_band": "early",
+                "target": 0.9,
                 "prediction": 0.2,
             },
             {
                 "problem": "b",
                 "rollout_is_correct": False,
                 "state_kind": "intermediate",
-                "target": 0.0,
+                "trajectory_band": "early",
+                "target": 0.1,
                 "prediction": 0.1,
             },
         ]
@@ -610,6 +614,14 @@ class TestGenerativeValueScoreComparison(unittest.TestCase):
         self.assertAlmostEqual(metrics["intermediate_within_problem_auc"], 1.0)
         self.assertEqual(metrics["intermediate_within_problem_auc_problems"], 2.0)
         self.assertEqual(metrics["intermediate_within_problem_auc_pairs"], 2.0)
+        # Eventual rollout correctness is not the critic's value target. The
+        # first problem ranks the correct rollout higher even though its exact
+        # continuation value is lower, which the decision metric catches.
+        self.assertAlmostEqual(metrics["intermediate_mc_selection_accuracy"], 0.5)
+        self.assertAlmostEqual(metrics["intermediate_mc_selection_regret"], 0.3)
+        self.assertAlmostEqual(metrics["intermediate_mc_selection_gain_over_random"], 0.05)
+        self.assertEqual(metrics["intermediate_mc_selection_problems"], 2.0)
+        self.assertEqual(metrics["intermediate_mc_selection_pairs"], 2.0)
 
 
 if __name__ == "__main__":

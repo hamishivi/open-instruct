@@ -31,6 +31,15 @@ def _optional_float(value: Any) -> float | None:
     return parsed if np.isfinite(parsed) else None
 
 
+def _trajectory_band(position: int, final_position: int) -> str:
+    fraction = position / max(final_position, 1)
+    if fraction < 1 / 3:
+        return "early"
+    if fraction < 2 / 3:
+        return "middle"
+    return "late"
+
+
 def _flatten_scores(path: pathlib.Path) -> dict[tuple[str, bool, str, int], dict[str, Any]]:
     frame = pd.read_parquet(path)
     required = {"problem", "rollout_tokens", "rollout_is_correct", "probe_positions", "mc_values", "predicted_values"}
@@ -57,6 +66,7 @@ def _flatten_scores(path: pathlib.Path) -> dict[tuple[str, bool, str, int], dict
                 "problem": str(row["problem"]),
                 "rollout_is_correct": is_correct,
                 "state_kind": state_kind,
+                "trajectory_band": _trajectory_band(position, final_position),
                 "target": float(target),
                 "prediction": _optional_float(prediction),
             }
@@ -91,6 +101,81 @@ def _spearman_correlation(left: list[float], right: list[float]) -> float | None
     if np.std(left_ranks) == 0.0 or np.std(right_ranks) == 0.0:
         return None
     return float(np.corrcoef(left_ranks, right_ranks)[0, 1])
+
+
+def _mc_selection_metrics(
+    rows: list[dict[str, Any]], *, trajectory_band: str | None
+) -> dict[str, float | None]:
+    problem_metrics = []
+    total_pairs = 0
+    for problem in sorted({row["problem"] for row in rows}):
+        correct = [
+            row
+            for row in rows
+            if row["problem"] == problem
+            and row["state_kind"] == "intermediate"
+            and row["rollout_is_correct"]
+            and row["prediction"] is not None
+        ]
+        incorrect = [
+            row
+            for row in rows
+            if row["problem"] == problem
+            and row["state_kind"] == "intermediate"
+            and not row["rollout_is_correct"]
+            and row["prediction"] is not None
+        ]
+        pair_metrics = []
+        for correct_row in correct:
+            for incorrect_row in incorrect:
+                if trajectory_band is None:
+                    if correct_row["trajectory_band"] != incorrect_row["trajectory_band"]:
+                        continue
+                elif (
+                    correct_row["trajectory_band"] != trajectory_band
+                    or incorrect_row["trajectory_band"] != trajectory_band
+                ):
+                    continue
+                correct_target = correct_row["target"]
+                incorrect_target = incorrect_row["target"]
+                if np.isclose(correct_target, incorrect_target):
+                    continue
+                prediction_delta = correct_row["prediction"] - incorrect_row["prediction"]
+                target_delta = correct_target - incorrect_target
+                if prediction_delta == 0.0:
+                    accuracy = 0.5
+                    selected_target = (correct_target + incorrect_target) / 2.0
+                else:
+                    accuracy = float(np.sign(prediction_delta) == np.sign(target_delta))
+                    selected_target = correct_target if prediction_delta > 0.0 else incorrect_target
+                random_target = (correct_target + incorrect_target) / 2.0
+                pair_metrics.append(
+                    (
+                        accuracy,
+                        max(correct_target, incorrect_target) - selected_target,
+                        selected_target - random_target,
+                    )
+                )
+        if pair_metrics:
+            total_pairs += len(pair_metrics)
+            problem_metrics.append(np.mean(pair_metrics, axis=0))
+
+    if not problem_metrics:
+        return {
+            "accuracy": None,
+            "regret": None,
+            "gain_over_random": None,
+            "problems": 0.0,
+            "pairs": 0.0,
+        }
+    problem_metrics_array = np.asarray(problem_metrics)
+    return {
+        "accuracy": float(np.mean(problem_metrics_array[:, 0])),
+        "regret": float(np.mean(problem_metrics_array[:, 1])),
+        "gain_over_random": float(np.mean(problem_metrics_array[:, 2])),
+        "problems": float(len(problem_metrics)),
+        "pairs": float(total_pairs),
+    }
 
 
 def _metrics(rows: list[dict[str, Any]]) -> dict[str, float | None]:
@@ -167,6 +252,11 @@ def _metrics(rows: list[dict[str, Any]]) -> dict[str, float | None]:
     )
     metrics["intermediate_within_problem_auc_problems"] = float(len(within_problem_aucs))
     metrics["intermediate_within_problem_auc_pairs"] = float(within_problem_pairs)
+    for trajectory_band in (None, "early", "middle", "late"):
+        selection_metrics = _mc_selection_metrics(rows, trajectory_band=trajectory_band)
+        band_suffix = "" if trajectory_band is None else f"_{trajectory_band}"
+        for name, value in selection_metrics.items():
+            metrics[f"intermediate_mc_selection{band_suffix}_{name}"] = value
     return metrics
 
 
@@ -224,6 +314,8 @@ def compare_scores(
     candidate_incorrect_mse = candidate_metrics["intermediate_incorrect_penalized_mse"]
     baseline_auc = baseline_metrics["intermediate_within_problem_auc"]
     candidate_auc = candidate_metrics["intermediate_within_problem_auc"]
+    baseline_selection_accuracy = baseline_metrics["intermediate_mc_selection_accuracy"]
+    candidate_selection_accuracy = candidate_metrics["intermediate_mc_selection_accuracy"]
     checks = {
         "candidate_parse_rate_at_least_0_99": candidate_metrics["parse_rate"] >= 0.99,
         "problem_balanced_mse_noninferior": float(delta_ci[1]) <= mse_noninferiority_margin,
@@ -233,6 +325,9 @@ def compare_scores(
         ),
         "intermediate_within_problem_auc_noninferior": (
             candidate_auc >= baseline_auc - auc_noninferiority_margin
+        ),
+        "intermediate_mc_selection_accuracy_noninferior": (
+            candidate_selection_accuracy >= baseline_selection_accuracy - auc_noninferiority_margin
         ),
     }
     return {
@@ -245,6 +340,9 @@ def compare_scores(
         "problem_balanced_mse_delta_candidate_minus_baseline": problem_balanced_delta,
         "problem_cluster_bootstrap_95pct_ci": [float(delta_ci[0]), float(delta_ci[1])],
         "intermediate_within_problem_auc_delta_candidate_minus_baseline": candidate_auc - baseline_auc,
+        "intermediate_mc_selection_accuracy_delta_candidate_minus_baseline": (
+            candidate_selection_accuracy - baseline_selection_accuracy
+        ),
         "bootstrap_samples": bootstrap_samples,
         "gate": {
             "accepted": all(checks.values()),
