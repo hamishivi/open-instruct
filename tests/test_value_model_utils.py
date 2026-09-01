@@ -403,6 +403,34 @@ def test_select_fresh_gen_value_rollouts_uses_model_version_before_batch_recency
     assert stale == []
 
 
+def test_select_fresh_gen_value_rollouts_does_not_discard_for_critic_version_age():
+    pending = [
+        {
+            "policy_training_step": 20,
+            "policy_model_version": 10,
+            "critic_version": 1,
+            "identifier": "old-critic-fresh-policy",
+        },
+        {
+            "policy_training_step": 19,
+            "policy_model_version": 10,
+            "critic_version": 9,
+            "identifier": "newer-critic-fresh-policy",
+        },
+    ]
+
+    selected, retained, stale = value_model_utils.select_fresh_gen_value_rollouts(
+        pending, batch_size=2, max_async_steps=1
+    )
+
+    assert [rollout["identifier"] for rollout in selected] == [
+        "old-critic-fresh-policy",
+        "newer-critic-fresh-policy",
+    ]
+    assert retained == []
+    assert stale == []
+
+
 def test_select_fresh_gen_value_rollouts_requires_policy_model_version():
     with pytest.raises(ValueError, match="policy_model_version"):
         value_model_utils.select_fresh_gen_value_rollouts(
