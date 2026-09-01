@@ -283,9 +283,17 @@ class GenValueTrainerActor:
                 checkpoint_path,
                 checkpoint_tag,
             )
-        loaded_path, client_state = self._model.load_checkpoint(
+        # DeepSpeed's public loader unconditionally calls a private ZeRO fallback
+        # after a module-only load. In the version used by these runs the selected
+        # FP16_UnfusedOptimizer has refresh_fp32_params() but not the fallback's
+        # _restore_from_bit16_weights(), so that otherwise-successful legacy load
+        # raises AttributeError. Its internal loader already loads the module,
+        # refreshes FP32 masters through the supported method, and returns the same
+        # client state; use it only for the legacy weights-only migration path.
+        checkpoint_loader = self._model.load_checkpoint if optimizer_state_available else self._model._load_checkpoint
+        loaded_path, client_state = checkpoint_loader(
             checkpoint_path,
-            tag=checkpoint_tag,
+            checkpoint_tag,
             load_module_strict=True,
             load_optimizer_states=optimizer_state_available,
             load_lr_scheduler_states=False,
