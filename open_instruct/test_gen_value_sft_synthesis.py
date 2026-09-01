@@ -31,6 +31,9 @@ class TestGenValueSFTSynthesis(unittest.TestCase):
             # Source output quality must not affect teacher-state selection.
             "prediction": None,
             "squared_error": None,
+            # A real reservoir carries this field. Teacher preparation and
+            # consensus must not reapply the source critic's quality gate.
+            "training_target_squared_error": 0.81,
             "prompt": f"prompt-{outcome}-{position}",
             "generation": "source parse failure",
             **metadata,
@@ -218,6 +221,46 @@ class TestGenValueSFTSynthesis(unittest.TestCase):
             self.assertEqual(len(sft_rows), 2)
             self.assertEqual({row["teacher_prediction"] for row in sft_rows}, {0.1, 0.9})
             self.assertTrue(all(row["teacher_model"] == "gpt-5" for row in sft_rows))
+
+    def test_collect_filters_teacher_against_pooled_training_target(self):
+        example = self._state(0.0, "early")
+        example["training_target"] = 0.75
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            metadata_path = root / "metadata.jsonl"
+            result_path = root / "results.jsonl"
+            output_path = root / "sft.jsonl"
+            metadata_path.write_text(json.dumps({"custom_id": "ambiguous", "source": example}) + "\n")
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "custom_id": "ambiguous",
+                        "response": {
+                            "status_code": 200,
+                            "body": {"choices": [{"message": {"content": "Likely recoverable. <answer>7</answer>"}}]},
+                        },
+                        "error": None,
+                    }
+                )
+                + "\n"
+            )
+
+            collect(
+                argparse.Namespace(
+                    metadata=metadata_path,
+                    results=[result_path],
+                    output=output_path,
+                    teacher_model="teacher",
+                    max_teacher_squared_error=0.01,
+                    skip_invalid_scores=False,
+                )
+            )
+
+            rows = [json.loads(line) for line in output_path.read_text().splitlines()]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["training_target"], 0.75)
+            self.assertAlmostEqual(rows[0]["training_target_squared_error"], 0.0025)
+            self.assertAlmostEqual(rows[0]["teacher_squared_error"], 0.0025)
 
     def test_prepare_conditions_only_terminal_teacher_request_on_outcome(self):
         examples = [

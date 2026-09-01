@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import pathlib
 from collections.abc import Sequence
 from typing import Any
@@ -125,6 +126,7 @@ def select_teacher_states(
         # outcome/position balancing used by the self-trace fallback.
         candidate["prediction"] = outcome
         candidate["squared_error"] = 0.0
+        candidate["training_target_squared_error"] = 0.0
         candidates.append(candidate)
     return select_gen_value_sft_traces(
         candidates,
@@ -353,7 +355,18 @@ def collect(args: argparse.Namespace) -> None:
             raise ValueError(f"Teacher response {custom_id!r} has no valid <answer> score: {generation!r}")
         prediction = rescale_gen_value_score(raw_prediction, score_min=0.0, score_max=10.0)
         outcome = float(source["outcome"])
-        squared_error = (outcome - prediction) ** 2
+        training_target = source.get("training_target", source.get("target", outcome))
+        if (
+            isinstance(training_target, bool)
+            or not isinstance(training_target, int | float)
+            or not math.isfinite(float(training_target))
+            or not 0.0 <= float(training_target) <= 1.0
+        ):
+            raise ValueError(
+                f"Teacher source {custom_id!r} has invalid training target {training_target!r}; expected [0, 1]."
+            )
+        training_target = float(training_target)
+        squared_error = (training_target - prediction) ** 2
         if args.max_teacher_squared_error is not None and squared_error > args.max_teacher_squared_error:
             filtered_for_error += 1
             continue
@@ -363,6 +376,8 @@ def collect(args: argparse.Namespace) -> None:
                 "generation": generation,
                 "prediction": prediction,
                 "squared_error": squared_error,
+                "training_target": training_target,
+                "training_target_squared_error": squared_error,
                 "teacher_model": args.teacher_model,
                 "teacher_prediction": prediction,
                 "teacher_squared_error": squared_error,
@@ -528,6 +543,7 @@ def select_teacher_consensus(
                 # The generic selector performs prompt deduplication and balanced
                 # position/outcome sampling after this independent quality gate.
                 "squared_error": 0.0,
+                "training_target_squared_error": 0.0,
                 "teacher_consensus_mean": sum(predictions) / len(predictions),
                 "teacher_consensus_predictions": predictions,
                 "teacher_consensus_range": prediction_range,
@@ -618,7 +634,14 @@ def parse_args() -> argparse.Namespace:
     collect_parser.add_argument("--results", required=True, nargs="+", type=pathlib.Path)
     collect_parser.add_argument("--output", required=True, type=pathlib.Path)
     collect_parser.add_argument("--teacher_model", default="gpt-5")
-    collect_parser.add_argument("--max_teacher_squared_error", type=float)
+    collect_parser.add_argument(
+        "--max_teacher_squared_error",
+        type=float,
+        help=(
+            "Optionally retain teacher traces whose score is this close to the pooled training target, "
+            "falling back to target/outcome for legacy inputs."
+        ),
+    )
     collect_parser.add_argument(
         "--skip_invalid_scores",
         action="store_true",
