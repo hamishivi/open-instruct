@@ -79,10 +79,10 @@ GEN_VALUE_MAX_ASYNC_STEPS="${GEN_VALUE_MAX_ASYNC_STEPS:-1}"
 # shared-state-preserving stochastic minibatch of approximately this many critic
 # examples per fresh policy batch.
 GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE="${GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE:-0}"
-# A small/positive advantage gap remains useful signal. Keep only a hard guard
-# against reversed separation; use the continuous gap to drive critic diagnostics
-# and subsequent critic-compute decisions instead of freezing at 0.20.
-GEN_VALUE_MIN_ADVANTAGE_GAP="${GEN_VALUE_MIN_ADVANTAGE_GAP:-0.0}"
+# Keep the advantage gap as a critic-compute diagnostic by default. A numeric
+# threshold is an explicit opt-in policy guard; even 0.0 is not equivalent to
+# disabling it because a noisy negative batch gap would still pause the actor.
+GEN_VALUE_MIN_ADVANTAGE_GAP="${GEN_VALUE_MIN_ADVANTAGE_GAP:-disabled}"
 GEN_VALUE_MODEL_SNAPSHOT_FREQ="${GEN_VALUE_MODEL_SNAPSHOT_FREQ:-25}"
 JOINT_TRAINING_STEPS="${JOINT_TRAINING_STEPS:-300}"
 VALUE_WARMUP_STEPS="${VALUE_WARMUP_STEPS:-0}"
@@ -111,6 +111,16 @@ if ((GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE > 0)); then
         --gen_value_train_target_examples_per_update "${GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE}"
     )
 fi
+GEN_VALUE_POLICY_GUARD_ARGS=()
+case "${GEN_VALUE_MIN_ADVANTAGE_GAP,,}" in
+    "" | disabled | none | off)
+        ;;
+    *)
+        GEN_VALUE_POLICY_GUARD_ARGS+=(
+            --gen_value_min_advantage_gap_for_policy_update "${GEN_VALUE_MIN_ADVANTAGE_GAP}"
+        )
+        ;;
+esac
 TOTAL_TRAINING_STEPS=$((VALUE_WARMUP_STEPS + JOINT_TRAINING_STEPS))
 TOTAL_EPISODES=$((TOTAL_TRAINING_STEPS * NUM_UNIQUE_PROMPTS_ROLLOUT * NUM_SAMPLES_PER_PROMPT_ROLLOUT))
 
@@ -200,7 +210,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --gen_value_sync_freq "${GEN_VALUE_SYNC_FREQ}" \
     --gen_value_max_async_steps "${GEN_VALUE_MAX_ASYNC_STEPS}" \
     "${GEN_VALUE_TRAIN_TARGET_ARGS[@]}" \
-    --gen_value_min_advantage_gap_for_policy_update "${GEN_VALUE_MIN_ADVANTAGE_GAP}" \
+    "${GEN_VALUE_POLICY_GUARD_ARGS[@]}" \
     --gen_value_diagnostic_scoring_freq 0 \
     --gen_value_validation_freq 25 \
     --gen_value_validation_max_examples 128 \
