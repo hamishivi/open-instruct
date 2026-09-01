@@ -520,17 +520,20 @@ def test_gen_value_training_progress_is_monotonic():
     progress.register_admitted_policy_step(policy_training_step=4, policy_rank=0, num_rollouts=2)
     progress.register_admitted_policy_step(policy_training_step=4, policy_rank=1, num_rollouts=1)
     progress.record_trained_policy_steps([4, 4])
-    assert progress.get_latest_trained_policy_step() == 3
-    progress.record_trained_policy_steps([4])
     assert progress.get_latest_trained_policy_step() == 4
+    assert progress.get_latest_processed_policy_step() == 3
+    progress.record_trained_policy_steps([4])
+    assert progress.get_latest_processed_policy_step() == 4
 
     # Mixed critic batches may begin training the next source step before all
-    # ranks finish registering it. Do not advance until admission is complete.
+    # ranks finish registering it. Trained-source freshness advances after the
+    # optimizer succeeds, while fully processed accounting waits for admission.
     progress.record_trained_policy_steps([5, 5])
-    progress.register_admitted_policy_step(policy_training_step=5, policy_rank=0, num_rollouts=1)
-    assert progress.get_latest_trained_policy_step() == 4
-    progress.register_admitted_policy_step(policy_training_step=5, policy_rank=1, num_rollouts=1)
     assert progress.get_latest_trained_policy_step() == 5
+    progress.register_admitted_policy_step(policy_training_step=5, policy_rank=0, num_rollouts=1)
+    assert progress.get_latest_processed_policy_step() == 4
+    progress.register_admitted_policy_step(policy_training_step=5, policy_rank=1, num_rollouts=1)
+    assert progress.get_latest_processed_policy_step() == 5
 
     with pytest.raises(ValueError, match="already complete"):
         progress.record_trained_policy_steps([4])
