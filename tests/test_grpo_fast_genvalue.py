@@ -607,6 +607,10 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
             "gen_value/batch_rollouts": 1,
             "gen_value/source_value_version_min": 4,
             "gen_value/source_value_version_max": 4,
+            "gen_value/newest_available_source_policy_step": 11,
+            "gen_value/source_policy_lag_min": 0,
+            "gen_value/source_policy_lag_max": 1,
+            "gen_value/discarded_stale_rollouts_since_update": 1,
         },
         "REINFORCE",
     )
@@ -645,6 +649,10 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
             "gen_value/batch_rollouts": 2,
             "gen_value/source_value_version_min": 5,
             "gen_value/source_value_version_max": 7,
+            "gen_value/newest_available_source_policy_step": 13,
+            "gen_value/source_policy_lag_min": 1,
+            "gen_value/source_policy_lag_max": 3,
+            "gen_value/discarded_stale_rollouts_since_update": 2,
         },
         "REINFORCE",
     )
@@ -684,6 +692,45 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
     assert metrics["gen_value/source_value_version_min"] == 4
     assert metrics["gen_value/source_value_version_max"] == 7
     assert metrics["gen_value/source_value_version_spread"] == 3
+    assert metrics["gen_value/newest_available_source_policy_step"] == 13
+    assert metrics["gen_value/source_policy_lag_min"] == 0
+    assert metrics["gen_value/source_policy_lag_max"] == 3
+    assert metrics["gen_value/discarded_stale_rollouts_since_update"] == 3
+
+
+def test_worker_async_queue_metrics_use_global_reductions():
+    metrics = grpo_fast.aggregate_worker_scalar_metrics(
+        (
+            {
+                "_token_count": 1.0,
+                "loss/policy_avg": 1.0,
+                "gen_value/enqueued_rollouts": 3.0,
+                "gen_value/queue_evicted_rollouts": 2.0,
+                "gen_value/queue_evicted_source_step_min": 4.0,
+                "gen_value/queue_evicted_source_step_max": 5.0,
+                "gen_value/training_queue_size": 4.0,
+                "gen_value/training_queue_backpressure_seconds": 0.1,
+            },
+            {
+                "_token_count": 3.0,
+                "loss/policy_avg": 3.0,
+                "gen_value/enqueued_rollouts": 5.0,
+                "gen_value/queue_evicted_rollouts": 1.0,
+                "gen_value/queue_evicted_source_step_min": 7.0,
+                "gen_value/queue_evicted_source_step_max": 9.0,
+                "gen_value/training_queue_size": 6.0,
+                "gen_value/training_queue_backpressure_seconds": 0.3,
+            },
+        )
+    )
+
+    assert metrics["loss/policy_avg"] == pytest.approx(2.5)
+    assert metrics["gen_value/enqueued_rollouts"] == 8
+    assert metrics["gen_value/queue_evicted_rollouts"] == 3
+    assert metrics["gen_value/queue_evicted_source_step_min"] == 4
+    assert metrics["gen_value/queue_evicted_source_step_max"] == 9
+    assert metrics["gen_value/training_queue_size"] == 6
+    assert metrics["gen_value/training_queue_backpressure_seconds"] == pytest.approx(0.3)
 
 
 def test_failed_weight_transfer_still_wakes_critic_engines(monkeypatch):

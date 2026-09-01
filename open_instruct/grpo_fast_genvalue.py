@@ -1187,6 +1187,7 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
         "gen_value/train_pack_tokens",
         "gen_value/tis_tokens",
         "gen_value/tis_mask_tokens",
+        "gen_value/discarded_stale_rollouts_since_update",
         "gen_value/skipped_empty_generation",
         "gen_value/update_skipped",
     }
@@ -1210,11 +1211,19 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
             merged[f"{prefix}_max"] = max(maxima)
             merged[f"{prefix}_spread"] = max(maxima) - min(minima)
 
-    for suffix, reducer in (("min", min), ("max", max)):
-        metric = f"gen_value/source_value_lag_{suffix}"
-        values = [float(update[metric]) for update in reinforce_updates if metric in update]
-        if values:
-            merged[metric] = reducer(values)
+    for prefix in ("gen_value/source_value_lag", "gen_value/source_policy_lag"):
+        for suffix, reducer in (("min", min), ("max", max)):
+            metric = f"{prefix}_{suffix}"
+            values = [float(update[metric]) for update in reinforce_updates if metric in update]
+            if values:
+                merged[metric] = reducer(values)
+    newest_available_steps = [
+        float(update["gen_value/newest_available_source_policy_step"])
+        for update in reinforce_updates
+        if "gen_value/newest_available_source_policy_step" in update
+    ]
+    if newest_available_steps:
+        merged["gen_value/newest_available_source_policy_step"] = max(newest_available_steps)
     max_pack_tokens = [
         float(update["gen_value/train_max_pack_tokens"])
         for update in reinforce_updates

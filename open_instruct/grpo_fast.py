@@ -3193,6 +3193,51 @@ def compute_token_weights(metrics_list: list[dict[str, float]]) -> list[float]:
     return [1.0 / len(metrics_list)] * len(metrics_list)
 
 
+def aggregate_worker_scalar_metrics(metrics: tuple[dict[str, float], ...]) -> dict[str, float]:
+    """Aggregate policy-worker metrics with metric-appropriate reductions."""
+    weights = compute_token_weights(list(metrics))
+    token_weighted_metrics = {
+        "objective/kl0_avg",
+        "objective/kl1_avg",
+        "objective/kl2_avg",
+        "objective/kl3_avg",
+        "loss/kl_avg",
+        "loss/policy_avg",
+        "loss/total_avg",
+        "policy/clipfrac_avg",
+        "policy/entropy_avg",
+        "val/ratio",
+        "val/ratio_var",
+    }
+    sum_metrics = {"gen_value/enqueued_rollouts", "gen_value/queue_evicted_rollouts"}
+    min_metrics = {"gen_value/queue_evicted_source_step_min"}
+    max_metrics = {
+        "gen_value/latest_enqueued_policy_training_step",
+        "gen_value/queue_evicted_source_step_max",
+        "gen_value/training_queue_size",
+        "gen_value/training_queue_backpressure_seconds",
+    }
+    aggregated: dict[str, float] = {}
+    all_metric_keys = set().union(*(worker_metrics.keys() for worker_metrics in metrics))
+    for key in all_metric_keys:
+        if key == "_token_count":
+            continue
+        present_values = [worker_metrics[key] for worker_metrics in metrics if key in worker_metrics]
+        if key in token_weighted_metrics:
+            aggregated[key] = sum(
+                worker_metrics.get(key, 0.0) * weight for worker_metrics, weight in zip(metrics, weights)
+            )
+        elif key in sum_metrics:
+            aggregated[key] = sum(present_values)
+        elif key in min_metrics:
+            aggregated[key] = min(present_values)
+        elif key in max_metrics:
+            aggregated[key] = max(present_values)
+        else:
+            aggregated[key] = sum(worker_metrics.get(key, 0.0) for worker_metrics in metrics) / len(metrics)
+    return aggregated
+
+
 def validate_configs(
     streaming_config: data_loader_lib.StreamingDataLoaderConfig,
     vllm_config: data_loader_lib.VLLMConfig,
@@ -3901,42 +3946,8 @@ def one_training_step(
 
     ray.get(actor_manager.report_training_step_time.remote(train_timer.duration))
 
-    # Note: metrics contains scalar metrics from each worker, array_metrics contains list/array metrics
-    weights = compute_token_weights(metrics)
-
-    # Metrics that should be token-weighted (averages over tokens)
-    token_weighted_metrics = {
-        "objective/kl0_avg",
-        "objective/kl1_avg",
-        "objective/kl2_avg",
-        "objective/kl3_avg",
-        "loss/kl_avg",
-        "loss/policy_avg",
-        "loss/total_avg",
-        "policy/clipfrac_avg",
-        "policy/entropy_avg",
-        "val/ratio",
-        "val/ratio_var",
-    }
-    max_metrics = {"gen_value/latest_enqueued_policy_training_step"}
-    average_metrics = {}
-    # Average scalar metrics from each worker (union of keys — some metrics are sparse,
-    # e.g. value diagnostic bins that only exist when the bin is non-empty on a given rank).
-    all_metric_keys = set().union(*(m.keys() for m in metrics))
-    for k in all_metric_keys:
-        if k == "_token_count":
-            # Don't include internal token count in final metrics
-            continue
-        if k in token_weighted_metrics:
-            # Token-weighted average
-            average_metrics[k] = sum(m.get(k, 0.0) * w for m, w in zip(metrics, weights))
-        elif k in max_metrics:
-            # Watermarks are maxima, not rank averages. Missing values mean that
-            # rank has not enqueued critic data yet.
-            average_metrics[k] = max(m[k] for m in metrics if k in m)
-        else:
-            # Simple average for other metrics
-            average_metrics[k] = sum(m.get(k, 0.0) for m in metrics) / len(metrics)
+    # Note: metrics contains scalar metrics from each worker, array_metrics contains list/array metrics.
+    average_metrics = aggregate_worker_scalar_metrics(metrics)
     # Pass through array metrics from the first worker (these are the same across workers)
     for k, v in array_metrics[0].items():
         average_metrics[k] = v
