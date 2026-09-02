@@ -51,6 +51,15 @@ NUM_TRAIN_EPOCHS=${NUM_TRAIN_EPOCHS:-2}
 EXP_NAME=${EXP_NAME:-genac-math-value-teacher-sft}
 OUTPUT_DIR=${OUTPUT_DIR:-output/${EXP_NAME}}
 SAVE_MODEL_EACH_EPOCH=${SAVE_MODEL_EACH_EPOCH:-0}
+SCORE_TOKEN_ONLY_LOSS=${SCORE_TOKEN_ONLY_LOSS:-0}
+if [[ ! "${SCORE_TOKEN_ONLY_LOSS}" =~ ^[01]$ ]]; then
+    echo "SCORE_TOKEN_ONLY_LOSS must be 0 or 1: ${SCORE_TOKEN_ONLY_LOSS}" >&2
+    exit 1
+fi
+GEN_VALUE_TOKENIZE_TRANSFORM=gen_value_sft_tokenize_and_truncate_v1
+if [[ "${SCORE_TOKEN_ONLY_LOSS}" == "1" ]]; then
+    GEN_VALUE_TOKENIZE_TRANSFORM=gen_value_sft_score_tokenize_and_truncate_v1
+fi
 MODEL_CHECKPOINT_ARGS=()
 if [[ "${SAVE_MODEL_EACH_EPOCH}" == "1" ]]; then
     MODEL_CHECKPOINT_ARGS+=(--save_model_each_epoch)
@@ -86,7 +95,7 @@ accelerate launch \
     --num_train_epochs "${NUM_TRAIN_EPOCHS}" \
     --dataset_mixer_list "${DATASET_MIXER_ARGS[@]}" \
     --dataset_mixer_list_splits train \
-    --dataset_transform_fn gen_value_sft_tokenize_and_truncate_v1 sft_tulu_filter_v1 \
+    --dataset_transform_fn "${GEN_VALUE_TOKENIZE_TRANSFORM}" sft_tulu_filter_v1 \
     --dataset_target_columns input_ids attention_mask labels \
     --dataset_skip_cache \
     --gradient_checkpointing \

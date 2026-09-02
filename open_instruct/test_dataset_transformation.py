@@ -120,6 +120,39 @@ class TestGenValueSFTTokenize(unittest.TestCase):
             [open_instruct.dataset_transformation.MASKED_TOKEN_VALUE] * 2 + [3, 99],
         )
 
+    def test_score_only_transform_masks_formatting_and_eos(self):
+        tokenizer = mock.MagicMock()
+        tokenizer.eos_token_id = 99
+        tokenizer.return_value = {
+            "input_ids": [1, 2, 3, 4, 5],
+            "offset_mapping": [(0, 1), (1, 10), (10, 11), (11, 12), (12, 21)],
+        }
+
+        row = open_instruct.dataset_transformation.gen_value_sft_score_tokenize_and_truncate_v1(
+            {"prompt": "P", "generation": " <answer>10</answer>"}, tokenizer, max_seq_length=32
+        )
+
+        masked = open_instruct.dataset_transformation.MASKED_TOKEN_VALUE
+        self.assertEqual(row[open_instruct.dataset_transformation.INPUT_IDS_KEY].tolist(), [1, 2, 3, 4, 5, 99])
+        self.assertEqual(
+            row[open_instruct.dataset_transformation.LABELS_KEY].tolist(), [masked, masked, 3, 4, masked, masked]
+        )
+        self.assertEqual(row[open_instruct.dataset_transformation.ATTENTION_MASK_KEY].tolist(), [1] * 6)
+
+    def test_score_only_transform_rejects_noninteger_or_missing_offsets(self):
+        tokenizer = mock.MagicMock()
+        tokenizer.eos_token_id = 99
+        with self.assertRaisesRegex(ValueError, "integer answer"):
+            open_instruct.dataset_transformation.gen_value_sft_score_tokenize_and_truncate_v1(
+                {"prompt": "P", "generation": " <answer>0.5</answer>"}, tokenizer, max_seq_length=32
+            )
+
+        tokenizer.side_effect = NotImplementedError
+        with self.assertRaisesRegex(ValueError, "fast tokenizer"):
+            open_instruct.dataset_transformation.gen_value_sft_score_tokenize_and_truncate_v1(
+                {"prompt": "P", "generation": " <answer>5</answer>"}, tokenizer, max_seq_length=32
+            )
+
 
 class TestConfigHash(unittest.TestCase):
     def test_config_hash_different(self):
