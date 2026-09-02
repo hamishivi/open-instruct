@@ -581,13 +581,27 @@ def _extract_problem(row: dict[str, Any]) -> str:
     return str(row.get("prompt", ""))
 
 
+def _normalize_problem_identity(problem: str) -> str:
+    """Canonicalize formatting-only whitespace for holdout exclusion.
+
+    Hub revisions can contain the same math problem with trailing spaces or
+    hard-wrapped lines while held-out parquets store a stripped version. Those
+    variants are semantically identical and must not cross a problem-level
+    train/evaluation boundary.
+    """
+    return " ".join(str(problem).split())
+
+
 def _sample_record_indices(
     dataset: Any, *, num_to_sample: int, seed: int, excluded_problems: set[str] | None = None
 ) -> list[int]:
-    """Sample dataset rows after exact problem-level holdout exclusion."""
+    """Sample dataset rows after whitespace-normalized problem-level holdout exclusion."""
     excluded_problems = excluded_problems or set()
+    normalized_excluded_problems = {_normalize_problem_identity(problem) for problem in excluded_problems}
     eligible_indices = [
-        index for index in range(len(dataset)) if _extract_problem(dataset[index]) not in excluded_problems
+        index
+        for index in range(len(dataset))
+        if _normalize_problem_identity(_extract_problem(dataset[index])) not in normalized_excluded_problems
     ]
     if not eligible_indices:
         raise ValueError("No dataset rows remain after held-out problem exclusion.")

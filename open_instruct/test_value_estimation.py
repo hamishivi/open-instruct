@@ -383,6 +383,15 @@ class TestValueEstimationStates(unittest.TestCase):
 
         self.assertCountEqual(indices, [1, 2])
 
+    def test_problem_exclusion_ignores_formatting_only_whitespace(self):
+        dataset = [{"problem": "held  out\nproblem  "}, {"problem": "training problem"}]
+
+        indices = value_estimation._sample_record_indices(
+            dataset, num_to_sample=2, seed=7, excluded_problems={"held out problem"}
+        )
+
+        self.assertEqual(indices, [1])
+
     def test_extract_problem_reads_local_problem_column(self):
         self.assertEqual(
             value_estimation._extract_problem({"problem": "held-out question", "ground_truth": "42"}),
@@ -392,7 +401,7 @@ class TestValueEstimationStates(unittest.TestCase):
     def test_problem_exclusion_fails_when_nothing_remains(self):
         with self.assertRaisesRegex(ValueError, "No dataset rows remain"):
             value_estimation._sample_record_indices(
-                [{"prompt": "held out"}], num_to_sample=1, seed=7, excluded_problems={"held out"}
+                [{"prompt": "held\nout  "}], num_to_sample=1, seed=7, excluded_problems={"held out"}
             )
 
     def test_source_dataset_loads_hub_dataset_by_name(self):
