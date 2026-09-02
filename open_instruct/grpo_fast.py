@@ -1491,6 +1491,65 @@ class PolicyTrainerRayProcess(RayProcess):
                 training_pair["outcome"] = outcome
             rollout["pairs"] = training_pairs
 
+    def _complete_and_enqueue_gen_value_rollouts(
+        self,
+        pending: _PendingGenValueTrainingGeneration | None,
+        rollouts_by_sample_subseq: dict[tuple[int, int], dict],
+        rollouts: list[dict],
+        training_step: int,
+    ) -> dict[str, float]:
+        """Finish any deferred samples and admit the batch to the critic loop.
+
+        This method is safe to run in a host thread while the actor's policy GPU
+        performs backpropagation. The critic batch is enqueued immediately after
+        stochastic decoding, allowing critic optimization to overlap the rest of
+        the policy update instead of waiting for ``PolicyTrainer.step`` to return.
+        """
+        if self._gen_value_training_queue is None:
+            raise RuntimeError("Cannot enqueue generative-critic rollouts without a training queue.")
+        metrics: dict[str, float] = {}
+        if pending is not None:
+            training_pairs_by_request, generation_timing = self._resolve_gen_value_training_generation(pending)
+            self._replace_deferred_gen_value_training_pairs(rollouts_by_sample_subseq, training_pairs_by_request)
+            metrics.update(generation_timing)
+
+        if rollouts:
+            metrics.update(value_model_utils.gen_value_sampled_version_metrics(rollouts))
+        if self._gen_value_training_progress is not None:
+            ray.get(
+                self._gen_value_training_progress.register_admitted_policy_step.remote(
+                    training_step, self.rank, len(rollouts)
+                )
+            )
+        critic_enqueue_started_at = time.perf_counter()
+        evicted_rollouts = self._enqueue_gen_value_rollouts_latest(rollouts)
+        metrics["gen_value/training_queue_backpressure_seconds"] = time.perf_counter() - critic_enqueue_started_at
+        metrics["gen_value/max_async_steps"] = float(self.args.gen_value_max_async_steps)
+        self._gen_value_latest_enqueued_policy_training_step = training_step
+        metrics["gen_value/enqueued_rollouts"] = float(len(rollouts))
+        metrics["gen_value/queue_evicted_rollouts"] = float(len(evicted_rollouts))
+        if rollouts:
+            enqueued_policy_versions = [int(rollout["policy_model_version"]) for rollout in rollouts]
+            self._gen_value_latest_enqueued_policy_model_version = max(enqueued_policy_versions)
+            metrics["gen_value/enqueued_policy_model_version_min"] = float(min(enqueued_policy_versions))
+            metrics["gen_value/enqueued_policy_model_version_max"] = float(max(enqueued_policy_versions))
+        if evicted_rollouts:
+            evicted_steps = [int(rollout["policy_training_step"]) for rollout in evicted_rollouts]
+            evicted_policy_versions = [int(rollout["policy_model_version"]) for rollout in evicted_rollouts]
+            metrics["gen_value/queue_evicted_source_step_min"] = float(min(evicted_steps))
+            metrics["gen_value/queue_evicted_source_step_max"] = float(max(evicted_steps))
+            metrics["gen_value/queue_evicted_policy_model_version_min"] = float(min(evicted_policy_versions))
+            metrics["gen_value/queue_evicted_policy_model_version_max"] = float(max(evicted_policy_versions))
+        metrics["gen_value/training_queue_size"] = float(self._gen_value_training_queue.qsize())
+        metrics["gen_value/latest_enqueued_policy_training_step"] = float(
+            self._gen_value_latest_enqueued_policy_training_step
+        )
+        if self._gen_value_latest_enqueued_policy_model_version is not None:
+            metrics["gen_value/latest_enqueued_policy_model_version"] = float(
+                self._gen_value_latest_enqueued_policy_model_version
+            )
+        return metrics
+
     def _score_gen_value_requests(self, requests: list[dict[str, Any]]) -> list[tuple[torch.Tensor, list[dict]]]:
         """Synchronously score actor values and independent stochastic critic samples."""
         actor_results, pending = self._score_gen_value_requests_deferred_training(requests)
@@ -2289,6 +2348,8 @@ class PolicyTrainerRayProcess(RayProcess):
         _gen_value_training_rollouts: list[dict] = []
         _gen_value_training_rollouts_by_sample_subseq: dict[tuple[int, int], dict] = {}
         _pending_gen_value_training_generation: _PendingGenValueTrainingGeneration | None = None
+        _gen_value_enqueue_executor: futures.ThreadPoolExecutor | None = None
+        _gen_value_enqueue_future: futures.Future[dict[str, float]] | None = None
         if _use_gen_value and self._gen_value_training_queue is not None:
             latest_processed_step = self._get_gen_value_processed_policy_step()
             latest_trained_step, staleness_backpressure_seconds = self._wait_for_gen_value_source_window(training_step)
@@ -2810,6 +2871,32 @@ class PolicyTrainerRayProcess(RayProcess):
                     dist.all_reduce(regression_sums)
                 sae_step_metrics.update(value_model_utils.regression_metrics_from_sums(regression_sums))
 
+        # Preserve the original critic-optimizer/policy overlap. When stochastic
+        # training completions are still decoding, a host thread joins them and
+        # enqueues the complete critic batch as soon as it is ready while the
+        # main actor thread continues into policy backpropagation.
+        if _use_gen_value and self._gen_value_training_queue is not None:
+            if _pending_gen_value_training_generation is None:
+                sae_step_metrics.update(
+                    self._complete_and_enqueue_gen_value_rollouts(
+                        None,
+                        _gen_value_training_rollouts_by_sample_subseq,
+                        _gen_value_training_rollouts,
+                        training_step,
+                    )
+                )
+            else:
+                _gen_value_enqueue_executor = futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="gen-value-enqueue"
+                )
+                _gen_value_enqueue_future = _gen_value_enqueue_executor.submit(
+                    self._complete_and_enqueue_gen_value_rollouts,
+                    _pending_gen_value_training_generation,
+                    _gen_value_training_rollouts_by_sample_subseq,
+                    _gen_value_training_rollouts,
+                    training_step,
+                )
+
         # Whiten the advantages that will feed the policy loss. With a value model these are
         # GAE/SAE advantages; without one they remain the group-relative advantages prepared
         # by the data loader. Keeping this outside the value-model branch makes the flag useful
@@ -3086,73 +3173,23 @@ class PolicyTrainerRayProcess(RayProcess):
                 if value_grad_norms:
                     self.local_metrics["value/grad_norm"] = sum(value_grad_norms) / len(value_grad_norms)
 
-            # The stochastic critic-training generation was launched as soon as
-            # actor-facing values arrived. Join it only after policy/value backprop
-            # so vLLM decoding and learner compute overlap without changing the
-            # samples, critic version, or data admitted to the async critic loop.
-            if _pending_gen_value_training_generation is not None:
-                training_pairs_by_request, generation_timing = self._resolve_gen_value_training_generation(
-                    _pending_gen_value_training_generation
-                )
-                self._replace_deferred_gen_value_training_pairs(
-                    _gen_value_training_rollouts_by_sample_subseq, training_pairs_by_request
-                )
-                sae_step_metrics.update(generation_timing)
-
-            # Pipe complete rollouts to the independent critic loop. Enqueueing is
-            # latest-wins and nonblocking; the separate trained-source barrier at
-            # the next step bounds policy progress while still allowing overlap.
-            # The oldest queued shard is explicitly discarded under pressure.
-            if _use_gen_value and self._gen_value_training_queue is not None:
-                if _gen_value_training_rollouts:
-                    sae_step_metrics.update(
-                        value_model_utils.gen_value_sampled_version_metrics(_gen_value_training_rollouts)
-                    )
-                if self._gen_value_training_progress is not None:
-                    ray.get(
-                        self._gen_value_training_progress.register_admitted_policy_step.remote(
-                            training_step, self.rank, len(_gen_value_training_rollouts)
-                        )
-                    )
-                critic_enqueue_started_at = time.perf_counter()
-                evicted_rollouts = self._enqueue_gen_value_rollouts_latest(_gen_value_training_rollouts)
-                sae_step_metrics["gen_value/training_queue_backpressure_seconds"] = (
-                    time.perf_counter() - critic_enqueue_started_at
-                )
-                sae_step_metrics["gen_value/max_async_steps"] = float(self.args.gen_value_max_async_steps)
-                self._gen_value_latest_enqueued_policy_training_step = training_step
-                sae_step_metrics["gen_value/enqueued_rollouts"] = float(len(_gen_value_training_rollouts))
-                sae_step_metrics["gen_value/queue_evicted_rollouts"] = float(len(evicted_rollouts))
-                if _gen_value_training_rollouts:
-                    enqueued_policy_versions = [
-                        int(rollout["policy_model_version"]) for rollout in _gen_value_training_rollouts
-                    ]
-                    self._gen_value_latest_enqueued_policy_model_version = max(enqueued_policy_versions)
-                    sae_step_metrics["gen_value/enqueued_policy_model_version_min"] = float(
-                        min(enqueued_policy_versions)
-                    )
-                    sae_step_metrics["gen_value/enqueued_policy_model_version_max"] = float(
-                        max(enqueued_policy_versions)
-                    )
-                if evicted_rollouts:
-                    evicted_steps = [int(rollout["policy_training_step"]) for rollout in evicted_rollouts]
-                    evicted_policy_versions = [int(rollout["policy_model_version"]) for rollout in evicted_rollouts]
-                    sae_step_metrics["gen_value/queue_evicted_source_step_min"] = float(min(evicted_steps))
-                    sae_step_metrics["gen_value/queue_evicted_source_step_max"] = float(max(evicted_steps))
-                    sae_step_metrics["gen_value/queue_evicted_policy_model_version_min"] = float(
-                        min(evicted_policy_versions)
-                    )
-                    sae_step_metrics["gen_value/queue_evicted_policy_model_version_max"] = float(
-                        max(evicted_policy_versions)
-                    )
-                sae_step_metrics["gen_value/training_queue_size"] = float(self._gen_value_training_queue.qsize())
-            if self._gen_value_latest_enqueued_policy_training_step is not None:
-                sae_step_metrics["gen_value/latest_enqueued_policy_training_step"] = float(
-                    self._gen_value_latest_enqueued_policy_training_step
-                )
-            if self._gen_value_latest_enqueued_policy_model_version is not None:
-                sae_step_metrics["gen_value/latest_enqueued_policy_model_version"] = float(
-                    self._gen_value_latest_enqueued_policy_model_version
+            # Surface background completion errors before returning this policy
+            # step, but normally the future has already enqueued the critic batch
+            # and the critic optimizer has been running alongside policy backprop.
+            if _gen_value_enqueue_future is not None:
+                if _gen_value_enqueue_executor is None or _pending_gen_value_training_generation is None:
+                    raise RuntimeError("Deferred generative-critic enqueue state is inconsistent.")
+                policy_join_started_at = time.perf_counter()
+                try:
+                    background_metrics = _gen_value_enqueue_future.result()
+                finally:
+                    _gen_value_enqueue_executor.shutdown(wait=True)
+                policy_join_wait = time.perf_counter() - policy_join_started_at
+                sae_step_metrics.update(background_metrics)
+                sae_step_metrics["gen_value/training_generation_policy_join_wait_seconds"] = policy_join_wait
+                generation_elapsed = background_metrics.get("gen_value/training_generation_elapsed_seconds", 0.0)
+                sae_step_metrics["gen_value/training_generation_hidden_by_policy_seconds"] = max(
+                    generation_elapsed - policy_join_wait, 0.0
                 )
             if tis_mask_enabled:
                 frac_kept = (

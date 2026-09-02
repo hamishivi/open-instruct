@@ -2,6 +2,7 @@
 """Unit tests for grpo_fast_genvalue helpers (no GPU required)."""
 
 from queue import Queue
+from concurrent import futures
 import threading
 import time
 from types import MethodType, SimpleNamespace
@@ -453,6 +454,54 @@ def test_deferred_critic_training_pairs_reject_metadata_drift():
         grpo_fast.PolicyTrainerRayProcess.__ray_metadata__.modified_class._replace_deferred_gen_value_training_pairs(
             {(0, 0): rollout}, [[stochastic]]
         )
+
+
+def test_deferred_critic_completion_enqueues_before_future_join():
+    trainer_cls = grpo_fast.PolicyTrainerRayProcess.__ray_metadata__.modified_class
+    trainer = object.__new__(trainer_cls)
+    trainer.args = SimpleNamespace(gen_value_max_async_steps=4)
+    trainer.rank = 0
+    trainer._gen_value_training_queue = Queue(maxsize=1)
+    trainer._gen_value_training_progress = None
+    trainer._gen_value_latest_enqueued_policy_training_step = None
+    trainer._gen_value_latest_enqueued_policy_model_version = None
+    placeholder = {
+        "subseq_idx": 0,
+        "response_tokens_used": 512,
+        "trajectory_fraction": 0.5,
+        "response_token_limit": 8192,
+        "state_kind": "segment_start",
+        "critic_version": 9,
+        "outcome": 1.0,
+        "request_output": "greedy",
+    }
+    stochastic = {**placeholder, "outcome": None, "request_output": "stochastic"}
+    rollout = {
+        "policy_training_step": 8,
+        "policy_model_version": 7,
+        "critic_version": 9,
+        "pairs": [placeholder],
+    }
+
+    def resolve(_, _pending):
+        return [[stochastic]], {"gen_value/training_generation_elapsed_seconds": 0.25}
+
+    trainer._resolve_gen_value_training_generation = MethodType(resolve, trainer)
+    with futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            trainer._complete_and_enqueue_gen_value_rollouts,
+            object(),
+            {(0, 0): rollout},
+            [rollout],
+            8,
+        )
+        enqueued_rollouts = trainer._gen_value_training_queue.get(timeout=1.0)
+        assert enqueued_rollouts[0]["pairs"][0]["request_output"] == "stochastic"
+        assert enqueued_rollouts[0]["pairs"][0]["outcome"] == 1.0
+        metrics = future.result(timeout=1.0)
+
+    assert metrics["gen_value/enqueued_rollouts"] == 1.0
+    assert metrics["gen_value/latest_enqueued_policy_training_step"] == 8.0
 
 
 def test_matching_critic_temperatures_reuse_one_completion(monkeypatch):
