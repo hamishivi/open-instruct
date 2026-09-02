@@ -329,6 +329,58 @@ def require_trajectory_coverage(
     return coverage
 
 
+def summarize_prefix_length_coverage(
+    examples: Sequence[dict[str, Any]], *, long_prefix_token_threshold: int
+) -> dict[str, int | float]:
+    """Measure absolute consumed-token coverage before replay multipliers.
+
+    Trajectory-relative bands alone can call a 600-token prefix "late" even
+    when the online actor routinely reasons for several thousand tokens. This
+    complementary view detects that short-context mismatch directly.
+    """
+    if isinstance(long_prefix_token_threshold, bool) or not isinstance(long_prefix_token_threshold, int):
+        raise ValueError(
+            f"long_prefix_token_threshold must be a nonnegative integer, got {long_prefix_token_threshold!r}."
+        )
+    if long_prefix_token_threshold < 0:
+        raise ValueError(
+            f"long_prefix_token_threshold must be a nonnegative integer, got {long_prefix_token_threshold}."
+        )
+    prefix_lengths = [int(example.get("response_tokens_used", 0)) for example in examples]
+    if any(length < 0 for length in prefix_lengths):
+        raise ValueError(f"response_tokens_used must be nonnegative, got {prefix_lengths}.")
+    long_prefix_examples = sum(length >= long_prefix_token_threshold for length in prefix_lengths)
+    return {
+        "examples": len(prefix_lengths),
+        "zero_prefix_examples": sum(length == 0 for length in prefix_lengths),
+        "at_least_1024_tokens": sum(length >= 1024 for length in prefix_lengths),
+        "at_least_2048_tokens": sum(length >= 2048 for length in prefix_lengths),
+        "at_least_3072_tokens": sum(length >= 3072 for length in prefix_lengths),
+        "long_prefix_token_threshold": long_prefix_token_threshold,
+        "long_prefix_examples": long_prefix_examples,
+        "long_prefix_fraction": long_prefix_examples / len(prefix_lengths) if prefix_lengths else 0.0,
+    }
+
+
+def require_prefix_length_coverage(
+    examples: Sequence[dict[str, Any]], *, long_prefix_token_threshold: int, min_long_prefix_fraction: float
+) -> dict[str, int | float]:
+    """Fail closed when a purported long-context corpus remains too short."""
+    if not 0.0 <= min_long_prefix_fraction <= 1.0:
+        raise ValueError(f"min_long_prefix_fraction must be in [0, 1], got {min_long_prefix_fraction}.")
+    coverage = summarize_prefix_length_coverage(
+        examples, long_prefix_token_threshold=long_prefix_token_threshold
+    )
+    observed_fraction = float(coverage["long_prefix_fraction"])
+    if observed_fraction < min_long_prefix_fraction:
+        raise ValueError(
+            "MC SFT prefix coverage is too short-context: "
+            f"{coverage['long_prefix_examples']}/{len(examples)} ({observed_fraction:.3f}) unique states use at least "
+            f"{long_prefix_token_threshold} response tokens, below the required {min_long_prefix_fraction:.3f}."
+        )
+    return coverage
+
+
 def read_excluded_problems(path: pathlib.Path | None) -> set[str]:
     if path is None:
         return set()
@@ -362,6 +414,21 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Minimum fraction of unique, pre-replay states with trajectory_fraction < 0.75. "
             "Use this to fail closed when an intended prefix-calibration dataset is late/final-heavy."
+        ),
+    )
+    parser.add_argument(
+        "--long_prefix_token_threshold",
+        type=int,
+        default=2048,
+        help="Consumed response-token threshold used to define a long-prefix state.",
+    )
+    parser.add_argument(
+        "--min_long_prefix_fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum fraction of unique, pre-replay states at or beyond --long_prefix_token_threshold. "
+            "Use this to fail closed when a current-policy calibration corpus is still too short-context."
         ),
     )
     parser.add_argument("--score_max", type=int, default=10)
@@ -401,6 +468,9 @@ def main() -> None:
         gen_value_conditioning=args.gen_value_conditioning,
     )
     source_trajectory_coverage = summarize_trajectory_coverage(source_examples)
+    source_prefix_length_coverage = summarize_prefix_length_coverage(
+        source_examples, long_prefix_token_threshold=args.long_prefix_token_threshold
+    )
     raw_examples = (
         balance_examples_by_target_and_position(source_examples, seed=args.balance_seed)
         if args.balance_target_position
@@ -410,6 +480,11 @@ def main() -> None:
         raise ValueError(f"MC SFT dataset has {len(raw_examples)} examples; at least {args.min_examples} required.")
     trajectory_coverage = require_trajectory_coverage(
         raw_examples, min_early_middle_fraction=args.min_early_middle_fraction
+    )
+    prefix_length_coverage = require_prefix_length_coverage(
+        raw_examples,
+        long_prefix_token_threshold=args.long_prefix_token_threshold,
+        min_long_prefix_fraction=args.min_long_prefix_fraction,
     )
     examples = repeat_examples_for_horizon(
         raw_examples,
@@ -443,6 +518,8 @@ def main() -> None:
                 "balance_seed": args.balance_seed,
                 "source_trajectory_coverage": source_trajectory_coverage,
                 "raw_trajectory_coverage": trajectory_coverage,
+                "source_prefix_length_coverage": source_prefix_length_coverage,
+                "raw_prefix_length_coverage": prefix_length_coverage,
             },
             indent=2,
             sort_keys=True,

@@ -162,6 +162,30 @@ class TestValueEstimationStates(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "too late-heavy"):
             prepare_gen_value_mc_sft.require_trajectory_coverage(raw_examples, min_early_middle_fraction=0.75)
 
+    def test_mc_sft_prefix_length_coverage_is_measured_before_replay(self):
+        raw_examples = [
+            {"response_tokens_used": 0},
+            {"response_tokens_used": 1023},
+            {"response_tokens_used": 1024},
+            {"response_tokens_used": 2048},
+            {"response_tokens_used": 3072},
+        ]
+
+        coverage = prepare_gen_value_mc_sft.require_prefix_length_coverage(
+            raw_examples, long_prefix_token_threshold=2048, min_long_prefix_fraction=0.4
+        )
+
+        self.assertEqual(coverage["zero_prefix_examples"], 1)
+        self.assertEqual(coverage["at_least_1024_tokens"], 3)
+        self.assertEqual(coverage["at_least_2048_tokens"], 2)
+        self.assertEqual(coverage["at_least_3072_tokens"], 1)
+        self.assertEqual(coverage["long_prefix_examples"], 2)
+        self.assertEqual(coverage["long_prefix_fraction"], 0.4)
+        with self.assertRaisesRegex(ValueError, "too short-context"):
+            prepare_gen_value_mc_sft.require_prefix_length_coverage(
+                raw_examples, long_prefix_token_threshold=2048, min_long_prefix_fraction=0.5
+            )
+
     def test_mc_sft_target_position_balance_is_deterministic_and_does_not_duplicate_states(self):
         examples = []
         identifier = 0
