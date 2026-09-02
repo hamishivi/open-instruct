@@ -531,6 +531,7 @@ class GenValueTrainerActor:
                     "parsed": v_hat is not None,
                     "prediction": v_hat,
                     "squared_error": squared_error,
+                    "state_kind": pair.get("state_kind", "segment_start"),
                 }
             )
 
@@ -558,6 +559,7 @@ class GenValueTrainerActor:
         ]
         optimizer_weights = [float(example["reward"]) for example in optimizer_examples]
         optimizer_outcomes = [float(example["outcome"]) for example in optimizer_examples]
+        optimizer_state_kinds = [str(example["state_kind"]) for example in optimizer_examples]
         optimizer_mses = [
             float(example["squared_error"]) for example in optimizer_examples if example["squared_error"] is not None
         ]
@@ -728,6 +730,13 @@ class GenValueTrainerActor:
             value_model_utils.generative_value_reinforce_outcome_mass_metrics(
                 optimizer_weights,
                 optimizer_outcomes,
+                [len(example["generated_ids"]) for example in optimizer_examples],
+            )
+        )
+        metrics.update(
+            value_model_utils.generative_value_reinforce_state_kind_mass_metrics(
+                optimizer_weights,
+                optimizer_state_kinds,
                 [len(example["generated_ids"]) for example in optimizer_examples],
             )
         )
@@ -1269,6 +1278,7 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
         "gen_value/tis_clipfrac": "gen_value/tis_tokens",
         "gen_value/tis_mask_frac_kept": "gen_value/tis_mask_tokens",
         "gen_value/train_examples_per_pack": "gen_value/train_packs",
+        "gen_value/physical_train_examples_per_pack": "gen_value/train_packs",
         "gen_value/train_mean_pack_tokens": "gen_value/train_packs",
     }
     for metric, weight in weighted_metrics.items():
@@ -1288,6 +1298,9 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
         "gen_value/candidate_train_examples",
         "gen_value/train_tokens",
         "gen_value/train_examples",
+        "gen_value/physical_train_examples",
+        "gen_value/replay_collapsed_examples",
+        "gen_value/physical_train_tokens",
         "gen_value/reinforce_correct_examples",
         "gen_value/reinforce_incorrect_examples",
         "gen_value/reinforce_correct_tokens",
@@ -1300,6 +1313,18 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
         "gen_value/reinforce_incorrect_signed_token_weight_mass",
         "gen_value/reinforce_correct_abs_token_weight_mass",
         "gen_value/reinforce_incorrect_abs_token_weight_mass",
+        "gen_value/reinforce_prefix_examples",
+        "gen_value/reinforce_final_action_examples",
+        "gen_value/reinforce_prefix_tokens",
+        "gen_value/reinforce_final_action_tokens",
+        "gen_value/reinforce_prefix_abs_weight_sum",
+        "gen_value/reinforce_final_action_abs_weight_sum",
+        "gen_value/reinforce_prefix_signed_weight_sum",
+        "gen_value/reinforce_final_action_signed_weight_sum",
+        "gen_value/reinforce_prefix_signed_token_weight_mass",
+        "gen_value/reinforce_final_action_signed_token_weight_mass",
+        "gen_value/reinforce_prefix_abs_token_weight_mass",
+        "gen_value/reinforce_final_action_abs_token_weight_mass",
         "gen_value/optimization_correct_parsed_examples",
         "gen_value/optimization_incorrect_parsed_examples",
         "gen_value/parsed_examples",
@@ -1341,6 +1366,15 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
         total_mass = float(correct_mass) + float(incorrect_mass)
         if total_mass > 0.0:
             merged["gen_value/reinforce_correct_abs_token_weight_mass_frac"] = float(correct_mass) / total_mass
+
+    prefix_mass = merged.get("gen_value/reinforce_prefix_abs_token_weight_mass")
+    final_action_mass = merged.get("gen_value/reinforce_final_action_abs_token_weight_mass")
+    if isinstance(prefix_mass, int | float) and isinstance(final_action_mass, int | float):
+        total_mass = float(prefix_mass) + float(final_action_mass)
+        if total_mass > 0.0:
+            merged["gen_value/reinforce_final_action_abs_token_weight_mass_frac"] = (
+                float(final_action_mass) / total_mass
+            )
 
     for prefix in (
         "gen_value/source_policy_training_step",

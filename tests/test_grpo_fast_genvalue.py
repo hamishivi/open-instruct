@@ -765,6 +765,9 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
             "gen_value/reinforce_correct_abs_token_weight_mass": 1.0,
             "gen_value/reinforce_incorrect_abs_token_weight_mass": 0.0,
             "gen_value/reinforce_correct_abs_token_weight_mass_frac": 1.0,
+            "gen_value/reinforce_prefix_abs_token_weight_mass": 1.0,
+            "gen_value/reinforce_final_action_abs_token_weight_mass": 0.0,
+            "gen_value/reinforce_final_action_abs_token_weight_mass_frac": 0.0,
             "gen_value/optimization_correct_parsed_examples": 1,
             "gen_value/optimization_correct_target_mean": 1.0,
             "gen_value/optimization_correct_v_hat_mean": 0.8,
@@ -780,6 +783,10 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
             "gen_value/train_packs": 1,
             "gen_value/train_pack_tokens": 100,
             "gen_value/train_examples_per_pack": 1.0,
+            "gen_value/physical_train_examples": 1,
+            "gen_value/replay_collapsed_examples": 0,
+            "gen_value/physical_train_tokens": 2,
+            "gen_value/physical_train_examples_per_pack": 1.0,
             "gen_value/train_mean_pack_tokens": 100.0,
             "gen_value/train_max_pack_tokens": 100,
             "gen_value/batch_rollouts": 1,
@@ -815,6 +822,9 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
             "gen_value/reinforce_correct_abs_token_weight_mass": 2.0,
             "gen_value/reinforce_incorrect_abs_token_weight_mass": 3.0,
             "gen_value/reinforce_correct_abs_token_weight_mass_frac": 0.4,
+            "gen_value/reinforce_prefix_abs_token_weight_mass": 2.0,
+            "gen_value/reinforce_final_action_abs_token_weight_mass": 3.0,
+            "gen_value/reinforce_final_action_abs_token_weight_mass_frac": 0.6,
             "gen_value/optimization_correct_parsed_examples": 1,
             "gen_value/optimization_correct_target_mean": 0.75,
             "gen_value/optimization_correct_v_hat_mean": 0.6,
@@ -834,6 +844,10 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
             "gen_value/train_packs": 2,
             "gen_value/train_pack_tokens": 300,
             "gen_value/train_examples_per_pack": 1.5,
+            "gen_value/physical_train_examples": 2,
+            "gen_value/replay_collapsed_examples": 1,
+            "gen_value/physical_train_tokens": 4,
+            "gen_value/physical_train_examples_per_pack": 1.0,
             "gen_value/train_mean_pack_tokens": 150.0,
             "gen_value/train_max_pack_tokens": 180,
             "gen_value/batch_rollouts": 2,
@@ -869,6 +883,9 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
     assert metrics["gen_value/reinforce_correct_abs_token_weight_mass"] == pytest.approx(3.0)
     assert metrics["gen_value/reinforce_incorrect_abs_token_weight_mass"] == pytest.approx(3.0)
     assert metrics["gen_value/reinforce_correct_abs_token_weight_mass_frac"] == pytest.approx(0.5)
+    assert metrics["gen_value/reinforce_prefix_abs_token_weight_mass"] == pytest.approx(3.0)
+    assert metrics["gen_value/reinforce_final_action_abs_token_weight_mass"] == pytest.approx(3.0)
+    assert metrics["gen_value/reinforce_final_action_abs_token_weight_mass_frac"] == pytest.approx(0.5)
     assert metrics["gen_value/optimization_correct_parsed_examples"] == 2
     assert metrics["gen_value/optimization_correct_target_mean"] == pytest.approx(0.875)
     assert metrics["gen_value/optimization_correct_v_hat_mean"] == pytest.approx(0.7)
@@ -888,6 +905,10 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
     assert metrics["gen_value/train_packs"] == 3
     assert metrics["gen_value/train_pack_tokens"] == 400
     assert metrics["gen_value/train_examples_per_pack"] == pytest.approx(4 / 3)
+    assert metrics["gen_value/physical_train_examples"] == 3
+    assert metrics["gen_value/replay_collapsed_examples"] == 1
+    assert metrics["gen_value/physical_train_tokens"] == 6
+    assert metrics["gen_value/physical_train_examples_per_pack"] == pytest.approx(1.0)
     assert metrics["gen_value/train_mean_pack_tokens"] == pytest.approx(400 / 3)
     assert metrics["gen_value/train_max_pack_tokens"] == 180
     assert metrics["gen_value/batch_rollouts"] == 3

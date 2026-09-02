@@ -763,6 +763,71 @@ def generative_value_reinforce_outcome_mass_metrics(
     return metrics
 
 
+def generative_value_reinforce_state_kind_mass_metrics(
+    weights: Sequence[float], state_kinds: Sequence[str], generated_token_counts: Sequence[int]
+) -> dict[str, float]:
+    """Measure how much critic gradient mass is spent on prefixes versus final actions.
+
+    Final-action replay copies are intentionally present in these inputs. Reporting
+    their logical token-weight mass makes the replay allocation visible even when
+    exact copies are collapsed into one physical forward/backward example.
+    """
+    if len(weights) != len(state_kinds) or len(weights) != len(generated_token_counts):
+        raise ValueError(
+            "REINFORCE weights, state kinds, and generated-token counts must have the same length "
+            f"({len(weights)}, {len(state_kinds)}, {len(generated_token_counts)})."
+        )
+
+    buckets = {
+        "prefix": {
+            "examples": 0,
+            "tokens": 0,
+            "signed_weight": 0.0,
+            "signed_token_weight": 0.0,
+            "abs_weight": 0.0,
+            "abs_token_weight": 0.0,
+        },
+        "final_action": {
+            "examples": 0,
+            "tokens": 0,
+            "signed_weight": 0.0,
+            "signed_token_weight": 0.0,
+            "abs_weight": 0.0,
+            "abs_token_weight": 0.0,
+        },
+    }
+    for weight, state_kind, token_count in zip(weights, state_kinds, generated_token_counts, strict=True):
+        if not isinstance(state_kind, str) or not state_kind:
+            raise ValueError(f"Generative-value state kinds must be non-empty strings, got {state_kind!r}.")
+        if isinstance(token_count, bool) or not isinstance(token_count, int) or token_count < 0:
+            raise ValueError(f"Generated-token counts must be nonnegative integers, got {token_count!r}.")
+        bucket = buckets["final_action" if state_kind == "final_action" else "prefix"]
+        signed_weight = float(weight)
+        absolute_weight = abs(signed_weight)
+        bucket["examples"] += 1
+        bucket["tokens"] += token_count
+        bucket["signed_weight"] += signed_weight
+        bucket["signed_token_weight"] += signed_weight * token_count
+        bucket["abs_weight"] += absolute_weight
+        bucket["abs_token_weight"] += absolute_weight * token_count
+
+    metrics: dict[str, float] = {}
+    for name, bucket in buckets.items():
+        metrics[f"gen_value/reinforce_{name}_examples"] = float(bucket["examples"])
+        metrics[f"gen_value/reinforce_{name}_tokens"] = float(bucket["tokens"])
+        metrics[f"gen_value/reinforce_{name}_signed_weight_sum"] = float(bucket["signed_weight"])
+        metrics[f"gen_value/reinforce_{name}_signed_token_weight_mass"] = float(bucket["signed_token_weight"])
+        metrics[f"gen_value/reinforce_{name}_abs_weight_sum"] = float(bucket["abs_weight"])
+        metrics[f"gen_value/reinforce_{name}_abs_token_weight_mass"] = float(bucket["abs_token_weight"])
+
+    total_mass = sum(float(bucket["abs_token_weight"]) for bucket in buckets.values())
+    if total_mass > 0.0:
+        metrics["gen_value/reinforce_final_action_abs_token_weight_mass_frac"] = (
+            float(buckets["final_action"]["abs_token_weight"]) / total_mass
+        )
+    return metrics
+
+
 def generative_value_prediction_outcome_metrics(
     predictions: Sequence[float | None], outcomes: Sequence[float]
 ) -> dict[str, float]:
@@ -938,6 +1003,7 @@ def collapse_replayed_gen_value_optimizer_examples(examples: Sequence[dict[str, 
         "generated_ids",
         "rollout_logprobs",
         "outcome",
+        "state_kind",
         "optimizer_selected",
         "parsed",
         "prediction",

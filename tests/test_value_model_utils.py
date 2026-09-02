@@ -400,6 +400,30 @@ def test_generative_value_reinforce_outcome_mass_metrics_include_tokens_and_repl
     }
 
 
+def test_generative_value_reinforce_state_kind_mass_metrics_include_tokens_and_replays():
+    metrics = value_model_utils.generative_value_reinforce_state_kind_mass_metrics(
+        weights=[0.5, -0.25, 0.5],
+        state_kinds=["final_action", "segment_start", "final_action"],
+        generated_token_counts=[4, 8, 2],
+    )
+
+    assert metrics == {
+        "gen_value/reinforce_prefix_examples": 1.0,
+        "gen_value/reinforce_prefix_tokens": 8.0,
+        "gen_value/reinforce_prefix_signed_weight_sum": -0.25,
+        "gen_value/reinforce_prefix_signed_token_weight_mass": -2.0,
+        "gen_value/reinforce_prefix_abs_weight_sum": 0.25,
+        "gen_value/reinforce_prefix_abs_token_weight_mass": 2.0,
+        "gen_value/reinforce_final_action_examples": 2.0,
+        "gen_value/reinforce_final_action_tokens": 6.0,
+        "gen_value/reinforce_final_action_signed_weight_sum": 1.0,
+        "gen_value/reinforce_final_action_signed_token_weight_mass": 3.0,
+        "gen_value/reinforce_final_action_abs_weight_sum": 1.0,
+        "gen_value/reinforce_final_action_abs_token_weight_mass": 3.0,
+        "gen_value/reinforce_final_action_abs_token_weight_mass_frac": 0.6,
+    }
+
+
 def test_generative_value_prediction_outcome_metrics_split_calibration_and_skip_parse_failures():
     metrics = value_model_utils.generative_value_prediction_outcome_metrics(
         predictions=[0.8, None, 0.4, 0.1], outcomes=[1.0, 1.0, 0.75, 0.0]
@@ -432,6 +456,19 @@ def test_generative_value_prediction_outcome_metrics_reject_invalid_values(predi
 def test_generative_value_reinforce_outcome_mass_metrics_reject_invalid_token_counts(token_count):
     with pytest.raises(ValueError, match="nonnegative integers"):
         value_model_utils.generative_value_reinforce_outcome_mass_metrics([0.5], [1.0], [token_count])
+
+
+@pytest.mark.parametrize("token_count", [-1, True, 1.5])
+def test_generative_value_reinforce_state_kind_mass_metrics_reject_invalid_token_counts(token_count):
+    with pytest.raises(ValueError, match="nonnegative integers"):
+        value_model_utils.generative_value_reinforce_state_kind_mass_metrics(
+            [0.5], ["segment_start"], [token_count]
+        )
+
+
+def test_generative_value_reinforce_state_kind_mass_metrics_reject_invalid_state_kind():
+    with pytest.raises(ValueError, match="non-empty strings"):
+        value_model_utils.generative_value_reinforce_state_kind_mass_metrics([0.5], [""], [1])
 
 
 @pytest.mark.parametrize("outcome", [float("nan"), -0.1, 1.1])
