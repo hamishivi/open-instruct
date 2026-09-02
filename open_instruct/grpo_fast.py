@@ -2187,6 +2187,8 @@ class PolicyTrainerRayProcess(RayProcess):
             _NUM_PCT_BINS = 20
             _vdiag_correct: list[list[float]] = [[] for _ in range(_NUM_PCT_BINS)]
             _vdiag_incorrect: list[list[float]] = [[] for _ in range(_NUM_PCT_BINS)]
+            _vdiag_returns_correct: list[list[float]] = [[] for _ in range(_NUM_PCT_BINS)]
+            _vdiag_returns_incorrect: list[list[float]] = [[] for _ in range(_NUM_PCT_BINS)]
             _vdiag_returns_all: list[float] = []
             _vdiag_preds_all: list[float] = []
             _gen_value_adv_correct: list[float] = []
@@ -2514,12 +2516,19 @@ class PolicyTrainerRayProcess(RayProcess):
                             f"correct={tuple(full_correct.shape)}, bins={tuple(full_bins.shape)}, "
                             f"values={tuple(value_mask.shape)}."
                         )
-                    correct_np = full_correct.cpu().numpy()
-                    bins_np = full_bins.cpu().numpy()
+                    position_samples = value_model_utils.scalar_value_outcome_position_samples(
+                        torch.from_numpy(vals_np),
+                        torch.from_numpy(returns_np),
+                        torch.from_numpy(vm_np),
+                        full_correct.cpu(),
+                        full_bins.cpu(),
+                        _NUM_PCT_BINS,
+                    )
                     for bin_idx in range(_NUM_PCT_BINS):
-                        in_bin = vm_np & (bins_np == bin_idx)
-                        _vdiag_correct[bin_idx].extend(vals_np[in_bin & correct_np].tolist())
-                        _vdiag_incorrect[bin_idx].extend(vals_np[in_bin & ~correct_np].tolist())
+                        _vdiag_correct[bin_idx].extend(position_samples["prediction_correct"][bin_idx])
+                        _vdiag_incorrect[bin_idx].extend(position_samples["prediction_incorrect"][bin_idx])
+                        _vdiag_returns_correct[bin_idx].extend(position_samples["return_correct"][bin_idx])
+                        _vdiag_returns_incorrect[bin_idx].extend(position_samples["return_incorrect"][bin_idx])
             # Reduce numerators and denominators rather than rank-local means. This
             # keeps diagnostics exact when ranks process unequal numbers of tokens.
             diagnostic_series: list[tuple[str, list[float]]] = [
@@ -2549,6 +2558,22 @@ class PolicyTrainerRayProcess(RayProcess):
                         "value/incorrect_late_mean",
                         [value for bin_values in _vdiag_incorrect[-edge_bin_count:] for value in bin_values],
                     ),
+                    (
+                        "value/returns_correct_early_mean",
+                        [value for bin_values in _vdiag_returns_correct[:edge_bin_count] for value in bin_values],
+                    ),
+                    (
+                        "value/returns_correct_late_mean",
+                        [value for bin_values in _vdiag_returns_correct[-edge_bin_count:] for value in bin_values],
+                    ),
+                    (
+                        "value/returns_incorrect_early_mean",
+                        [value for bin_values in _vdiag_returns_incorrect[:edge_bin_count] for value in bin_values],
+                    ),
+                    (
+                        "value/returns_incorrect_late_mean",
+                        [value for bin_values in _vdiag_returns_incorrect[-edge_bin_count:] for value in bin_values],
+                    ),
                 )
             )
             for bin_idx in range(_NUM_PCT_BINS):
@@ -2557,6 +2582,8 @@ class PolicyTrainerRayProcess(RayProcess):
                     (
                         (f"value/correct_pct_{tag}", _vdiag_correct[bin_idx]),
                         (f"value/incorrect_pct_{tag}", _vdiag_incorrect[bin_idx]),
+                        (f"value/returns_correct_pct_{tag}", _vdiag_returns_correct[bin_idx]),
+                        (f"value/returns_incorrect_pct_{tag}", _vdiag_returns_incorrect[bin_idx]),
                     )
                 )
             diagnostic_sums = torch.tensor(

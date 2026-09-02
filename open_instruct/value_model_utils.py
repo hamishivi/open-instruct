@@ -604,6 +604,60 @@ def regression_metrics_from_sums(metric_sums: torch.Tensor) -> dict[str, float]:
     }
 
 
+def scalar_value_outcome_position_samples(
+    predictions: torch.Tensor,
+    returns: torch.Tensor,
+    value_mask: torch.Tensor,
+    correct_labels: torch.Tensor,
+    percentile_bins: torch.Tensor,
+    num_bins: int,
+) -> dict[str, list[list[float]]]:
+    """Split scalar-value predictions and return targets by outcome and trajectory position.
+
+    The caller reduces the returned samples across data-parallel ranks. Keeping
+    predictions and their training targets under the same labels distinguishes a
+    changing on-policy target distribution from value-head miscalibration.
+    """
+    if isinstance(num_bins, bool) or not isinstance(num_bins, int) or num_bins <= 0:
+        raise ValueError(f"num_bins must be a positive integer, got {num_bins!r}.")
+    tensors = {
+        "returns": returns,
+        "value_mask": value_mask,
+        "correct_labels": correct_labels,
+        "percentile_bins": percentile_bins,
+    }
+    for name, tensor in tensors.items():
+        if tensor.shape != predictions.shape:
+            raise ValueError(
+                f"{name} must have the same shape as predictions ({tensor.shape} != {predictions.shape})."
+            )
+    mask = value_mask.bool()
+    bins = percentile_bins.long()
+    invalid_bins = mask & ((bins < 0) | (bins >= num_bins))
+    if bool(invalid_bins.any()):
+        invalid = sorted(set(bins[invalid_bins].detach().cpu().tolist()))
+        raise ValueError(f"Masked percentile bins must be in [0, {num_bins}), got {invalid}.")
+
+    predictions = predictions.detach()
+    returns = returns.detach()
+    correct = correct_labels.bool()
+    result = {
+        "prediction_correct": [[] for _ in range(num_bins)],
+        "prediction_incorrect": [[] for _ in range(num_bins)],
+        "return_correct": [[] for _ in range(num_bins)],
+        "return_incorrect": [[] for _ in range(num_bins)],
+    }
+    for bin_index in range(num_bins):
+        in_bin = mask & (bins == bin_index)
+        correct_in_bin = in_bin & correct
+        incorrect_in_bin = in_bin & ~correct
+        result["prediction_correct"][bin_index] = predictions[correct_in_bin].float().cpu().tolist()
+        result["prediction_incorrect"][bin_index] = predictions[incorrect_in_bin].float().cpu().tolist()
+        result["return_correct"][bin_index] = returns[correct_in_bin].float().cpu().tolist()
+        result["return_incorrect"][bin_index] = returns[incorrect_in_bin].float().cpu().tolist()
+    return result
+
+
 def generative_value_reinforce_reward(outcome: float, prediction: float | None) -> tuple[float, float | None]:
     """Return the GenAC critic reward and parsed-prediction squared error.
 

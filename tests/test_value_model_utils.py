@@ -5,6 +5,7 @@ import random
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from open_instruct import value_model_utils
 
@@ -604,6 +605,42 @@ def test_gen_value_policy_guard(threshold: float | None, observed: float | None,
 def test_gen_value_policy_guard_rejects_invalid_threshold():
     with pytest.raises(ValueError, match="min_advantage_gap"):
         value_model_utils.gen_value_policy_guard_active(-0.1, 0.3)
+
+
+def test_scalar_value_outcome_position_samples_aligns_predictions_and_returns():
+    samples = value_model_utils.scalar_value_outcome_position_samples(
+        predictions=torch.tensor([[0.1, 0.2, 0.3, 0.4, 9.0]]),
+        returns=torch.tensor([[0.5, 0.6, 0.7, 0.8, 9.0]]),
+        value_mask=torch.tensor([[True, True, True, True, False]]),
+        correct_labels=torch.tensor([[True, True, False, False, False]]),
+        percentile_bins=torch.tensor([[0, 1, 0, 1, -1]]),
+        num_bins=2,
+    )
+
+    assert samples == {
+        "prediction_correct": [[pytest.approx(0.1)], [pytest.approx(0.2)]],
+        "prediction_incorrect": [[pytest.approx(0.3)], [pytest.approx(0.4)]],
+        "return_correct": [[pytest.approx(0.5)], [pytest.approx(0.6)]],
+        "return_incorrect": [[pytest.approx(0.7)], [pytest.approx(0.8)]],
+    }
+
+
+def test_scalar_value_outcome_position_samples_rejects_invalid_shape_and_bins():
+    tensors = {
+        "predictions": torch.zeros((1, 2)),
+        "returns": torch.zeros((1, 2)),
+        "value_mask": torch.ones((1, 2), dtype=torch.bool),
+        "correct_labels": torch.ones((1, 2), dtype=torch.bool),
+        "percentile_bins": torch.tensor([[0, 2]]),
+        "num_bins": 2,
+    }
+    with pytest.raises(ValueError, match="Masked percentile bins"):
+        value_model_utils.scalar_value_outcome_position_samples(**tensors)
+
+    with pytest.raises(ValueError, match="same shape"):
+        value_model_utils.scalar_value_outcome_position_samples(
+            **{**tensors, "returns": torch.zeros((1, 1)), "percentile_bins": torch.tensor([[0, 1]])}
+        )
 
 
 @pytest.mark.parametrize(("world_size", "max_async_steps", "expected"), [(1, 1, 2), (4, 1, 8), (2, 3, 8)])
