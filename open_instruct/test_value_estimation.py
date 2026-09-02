@@ -2,6 +2,9 @@ import argparse
 import dataclasses
 import math
 import os
+import pathlib
+import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
@@ -22,6 +25,47 @@ class _FakeTokenizer:
 
 
 class TestValueEstimationStates(unittest.TestCase):
+    def test_mc_value_sft_wrapper_forwards_absolute_prefix_gate(self):
+        repository_root = pathlib.Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory(prefix="gen-value-wrapper-test-") as directory:
+            test_root = pathlib.Path(directory)
+            train_parquet = test_root / "train.parquet"
+            heldout_parquet = test_root / "heldout.parquet"
+            model_path = test_root / "model"
+            captured_args = test_root / "args.txt"
+            fake_python = test_root / "fake-python"
+            train_parquet.touch()
+            heldout_parquet.touch()
+            model_path.mkdir()
+            fake_python.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$CAPTURE_ARGS"\nexit 73\n')
+            fake_python.chmod(0o755)
+            environment = {
+                **os.environ,
+                "MC_VALUE_PARQUET": str(train_parquet),
+                "HELDOUT_VALUE_PARQUET": str(heldout_parquet),
+                "MODEL_PATH": str(model_path),
+                "PYTHON_EXECUTABLE": str(fake_python),
+                "CAPTURE_ARGS": str(captured_args),
+                "LONG_PREFIX_TOKEN_THRESHOLD": "3072",
+                "MIN_LONG_PREFIX_FRACTION": "0.15",
+            }
+
+            result = subprocess.run(
+                ["bash", "scripts/train/debug/genac_math_mc_value_sft_h200.sh"],
+                cwd=repository_root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 73, result.stderr)
+            arguments = captured_args.read_text().splitlines()
+            threshold_index = arguments.index("--long_prefix_token_threshold")
+            fraction_index = arguments.index("--min_long_prefix_fraction")
+            self.assertEqual(arguments[threshold_index + 1], "3072")
+            self.assertEqual(arguments[fraction_index + 1], "0.15")
+
     def test_trace_sft_can_target_prefix_states_without_discarding_other_kinds_by_default(self):
         examples = [{"id": "early", "state_kind": "segment_start"}, {"id": "terminal", "state_kind": "final_action"}]
 
