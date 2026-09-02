@@ -1394,21 +1394,53 @@ def build_gen_value_validation_holdout(
         if any(is_gen_value_near_horizon_incorrect(pair) for rollout in group[1] for pair in rollout.get("pairs", []))
     ]
     rng.shuffle(near_horizon_groups)
+    long_success_groups = [
+        group
+        for group in grouped_rollouts
+        if any(
+            pair.get("state_kind") != "final_action"
+            and int(pair.get("response_tokens_used") or 0) >= 4096
+            and float(pair["outcome"]) > 0.5
+            for rollout in group[1]
+            for pair in rollout.get("pairs", [])
+        )
+    ]
+    rng.shuffle(long_success_groups)
     mixed_outcome_groups = [group for group in grouped_rollouts if len(group_outcomes(group)) == 2]
     rng.shuffle(mixed_outcome_groups)
 
     # A single mixed prompt group is strictly more informative than a one-class
     # group: it retains prompt-level isolation while making both calibration and
-    # ranking diagnostics available. With a larger budget, first retain the rare
-    # near-horizon failures, then explicitly cover any missing outcome class.
+    # ranking diagnostics available. With a larger budget, retain scarce long
+    # successes and near-horizon failures, then explicitly cover any missing
+    # outcome class.
     heldout_groups: list[tuple[tuple[int, ...], list[dict[str, Any]]]] = []
-    if holdout_group_count == 1 and mixed_outcome_groups:
-        heldout_groups.append(mixed_outcome_groups[0])
-    else:
-        reserved_count = min(len(near_horizon_groups), max(1, math.ceil(holdout_group_count / 2)))
-        heldout_groups.extend(near_horizon_groups[:reserved_count])
+    selected_group_ids: set[int] = set()
 
-    selected_group_ids = {id(group) for group in heldout_groups}
+    def add_heldout_group(group: tuple[tuple[int, ...], list[dict[str, Any]]]) -> bool:
+        if len(heldout_groups) >= holdout_group_count or id(group) in selected_group_ids:
+            return False
+        heldout_groups.append(group)
+        selected_group_ids.add(id(group))
+        return True
+
+    if holdout_group_count == 1 and mixed_outcome_groups:
+        add_heldout_group(mixed_outcome_groups[0])
+    else:
+        # Long successful prefixes are substantially rarer than long failed
+        # prefixes in hard-math rollouts.  Reserve one prompt group containing
+        # one when available, otherwise a fixed panel can report excellent
+        # near-horizon failure calibration while having no evidence at all for
+        # the successful long-context states used by the actor.
+        if long_success_groups:
+            add_heldout_group(long_success_groups[0])
+        reserved_count = min(len(near_horizon_groups), max(1, math.ceil(holdout_group_count / 2)))
+        reserved_near_horizon_groups = 0
+        for group in near_horizon_groups:
+            if reserved_near_horizon_groups >= reserved_count:
+                break
+            reserved_near_horizon_groups += int(add_heldout_group(group))
+
     observed_outcomes = set().union(*(group_outcomes(group) for group in heldout_groups))
     for missing_outcome in (True, False):
         if missing_outcome in observed_outcomes:
@@ -1425,12 +1457,14 @@ def build_gen_value_validation_holdout(
         # even when the remaining prompt-group budget is only one.
         candidates.sort(key=lambda group: len(group_outcomes(group)), reverse=True)
         if candidates:
-            heldout_groups.append(candidates[0])
-            selected_group_ids.add(id(candidates[0]))
+            add_heldout_group(candidates[0])
 
     remaining_groups = [group for group in grouped_rollouts if id(group) not in selected_group_ids]
     rng.shuffle(remaining_groups)
-    heldout_groups.extend(remaining_groups[: holdout_group_count - len(heldout_groups)])
+    for group in remaining_groups:
+        if len(heldout_groups) >= holdout_group_count:
+            break
+        add_heldout_group(group)
     rng.shuffle(heldout_groups)
     heldout_rollout_ids = {id(rollout) for _, group in heldout_groups for rollout in group}
     validation_examples: list[dict[str, Any]] = []

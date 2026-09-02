@@ -346,6 +346,48 @@ def test_gen_value_validation_preserves_near_horizon_and_both_outcomes():
     assert any(value_model_utils.is_gen_value_near_horizon_incorrect(example) for example in sampled)
 
 
+def test_gen_value_validation_reserves_rare_long_successful_prefix():
+    rollouts = []
+    for group_index in range(8):
+        outcome = float(group_index == 6)
+        response_tokens_used = 5000 if group_index == 6 else 500
+        final_tokens_used = 8000 if group_index == 7 else response_tokens_used + 500
+        rollouts.append(
+            {
+                "pairs": [
+                    _pair([group_index], outcome, state_kind="segment_start", response_tokens_used=0),
+                    _pair(
+                        [group_index, 1],
+                        outcome,
+                        state_kind="segment_start",
+                        response_tokens_used=response_tokens_used,
+                    ),
+                    _pair(
+                        [group_index, 2],
+                        outcome,
+                        state_kind="final_action",
+                        response_tokens_used=final_tokens_used,
+                    ),
+                ]
+            }
+        )
+
+    examples, _ = value_model_utils.build_gen_value_validation_holdout(
+        rollouts,
+        max_examples=16,
+        seed=7,
+        prompt_holdout_fraction=0.25,
+    )
+
+    assert any(
+        example["kind"] == "segment_start"
+        and example["target"] == 1.0
+        and example["response_tokens_used"] >= 4096
+        for example in examples
+    )
+    assert any(value_model_utils.is_gen_value_near_horizon_incorrect(example) for example in examples)
+
+
 def test_gen_value_validation_requires_both_sampled_outcome_classes_before_capture():
     one_class = [
         {"target": 0.0, "target_source": "sibling_empirical_return"},
