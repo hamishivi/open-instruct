@@ -731,6 +731,11 @@ class GenValueTrainerActor:
                 [len(example["generated_ids"]) for example in optimizer_examples],
             )
         )
+        metrics.update(
+            value_model_utils.generative_value_prediction_outcome_metrics(
+                [example["prediction"] for example in optimizer_examples], optimizer_outcomes
+            )
+        )
         metrics.update(pooling_metrics)
         if self._trace_reservoir_size > 0:
             metrics["gen_value/trace_examples_seen"] = sum(self._trace_seen_by_outcome.values())
@@ -1289,8 +1294,14 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
         "gen_value/reinforce_incorrect_tokens",
         "gen_value/reinforce_correct_abs_weight_sum",
         "gen_value/reinforce_incorrect_abs_weight_sum",
+        "gen_value/reinforce_correct_signed_weight_sum",
+        "gen_value/reinforce_incorrect_signed_weight_sum",
+        "gen_value/reinforce_correct_signed_token_weight_mass",
+        "gen_value/reinforce_incorrect_signed_token_weight_mass",
         "gen_value/reinforce_correct_abs_token_weight_mass",
         "gen_value/reinforce_incorrect_abs_token_weight_mass",
+        "gen_value/optimization_correct_parsed_examples",
+        "gen_value/optimization_incorrect_parsed_examples",
         "gen_value/parsed_examples",
         "gen_value/unique_examples",
         "gen_value/optimizer_unique_examples",
@@ -1315,6 +1326,14 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
         values = [float(update[metric]) for update in reinforce_updates if metric in update]
         if values:
             merged[metric] = sum(values)
+
+    for outcome in ("correct", "incorrect"):
+        count_key = f"gen_value/optimization_{outcome}_parsed_examples"
+        for suffix in ("target_mean", "v_hat_mean", "mse"):
+            metric = f"gen_value/optimization_{outcome}_{suffix}"
+            mean = weighted_mean(metric, count_key)
+            if mean is not None:
+                merged[metric] = mean
 
     correct_mass = merged.get("gen_value/reinforce_correct_abs_token_weight_mass")
     incorrect_mass = merged.get("gen_value/reinforce_incorrect_abs_token_weight_mass")

@@ -386,14 +386,46 @@ def test_generative_value_reinforce_outcome_mass_metrics_include_tokens_and_repl
     assert metrics == {
         "gen_value/reinforce_correct_examples": 2.0,
         "gen_value/reinforce_correct_tokens": 6.0,
+        "gen_value/reinforce_correct_signed_weight_sum": 1.0,
+        "gen_value/reinforce_correct_signed_token_weight_mass": 3.0,
         "gen_value/reinforce_correct_abs_weight_sum": 1.0,
         "gen_value/reinforce_correct_abs_token_weight_mass": 3.0,
         "gen_value/reinforce_incorrect_examples": 1.0,
         "gen_value/reinforce_incorrect_tokens": 8.0,
+        "gen_value/reinforce_incorrect_signed_weight_sum": -0.25,
+        "gen_value/reinforce_incorrect_signed_token_weight_mass": -2.0,
         "gen_value/reinforce_incorrect_abs_weight_sum": 0.25,
         "gen_value/reinforce_incorrect_abs_token_weight_mass": 2.0,
         "gen_value/reinforce_correct_abs_token_weight_mass_frac": 0.6,
     }
+
+
+def test_generative_value_prediction_outcome_metrics_split_calibration_and_skip_parse_failures():
+    metrics = value_model_utils.generative_value_prediction_outcome_metrics(
+        predictions=[0.8, None, 0.4, 0.1], outcomes=[1.0, 1.0, 0.75, 0.0]
+    )
+
+    assert metrics == pytest.approx(
+        {
+            "gen_value/optimization_correct_parsed_examples": 2.0,
+            "gen_value/optimization_correct_target_mean": 0.875,
+            "gen_value/optimization_correct_v_hat_mean": 0.6,
+            "gen_value/optimization_correct_mse": (0.2**2 + 0.35**2) / 2,
+            "gen_value/optimization_incorrect_parsed_examples": 1.0,
+            "gen_value/optimization_incorrect_target_mean": 0.0,
+            "gen_value/optimization_incorrect_v_hat_mean": 0.1,
+            "gen_value/optimization_incorrect_mse": 0.1**2,
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("predictions", "outcomes", "message"),
+    [([0.5], [], "same length"), ([1.1], [1.0], "prediction"), ([0.5], [float("nan")], "outcome")],
+)
+def test_generative_value_prediction_outcome_metrics_reject_invalid_values(predictions, outcomes, message):
+    with pytest.raises(ValueError, match=message):
+        value_model_utils.generative_value_prediction_outcome_metrics(predictions, outcomes)
 
 
 @pytest.mark.parametrize("token_count", [-1, True, 1.5])

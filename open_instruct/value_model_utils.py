@@ -716,16 +716,33 @@ def generative_value_reinforce_outcome_mass_metrics(
         )
 
     buckets = {
-        "correct": {"examples": 0, "tokens": 0, "abs_weight": 0.0, "abs_token_weight": 0.0},
-        "incorrect": {"examples": 0, "tokens": 0, "abs_weight": 0.0, "abs_token_weight": 0.0},
+        "correct": {
+            "examples": 0,
+            "tokens": 0,
+            "signed_weight": 0.0,
+            "signed_token_weight": 0.0,
+            "abs_weight": 0.0,
+            "abs_token_weight": 0.0,
+        },
+        "incorrect": {
+            "examples": 0,
+            "tokens": 0,
+            "signed_weight": 0.0,
+            "signed_token_weight": 0.0,
+            "abs_weight": 0.0,
+            "abs_token_weight": 0.0,
+        },
     }
     for weight, outcome, token_count in zip(weights, outcomes, generated_token_counts, strict=True):
         if isinstance(token_count, bool) or not isinstance(token_count, int) or token_count < 0:
             raise ValueError(f"Generated-token counts must be nonnegative integers, got {token_count!r}.")
         bucket = buckets["correct" if float(outcome) > 0.5 else "incorrect"]
-        absolute_weight = abs(float(weight))
+        signed_weight = float(weight)
+        absolute_weight = abs(signed_weight)
         bucket["examples"] += 1
         bucket["tokens"] += token_count
+        bucket["signed_weight"] += signed_weight
+        bucket["signed_token_weight"] += signed_weight * token_count
         bucket["abs_weight"] += absolute_weight
         bucket["abs_token_weight"] += absolute_weight * token_count
 
@@ -733,6 +750,8 @@ def generative_value_reinforce_outcome_mass_metrics(
     for name, bucket in buckets.items():
         metrics[f"gen_value/reinforce_{name}_examples"] = float(bucket["examples"])
         metrics[f"gen_value/reinforce_{name}_tokens"] = float(bucket["tokens"])
+        metrics[f"gen_value/reinforce_{name}_signed_weight_sum"] = float(bucket["signed_weight"])
+        metrics[f"gen_value/reinforce_{name}_signed_token_weight_mass"] = float(bucket["signed_token_weight"])
         metrics[f"gen_value/reinforce_{name}_abs_weight_sum"] = float(bucket["abs_weight"])
         metrics[f"gen_value/reinforce_{name}_abs_token_weight_mass"] = float(bucket["abs_token_weight"])
 
@@ -741,6 +760,48 @@ def generative_value_reinforce_outcome_mass_metrics(
         metrics["gen_value/reinforce_correct_abs_token_weight_mass_frac"] = (
             float(buckets["correct"]["abs_token_weight"]) / total_mass
         )
+    return metrics
+
+
+def generative_value_prediction_outcome_metrics(
+    predictions: Sequence[float | None], outcomes: Sequence[float]
+) -> dict[str, float]:
+    """Report calibration separately for parsed correct and incorrect targets.
+
+    A global critic MSE can improve merely because the more common failed states
+    become easier.  Splitting the actual optimizer examples by target outcome
+    makes a shared downward prediction drift visible without changing the loss.
+    Parse failures remain excluded from calibration statistics and are already
+    represented by the optimizer parse-rate metric.
+    """
+    if len(predictions) != len(outcomes):
+        raise ValueError(
+            "Generative-value predictions and outcomes must have the same length "
+            f"({len(predictions)} != {len(outcomes)})."
+        )
+
+    buckets: dict[str, list[tuple[float, float]]] = {"correct": [], "incorrect": []}
+    for prediction, outcome in zip(predictions, outcomes, strict=True):
+        target = float(outcome)
+        if not math.isfinite(target) or not 0.0 <= target <= 1.0:
+            raise ValueError(f"Generative-value outcome must be finite and in [0, 1], got {outcome}.")
+        if prediction is None:
+            continue
+        prediction = float(prediction)
+        if not math.isfinite(prediction) or not 0.0 <= prediction <= 1.0:
+            raise ValueError(f"Generative-value prediction must be finite and in [0, 1], got {prediction}.")
+        buckets["correct" if target > 0.5 else "incorrect"].append((target, prediction))
+
+    metrics: dict[str, float] = {}
+    for name, rows in buckets.items():
+        if not rows:
+            continue
+        metrics[f"gen_value/optimization_{name}_parsed_examples"] = float(len(rows))
+        metrics[f"gen_value/optimization_{name}_target_mean"] = sum(target for target, _ in rows) / len(rows)
+        metrics[f"gen_value/optimization_{name}_v_hat_mean"] = sum(prediction for _, prediction in rows) / len(rows)
+        metrics[f"gen_value/optimization_{name}_mse"] = sum(
+            (prediction - target) ** 2 for target, prediction in rows
+        ) / len(rows)
     return metrics
 
 
