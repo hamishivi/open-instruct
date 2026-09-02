@@ -38,6 +38,7 @@ class TestValueEstimationStates(unittest.TestCase):
 
         self.assertEqual(config.vllm_max_model_len, 32768)
         self.assertTrue(config.vllm_enable_prefix_caching)
+        self.assertFalse(config.vllm_disable_custom_all_reduce)
 
     def test_generative_score_uses_actor_tokenizer_instead_of_critic_tokenizer(self):
         config = value_estimation.ScoreDatasetConfig(
@@ -78,6 +79,7 @@ class TestValueEstimationStates(unittest.TestCase):
                 "PYTHON_EXECUTABLE": str(fake_python),
                 "CAPTURE_ARGS": str(captured_args),
                 "ACTOR_TOKENIZER_NAME_OR_PATH": "actor-tokenizer",
+                "VLLM_DISABLE_CUSTOM_ALL_REDUCE": "1",
             }
 
             result = subprocess.run(
@@ -100,6 +102,7 @@ class TestValueEstimationStates(unittest.TestCase):
             arguments = captured_args.read_text().splitlines()
             tokenizer_index = arguments.index("--actor_tokenizer_name_or_path")
             self.assertEqual(arguments[tokenizer_index + 1], "actor-tokenizer")
+            self.assertIn("--vllm_disable_custom_all_reduce", arguments)
 
     def test_mc_dataset_split_keeps_normalized_problem_pairs_disjoint(self):
         rows = [

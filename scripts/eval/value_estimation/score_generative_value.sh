@@ -12,8 +12,14 @@ GEN_VALUE_MAX_NEW_TOKENS="${GEN_VALUE_MAX_NEW_TOKENS:-1024}"
 VLLM_TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
+VLLM_DISABLE_CUSTOM_ALL_REDUCE="${VLLM_DISABLE_CUSTOM_ALL_REDUCE:-0}"
 RUN_NAME="${RUN_NAME:-generative_value_${CONDITIONING}}"
 PYTHON_EXECUTABLE=${PYTHON_EXECUTABLE:-python}
+
+if [[ ! "${VLLM_DISABLE_CUSTOM_ALL_REDUCE}" =~ ^[01]$ ]]; then
+    echo "VLLM_DISABLE_CUSTOM_ALL_REDUCE must be 0 or 1: ${VLLM_DISABLE_CUSTOM_ALL_REDUCE}" >&2
+    exit 1
+fi
 
 score_args=(
     --input_dataset_path "${INPUT_DATASET_PATH}"
@@ -30,6 +36,9 @@ score_args=(
     --vllm_enable_prefix_caching
     --run_name "${RUN_NAME}"
 )
+if [[ "${VLLM_DISABLE_CUSTOM_ALL_REDUCE}" == "1" ]]; then
+    score_args+=(--vllm_disable_custom_all_reduce)
+fi
 if [[ -n "${ACTOR_TOKENIZER_NAME_OR_PATH}" ]]; then
     score_args+=(--actor_tokenizer_name_or_path "${ACTOR_TOKENIZER_NAME_OR_PATH}")
 fi

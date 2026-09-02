@@ -142,6 +142,7 @@ class ScoreDatasetConfig:
     vllm_gpu_memory_utilization: float = 0.85
     vllm_max_model_len: int = 32768
     vllm_enable_prefix_caching: bool = True
+    vllm_disable_custom_all_reduce: bool = False
 
 
 @dataclass
@@ -1384,6 +1385,7 @@ def _score_with_generative_value(
         gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
         max_model_len=cfg.vllm_max_model_len,
         enable_prefix_caching=cfg.vllm_enable_prefix_caching,
+        disable_custom_all_reduce=cfg.vllm_disable_custom_all_reduce,
     )
     sp = SamplingParams(
         n=1,
