@@ -143,6 +143,11 @@ class ScoreDatasetConfig:
     vllm_max_model_len: int = 32768
     vllm_enable_prefix_caching: bool = True
     vllm_disable_custom_all_reduce: bool = False
+    gen_value_soft_class_probabilities: bool = False
+    """Also score the critic's discrete answer distribution after its greedy rationale.
+
+    This is diagnostic-only: it leaves online generation and training unchanged.
+    """
 
 
 @dataclass
@@ -1110,6 +1115,7 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
 
     preds_per_row: list[list[float | None]] = []
     raw_generations_per_row: list[list[str | None]] | None = None
+    generative_diagnostics: dict[str, list[list[Any | None]]] = {}
     all_preds: list[float | None] = []
     all_mc: list[float] = []
     all_horizon_fractions: list[float] = []
@@ -1126,7 +1132,7 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
     if cfg.value_model_type == "scalar":
         preds_per_row = _score_with_scalar_value(df, cfg)
     elif cfg.value_model_type == "generative":
-        preds_per_row, raw_generations_per_row = _score_with_generative_value(df, cfg)
+        preds_per_row, raw_generations_per_row, generative_diagnostics = _score_with_generative_value(df, cfg)
     else:
         raise ValueError(f"Unknown value_model_type: {cfg.value_model_type}")
 
@@ -1239,6 +1245,8 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
     df_out["predicted_values"] = preds_per_row
     if raw_generations_per_row is not None:
         df_out["raw_generations"] = raw_generations_per_row
+    for column, values in generative_diagnostics.items():
+        df_out[column] = values
     df_out["run_config"] = [json.dumps(dataclasses.asdict(cfg))] * len(df_out)
     pathlib.Path(os.path.dirname(cfg.output_path) or ".").mkdir(parents=True, exist_ok=True)
     df_out.to_parquet(cfg.output_path, index=False)
@@ -1336,6 +1344,118 @@ def _collate_generative_value_generations(
     return predictions, raw_generations
 
 
+def _generative_value_answer_prefix(prompt: str, generation: str) -> str | None:
+    """Return the model context immediately before its generated score token.
+
+    Generative critics reason before emitting ``<answer>X</answer>``. Scoring a
+    class directly after the original prompt measures an out-of-distribution
+    context, so soft-class diagnostics retain the critic's own greedy rationale
+    and condition on everything through the final opening answer tag.
+    """
+    answer_start = generation.rfind("<answer>")
+    if answer_start < 0:
+        return None
+    answer_end = answer_start + len("<answer>")
+    while answer_end < len(generation) and generation[answer_end].isspace():
+        answer_end += 1
+    return prompt + generation[:answer_end]
+
+
+def _discrete_generative_value_scores(score_min: float, score_max: float) -> list[float]:
+    """Enumerate an inclusive integer score range without silently rounding."""
+    if not float(score_min).is_integer() or not float(score_max).is_integer():
+        raise ValueError(
+            f"Soft generative-value class scoring requires integral score bounds, got [{score_min}, {score_max}]."
+        )
+    if score_max < score_min:
+        raise ValueError(f"Generative-value score maximum {score_max} is below minimum {score_min}.")
+    return [float(score) for score in range(int(score_min), int(score_max) + 1)]
+
+
+def _build_generative_value_soft_class_inputs(
+    tokenizer: Any, answer_prefixes: Sequence[str], class_scores: Sequence[float]
+) -> tuple[list[dict[str, list[int]]], list[int]]:
+    """Build teacher-forced class sequences and their first scored positions."""
+    token_prompts: list[dict[str, list[int]]] = []
+    suffix_starts: list[int] = []
+    for answer_prefix in answer_prefixes:
+        prefix_ids = tokenizer.encode(answer_prefix, add_special_tokens=False)
+        for score in class_scores:
+            rendered_score = str(int(score)) if float(score).is_integer() else str(score)
+            full_ids = tokenizer.encode(f"{answer_prefix}{rendered_score}</answer>", add_special_tokens=False)
+            if full_ids[: len(prefix_ids)] != prefix_ids:
+                raise RuntimeError(
+                    f"Score {rendered_score} does not preserve the tokenized generative-value answer prefix."
+                )
+            token_prompts.append({"prompt_token_ids": full_ids})
+            suffix_starts.append(len(prefix_ids))
+    return token_prompts, suffix_starts
+
+
+def _generative_value_sequence_logprobs(outputs: Sequence[Any], suffix_starts: Sequence[int]) -> list[float]:
+    """Sum chosen-token prompt log probabilities over each answer suffix."""
+    if len(outputs) != len(suffix_starts):
+        raise ValueError(
+            f"Soft class outputs and suffix starts differ in length ({len(outputs)} != {len(suffix_starts)})."
+        )
+    sequence_logprobs: list[float] = []
+    for output, suffix_start in zip(outputs, suffix_starts, strict=True):
+        if output.prompt_token_ids is None or output.prompt_logprobs is None:
+            raise RuntimeError("vLLM did not return token ids and prompt log probabilities for soft class scoring.")
+        if len(output.prompt_token_ids) != len(output.prompt_logprobs):
+            raise RuntimeError(
+                "vLLM returned misaligned soft-class token ids and prompt log probabilities "
+                f"({len(output.prompt_token_ids)} != {len(output.prompt_logprobs)})."
+            )
+        sequence_logprob = 0.0
+        for position in range(suffix_start, len(output.prompt_token_ids)):
+            token_id = output.prompt_token_ids[position]
+            position_logprobs = output.prompt_logprobs[position]
+            if position_logprobs is None or token_id not in position_logprobs:
+                raise RuntimeError(
+                    f"vLLM omitted chosen token {token_id} from prompt log probabilities at position {position}."
+                )
+            sequence_logprob += float(position_logprobs[token_id].logprob)
+        sequence_logprobs.append(sequence_logprob)
+    return sequence_logprobs
+
+
+def _collate_generative_value_soft_classes(
+    sequence_logprobs: Sequence[float], class_scores: Sequence[float]
+) -> tuple[list[float], list[list[float]], list[list[float]]]:
+    """Convert per-class sequence likelihoods into normalized expected values."""
+    if not class_scores:
+        raise ValueError("Soft generative-value class scoring requires at least one score class.")
+    if len(sequence_logprobs) % len(class_scores) != 0:
+        raise ValueError(
+            f"Received {len(sequence_logprobs)} sequence log probabilities for {len(class_scores)} score classes."
+        )
+    expected_scores: list[float] = []
+    class_probabilities: list[list[float]] = []
+    grouped_logprobs: list[list[float]] = []
+    for start in range(0, len(sequence_logprobs), len(class_scores)):
+        row_logprobs = list(sequence_logprobs[start : start + len(class_scores)])
+        expected_score, probabilities = value_model_utils.expected_gen_value_score_from_logprobs(
+            class_scores, row_logprobs
+        )
+        expected_scores.append(expected_score)
+        class_probabilities.append(probabilities)
+        grouped_logprobs.append(row_logprobs)
+    return expected_scores, class_probabilities, grouped_logprobs
+
+
+def _collate_positioned_values(
+    values: Sequence[Any], positions: Sequence[tuple[int, int]], num_probes_per_row: Sequence[int]
+) -> list[list[Any | None]]:
+    """Restore flattened probe values to the source parquet's nested row layout."""
+    if len(values) != len(positions):
+        raise ValueError(f"Values and positions differ in length ({len(values)} != {len(positions)}).")
+    nested: list[list[Any | None]] = [[None] * count for count in num_probes_per_row]
+    for value, (row_position, probe_position) in zip(values, positions, strict=True):
+        nested[row_position][probe_position] = value
+    return nested
+
+
 def _resolve_generative_value_actor_tokenizer_path(cfg: ScoreDatasetConfig, actor_model_names: Sequence[Any]) -> str:
     """Choose the tokenizer that originally produced actor rollout token IDs."""
     if cfg.actor_tokenizer_name_or_path:
@@ -1368,7 +1488,7 @@ def _resolve_generative_value_actor_tokenizer_path(cfg: ScoreDatasetConfig, acto
 
 def _score_with_generative_value(
     df, cfg: ScoreDatasetConfig
-) -> tuple[list[list[float | None]], list[list[str | None]]]:
+) -> tuple[list[list[float | None]], list[list[str | None]], dict[str, list[list[Any | None]]]]:
     """Score probes using a generative value model served via vLLM."""
     from transformers import AutoTokenizer  # noqa: PLC0415
     from vllm import LLM, SamplingParams  # noqa: PLC0415
@@ -1432,13 +1552,47 @@ def _score_with_generative_value(
 
     raw = llm.generate(prompts, sp)
     generations = [out.outputs[0].text if hasattr(out, "outputs") else "" for out in raw]
-    return _collate_generative_value_generations(
+    predictions, raw_generations = _collate_generative_value_generations(
         generations,
         positions,
         num_probes_per_row,
         score_min=cfg.gen_value_score_min,
         score_max=cfg.gen_value_score_max,
     )
+    diagnostics: dict[str, list[list[Any | None]]] = {}
+    if cfg.gen_value_soft_class_probabilities:
+        answer_prefixes: list[str] = []
+        soft_positions: list[tuple[int, int]] = []
+        for prompt, generation, position in zip(prompts, generations, positions, strict=True):
+            answer_prefix = _generative_value_answer_prefix(prompt, generation)
+            if answer_prefix is not None:
+                answer_prefixes.append(answer_prefix)
+                soft_positions.append(position)
+
+        class_scores = _discrete_generative_value_scores(cfg.gen_value_score_min, cfg.gen_value_score_max)
+        token_prompts, suffix_starts = _build_generative_value_soft_class_inputs(
+            llm.get_tokenizer(), answer_prefixes, class_scores
+        )
+        soft_sp = SamplingParams(n=1, temperature=0.0, max_tokens=1, prompt_logprobs=0, detokenize=False)
+        soft_raw = llm.generate(token_prompts, soft_sp) if token_prompts else []
+        sequence_logprobs = _generative_value_sequence_logprobs(soft_raw, suffix_starts)
+        expected_scores, class_probabilities, grouped_logprobs = _collate_generative_value_soft_classes(
+            sequence_logprobs, class_scores
+        )
+        soft_predictions = [
+            value_model_utils.rescale_gen_value_score(score, cfg.gen_value_score_min, cfg.gen_value_score_max)
+            for score in expected_scores
+        ]
+        diagnostics = {
+            "soft_predicted_values": _collate_positioned_values(soft_predictions, soft_positions, num_probes_per_row),
+            "soft_class_probabilities": _collate_positioned_values(
+                class_probabilities, soft_positions, num_probes_per_row
+            ),
+            "soft_class_sequence_logprobs": _collate_positioned_values(
+                grouped_logprobs, soft_positions, num_probes_per_row
+            ),
+        }
+    return predictions, raw_generations, diagnostics
 
 
 # --------------------------------------------------------------------------------------------

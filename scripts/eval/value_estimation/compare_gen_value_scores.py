@@ -21,6 +21,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mse_noninferiority_margin", type=float, default=0.01)
     parser.add_argument("--auc_noninferiority_margin", type=float, default=0.02)
+    parser.add_argument(
+        "--prediction_column",
+        default="predicted_values",
+        help="Nested parquet column to evaluate, for example soft_predicted_values.",
+    )
     return parser.parse_args()
 
 
@@ -50,9 +55,11 @@ def _absolute_prefix_band(position: int) -> str:
     return "ge_4096"
 
 
-def _flatten_scores(path: pathlib.Path) -> dict[tuple[str, bool, str, int], dict[str, Any]]:
+def _flatten_scores(
+    path: pathlib.Path, *, prediction_column: str = "predicted_values"
+) -> dict[tuple[str, bool, str, int], dict[str, Any]]:
     frame = pd.read_parquet(path)
-    required = {"problem", "rollout_tokens", "rollout_is_correct", "probe_positions", "mc_values", "predicted_values"}
+    required = {"problem", "rollout_tokens", "rollout_is_correct", "probe_positions", "mc_values", prediction_column}
     missing = sorted(required - set(frame.columns))
     if missing:
         raise ValueError(f"{path} is missing required columns: {missing}")
@@ -61,7 +68,7 @@ def _flatten_scores(path: pathlib.Path) -> dict[tuple[str, bool, str, int], dict
     for _, row in frame.iterrows():
         positions = list(row["probe_positions"])
         targets = list(row["mc_values"])
-        predictions = list(row["predicted_values"])
+        predictions = list(row[prediction_column])
         if not (len(positions) == len(targets) == len(predictions)):
             raise ValueError(f"Mismatched probe arrays for problem {row['problem']!r} in {path}.")
         final_position = len(row["rollout_tokens"]) - 1
@@ -389,11 +396,12 @@ def compare_scores(
     seed: int,
     mse_noninferiority_margin: float,
     auc_noninferiority_margin: float,
+    prediction_column: str = "predicted_values",
 ) -> dict[str, Any]:
     if bootstrap_samples < 1:
         raise ValueError("bootstrap_samples must be at least 1.")
-    baseline = _flatten_scores(baseline_path)
-    candidate = _flatten_scores(candidate_path)
+    baseline = _flatten_scores(baseline_path, prediction_column=prediction_column)
+    candidate = _flatten_scores(candidate_path, prediction_column=prediction_column)
     if baseline.keys() != candidate.keys():
         missing = sorted(baseline.keys() - candidate.keys())
         extra = sorted(candidate.keys() - baseline.keys())
@@ -544,6 +552,7 @@ def compare_scores(
     return {
         "baseline_path": str(baseline_path),
         "candidate_path": str(candidate_path),
+        "prediction_column": prediction_column,
         "problems": len(problem_deltas),
         "probes": len(baseline_rows),
         "baseline": baseline_metrics,
@@ -578,6 +587,7 @@ def main() -> None:
         seed=args.seed,
         mse_noninferiority_margin=args.mse_noninferiority_margin,
         auc_noninferiority_margin=args.auc_noninferiority_margin,
+        prediction_column=args.prediction_column,
     )
     rendered = json.dumps(comparison, indent=2, sort_keys=True)
     if args.output_json is not None:

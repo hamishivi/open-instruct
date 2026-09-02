@@ -29,6 +29,9 @@ class _FakeTokenizer:
         self.skip_special_tokens_calls.append(skip_special_tokens)
         return ":".join(str(token_id) for token_id in token_ids)
 
+    def encode(self, text, add_special_tokens=True):
+        return list(text.encode())
+
 
 class TestValueEstimationStates(unittest.TestCase):
     def test_generative_score_defaults_match_online_long_context_serving(self):
@@ -39,6 +42,41 @@ class TestValueEstimationStates(unittest.TestCase):
         self.assertEqual(config.vllm_max_model_len, 32768)
         self.assertTrue(config.vllm_enable_prefix_caching)
         self.assertFalse(config.vllm_disable_custom_all_reduce)
+        self.assertFalse(config.gen_value_soft_class_probabilities)
+
+    def test_soft_class_diagnostic_conditions_on_generated_rationale(self):
+        prompt = "critic prompt\n"
+        generation = "reasoning\n<answer> 7</answer>"
+
+        self.assertEqual(
+            value_estimation._generative_value_answer_prefix(prompt, generation), "critic prompt\nreasoning\n<answer> "
+        )
+        self.assertIsNone(value_estimation._generative_value_answer_prefix(prompt, "reasoning only"))
+
+    def test_soft_class_inputs_score_complete_answer_sequences(self):
+        tokenizer = _FakeTokenizer()
+        token_prompts, suffix_starts = value_estimation._build_generative_value_soft_class_inputs(
+            tokenizer, ["context<answer>"], [0.0, 10.0]
+        )
+
+        self.assertEqual(len(token_prompts), 2)
+        self.assertEqual(suffix_starts, [len("context<answer>"), len("context<answer>")])
+        self.assertEqual(bytes(token_prompts[0]["prompt_token_ids"]).decode(), "context<answer>0</answer>")
+        self.assertEqual(bytes(token_prompts[1]["prompt_token_ids"]).decode(), "context<answer>10</answer>")
+
+    def test_soft_class_logprobs_produce_a_continuous_expected_score(self):
+        predictions, probabilities, grouped_logprobs = value_estimation._collate_generative_value_soft_classes(
+            [0.0, -2.0], [0.0, 10.0]
+        )
+
+        self.assertGreater(predictions[0], 0.0)
+        self.assertLess(predictions[0], 5.0)
+        self.assertAlmostEqual(sum(probabilities[0]), 1.0)
+        self.assertEqual(grouped_logprobs, [[0.0, -2.0]])
+
+    def test_soft_class_bounds_must_be_integral(self):
+        with self.assertRaisesRegex(ValueError, "integral score bounds"):
+            value_estimation._discrete_generative_value_scores(0.5, 10.0)
 
     def test_generative_score_uses_actor_tokenizer_instead_of_critic_tokenizer(self):
         config = value_estimation.ScoreDatasetConfig(
@@ -80,6 +118,7 @@ class TestValueEstimationStates(unittest.TestCase):
                 "CAPTURE_ARGS": str(captured_args),
                 "ACTOR_TOKENIZER_NAME_OR_PATH": "actor-tokenizer",
                 "VLLM_DISABLE_CUSTOM_ALL_REDUCE": "1",
+                "GEN_VALUE_SOFT_CLASS_PROBABILITIES": "1",
             }
 
             result = subprocess.run(
@@ -103,6 +142,7 @@ class TestValueEstimationStates(unittest.TestCase):
             tokenizer_index = arguments.index("--actor_tokenizer_name_or_path")
             self.assertEqual(arguments[tokenizer_index + 1], "actor-tokenizer")
             self.assertIn("--vllm_disable_custom_all_reduce", arguments)
+            self.assertIn("--gen_value_soft_class_probabilities", arguments)
 
     def test_mc_dataset_split_keeps_normalized_problem_pairs_disjoint(self):
         rows = [
@@ -1047,6 +1087,27 @@ esac
 
 
 class TestGenerativeValueScoreComparison(unittest.TestCase):
+    def test_flatten_scores_can_select_soft_prediction_column(self):
+        with tempfile.TemporaryDirectory(prefix="gen-value-soft-column-") as directory:
+            path = pathlib.Path(directory) / "scores.parquet"
+            pd.DataFrame(
+                [
+                    {
+                        "problem": "p",
+                        "rollout_tokens": [1, 2],
+                        "rollout_is_correct": True,
+                        "probe_positions": [0],
+                        "mc_values": [0.25],
+                        "predicted_values": [1.0],
+                        "soft_predicted_values": [0.3],
+                    }
+                ]
+            ).to_parquet(path, index=False)
+
+            flattened = compare_gen_value_scores._flatten_scores(path, prediction_column="soft_predicted_values")
+
+        self.assertAlmostEqual(next(iter(flattened.values()))["prediction"], 0.3)
+
     def test_clustered_delta_summary_uses_problem_means(self):
         summary = compare_gen_value_scores._clustered_delta_summary(
             {"a": [0.1, 0.3], "b": [-0.2]}, bootstrap_samples=100, rng=np.random.default_rng(0)
