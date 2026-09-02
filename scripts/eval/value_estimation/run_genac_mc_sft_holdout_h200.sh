@@ -7,6 +7,7 @@ set -euo pipefail
 : "${MC_VALUE_PARQUET:?Set MC_VALUE_PARQUET to the completed paired exact-MC parquet.}"
 : "${MODEL_PATH:?Set MODEL_PATH to the starting generative-critic checkpoint.}"
 : "${EXPERIMENT_ROOT:?Set EXPERIMENT_ROOT to a new output directory.}"
+: "${GEN_VALUE_CONDITIONING:?Set GEN_VALUE_CONDITIONING to none or gt, matching the deployed critic.}"
 
 if [[ ! -f "${MC_VALUE_PARQUET}" ]]; then
     echo "MC_VALUE_PARQUET is not a file: ${MC_VALUE_PARQUET}" >&2
@@ -18,6 +19,10 @@ if [[ ! -d "${MODEL_PATH}" ]]; then
 fi
 if [[ -e "${EXPERIMENT_ROOT}" ]]; then
     echo "Refusing to reuse EXPERIMENT_ROOT: ${EXPERIMENT_ROOT}" >&2
+    exit 1
+fi
+if [[ "${GEN_VALUE_CONDITIONING}" != "none" && "${GEN_VALUE_CONDITIONING}" != "gt" ]]; then
+    echo "GEN_VALUE_CONDITIONING must be none or gt: ${GEN_VALUE_CONDITIONING}" >&2
     exit 1
 fi
 
@@ -51,7 +56,7 @@ VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN}" \
 GEN_VALUE_MAX_NEW_TOKENS="${GEN_VALUE_MAX_NEW_TOKENS}" \
 RUN_NAME="baseline" \
 bash scripts/eval/value_estimation/score_generative_value.sh \
-    "${MODEL_PATH}" "${HELDOUT_PARQUET}" "${BASELINE_SCORE}" none
+    "${MODEL_PATH}" "${HELDOUT_PARQUET}" "${BASELINE_SCORE}" "${GEN_VALUE_CONDITIONING}"
 
 MC_VALUE_PARQUET="${TRAIN_PARQUET}" \
 HELDOUT_VALUE_PARQUET="${HELDOUT_PARQUET}" \
@@ -60,6 +65,7 @@ PYTHON_EXECUTABLE="${PYTHON_EXECUTABLE}" \
 NUM_GPUS="${NUM_GPUS}" \
 LONG_PREFIX_TOKEN_THRESHOLD="${LONG_PREFIX_TOKEN_THRESHOLD}" \
 MIN_LONG_PREFIX_FRACTION="${MIN_LONG_PREFIX_FRACTION}" \
+GEN_VALUE_CONDITIONING="${GEN_VALUE_CONDITIONING}" \
 MC_SFT_JSONL="${EXPERIMENT_ROOT}/data/train.jsonl" \
 OUTPUT_DIR="${SFT_OUTPUT_DIR}" \
 EXP_NAME="${EXP_NAME:-genac-math-current-policy-direct-mc-sft}" \
@@ -82,7 +88,7 @@ for candidate_model in "${candidate_models[@]}"; do
     GEN_VALUE_MAX_NEW_TOKENS="${GEN_VALUE_MAX_NEW_TOKENS}" \
     RUN_NAME="${candidate_name}" \
     bash scripts/eval/value_estimation/score_generative_value.sh \
-        "${candidate_model}" "${HELDOUT_PARQUET}" "${candidate_score}" none
+        "${candidate_model}" "${HELDOUT_PARQUET}" "${candidate_score}" "${GEN_VALUE_CONDITIONING}"
     "${PYTHON_EXECUTABLE}" scripts/eval/value_estimation/compare_gen_value_scores.py \
         --baseline "${BASELINE_SCORE}" \
         --candidate "${candidate_score}" \
