@@ -581,7 +581,7 @@ def _extract_problem(row: dict[str, Any]) -> str:
     return str(row.get("prompt", ""))
 
 
-def _normalize_problem_identity(problem: str) -> str:
+def normalize_problem_identity(problem: str) -> str:
     """Canonicalize formatting-only whitespace for holdout exclusion.
 
     Hub revisions can contain the same math problem with trailing spaces or
@@ -597,11 +597,11 @@ def _sample_record_indices(
 ) -> list[int]:
     """Sample dataset rows after whitespace-normalized problem-level holdout exclusion."""
     excluded_problems = excluded_problems or set()
-    normalized_excluded_problems = {_normalize_problem_identity(problem) for problem in excluded_problems}
+    normalized_excluded_problems = {normalize_problem_identity(problem) for problem in excluded_problems}
     eligible_indices = [
         index
         for index in range(len(dataset))
-        if _normalize_problem_identity(_extract_problem(dataset[index])) not in normalized_excluded_problems
+        if normalize_problem_identity(_extract_problem(dataset[index])) not in normalized_excluded_problems
     ]
     if not eligible_indices:
         raise ValueError("No dataset rows remain after held-out problem exclusion.")

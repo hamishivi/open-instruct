@@ -19,7 +19,7 @@ import random
 from collections.abc import Sequence
 from typing import Any
 
-from open_instruct import value_model_utils
+from open_instruct import value_estimation, value_model_utils
 
 
 def optional_sequence_as_list(value: Any) -> list[Any]:
@@ -390,6 +390,18 @@ def read_excluded_problems(path: pathlib.Path | None) -> set[str]:
     return {problem for problem in frame["problem"].tolist() if isinstance(problem, str) and problem}
 
 
+def normalized_problem_overlaps(rows: Sequence[dict[str, Any]], excluded_problems: set[str]) -> list[str]:
+    """Return formatting-insensitive problem identities shared with a holdout."""
+    normalized_inputs = {
+        value_estimation.normalize_problem_identity(str(row.get("problem", row.get("prompt", ""))))
+        for row in rows
+    }
+    normalized_excluded = {
+        value_estimation.normalize_problem_identity(problem) for problem in excluded_problems
+    }
+    return sorted(identity for identity in normalized_inputs & normalized_excluded if identity)
+
+
 def write_jsonl(path: pathlib.Path, examples: Sequence[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = path.with_suffix(path.suffix + ".tmp")
@@ -456,9 +468,12 @@ def main() -> None:
     frame = pd.read_parquet(args.input_parquet)
     rows = frame.to_dict(orient="records")
     excluded_problems = read_excluded_problems(args.exclude_problem_dataset_path)
-    overlaps = sorted({str(row.get("problem", "")) for row in rows} & excluded_problems)
+    overlaps = normalized_problem_overlaps(rows, excluded_problems)
     if overlaps:
-        raise ValueError(f"MC SFT input overlaps {len(overlaps)} held-out calibration problems.")
+        raise ValueError(
+            f"MC SFT input overlaps {len(overlaps)} held-out calibration problem identities after whitespace "
+            "normalization."
+        )
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name_or_path)
     source_examples = build_mc_sft_examples(
         rows,

@@ -416,6 +416,13 @@ class TestValueEstimationStates(unittest.TestCase):
 
         self.assertEqual(indices, [1])
 
+    def test_mc_sft_overlap_guard_ignores_formatting_only_whitespace(self):
+        overlaps = prepare_gen_value_mc_sft.normalized_problem_overlaps(
+            [{"problem": "held  out\nproblem  "}, {"problem": "training problem"}], {"held out problem"}
+        )
+
+        self.assertEqual(overlaps, ["held out problem"])
+
     def test_extract_problem_reads_local_problem_column(self):
         self.assertEqual(
             value_estimation._extract_problem({"problem": "held-out question", "ground_truth": "42"}),
