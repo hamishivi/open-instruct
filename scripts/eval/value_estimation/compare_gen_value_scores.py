@@ -337,6 +337,17 @@ def compare_scores(
         "ge_4096": {},
         "ge_2048": {},
     }
+    # Keep a separate intermediate-only view for the long-prefix acceptance
+    # gate.  Final-action states are deliberately repeated during SFT and are
+    # much easier to fit; allowing their gains into this gate could hide a
+    # regression at the segment-start values that provide most actor credit.
+    absolute_prefix_intermediate_problem_deltas: dict[str, dict[str, list[float]]] = {
+        "lt_1024": {},
+        "1024_2047": {},
+        "2048_4095": {},
+        "ge_4096": {},
+        "ge_2048": {},
+    }
     for key in baseline:
         baseline_row = baseline[key]
         candidate_row = candidate[key]
@@ -359,6 +370,10 @@ def compare_scores(
         absolute_prefix_problem_deltas[prefix_band].setdefault(problem, []).append(error_delta)
         if prefix_band in {"2048_4095", "ge_4096"}:
             absolute_prefix_problem_deltas["ge_2048"].setdefault(problem, []).append(error_delta)
+        if baseline_row["state_kind"] == "intermediate":
+            absolute_prefix_intermediate_problem_deltas[prefix_band].setdefault(problem, []).append(error_delta)
+            if prefix_band in {"2048_4095", "ge_4096"}:
+                absolute_prefix_intermediate_problem_deltas["ge_2048"].setdefault(problem, []).append(error_delta)
 
     baseline_metrics = _metrics(baseline_rows)
     candidate_metrics = _metrics(candidate_rows)
@@ -376,6 +391,14 @@ def compare_scores(
         )
         is not None
     }
+    absolute_prefix_intermediate_deltas = {
+        band: summary
+        for band, deltas in absolute_prefix_intermediate_problem_deltas.items()
+        if (
+            summary := _clustered_delta_summary(deltas, bootstrap_samples=bootstrap_samples, rng=rng)
+        )
+        is not None
+    }
 
     baseline_correct_mse = baseline_metrics["intermediate_correct_penalized_mse"]
     candidate_correct_mse = candidate_metrics["intermediate_correct_penalized_mse"]
@@ -385,15 +408,16 @@ def compare_scores(
     candidate_auc = candidate_metrics["intermediate_within_problem_auc"]
     baseline_selection_accuracy = baseline_metrics["intermediate_mc_selection_accuracy"]
     candidate_selection_accuracy = candidate_metrics["intermediate_mc_selection_accuracy"]
-    long_prefix_delta = absolute_prefix_deltas.get("ge_2048")
+    long_prefix_intermediate_delta = absolute_prefix_intermediate_deltas.get("ge_2048")
     checks = {
         "candidate_parse_rate_at_least_0_99": candidate_metrics["parse_rate"] >= 0.99,
         "problem_balanced_mse_noninferior": (
             overall_delta["problem_cluster_bootstrap_95pct_ci"][1] <= mse_noninferiority_margin
         ),
-        "long_prefix_mse_noninferior": bool(
-            long_prefix_delta is not None
-            and long_prefix_delta["problem_cluster_bootstrap_95pct_ci"][1] <= mse_noninferiority_margin
+        "long_prefix_intermediate_mse_noninferior": bool(
+            long_prefix_intermediate_delta is not None
+            and long_prefix_intermediate_delta["problem_cluster_bootstrap_95pct_ci"][1]
+            <= mse_noninferiority_margin
         ),
         "successful_intermediate_mse_improved": candidate_correct_mse < baseline_correct_mse,
         "failed_intermediate_mse_noninferior": (
@@ -418,6 +442,7 @@ def compare_scores(
         ],
         "problem_cluster_bootstrap_95pct_ci": overall_delta["problem_cluster_bootstrap_95pct_ci"],
         "absolute_prefix_mse_deltas": absolute_prefix_deltas,
+        "absolute_prefix_intermediate_mse_deltas": absolute_prefix_intermediate_deltas,
         "intermediate_within_problem_auc_delta_candidate_minus_baseline": candidate_auc - baseline_auc,
         "intermediate_mc_selection_accuracy_delta_candidate_minus_baseline": (
             candidate_selection_accuracy - baseline_selection_accuracy

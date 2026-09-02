@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 import numpy as np
+import pandas as pd
 from scripts.data import (
     prepare_gen_value_mc_sft,
     prepare_gen_value_sft,
@@ -1041,6 +1042,48 @@ class TestGenerativeValueScoreComparison(unittest.TestCase):
         self.assertAlmostEqual(metrics["absolute_prefix_lt_1024_mc_selection_accuracy"], 0.0)
         self.assertEqual(metrics["absolute_prefix_2048_4095_examples"], 2.0)
         self.assertAlmostEqual(metrics["absolute_prefix_2048_4095_mc_selection_accuracy"], 1.0)
+
+    def test_long_prefix_gate_cannot_hide_intermediate_regression_with_final_action_gains(self):
+        with tempfile.TemporaryDirectory(prefix="gen-value-long-prefix-gate-") as directory:
+            test_root = pathlib.Path(directory)
+            baseline_path = test_root / "baseline.parquet"
+            candidate_path = test_root / "candidate.parquet"
+            shared = {"problem": "one problem", "rollout_tokens": list(range(4097)), "probe_positions": [2048, 4096]}
+            pd.DataFrame(
+                [
+                    {**shared, "rollout_is_correct": True, "mc_values": [0.8, 1.0], "predicted_values": [0.8, 0.0]},
+                    {**shared, "rollout_is_correct": False, "mc_values": [0.2, 0.0], "predicted_values": [0.2, 1.0]},
+                ]
+            ).to_parquet(baseline_path, index=False)
+            pd.DataFrame(
+                [
+                    {**shared, "rollout_is_correct": True, "mc_values": [0.8, 1.0], "predicted_values": [1.0, 1.0]},
+                    {**shared, "rollout_is_correct": False, "mc_values": [0.2, 0.0], "predicted_values": [0.0, 0.0]},
+                ]
+            ).to_parquet(candidate_path, index=False)
+
+            comparison = compare_gen_value_scores.compare_scores(
+                baseline_path,
+                candidate_path,
+                bootstrap_samples=100,
+                seed=0,
+                mse_noninferiority_margin=0.01,
+                auc_noninferiority_margin=0.02,
+            )
+
+        # Easy final actions make the aggregate long-prefix score look much
+        # better even though both intermediate values become worse.
+        self.assertLess(
+            comparison["absolute_prefix_mse_deltas"]["ge_2048"]["problem_balanced_mse_delta_candidate_minus_baseline"],
+            0.0,
+        )
+        self.assertAlmostEqual(
+            comparison["absolute_prefix_intermediate_mse_deltas"]["ge_2048"][
+                "problem_balanced_mse_delta_candidate_minus_baseline"
+            ],
+            0.04,
+        )
+        self.assertFalse(comparison["gate"]["checks"]["long_prefix_intermediate_mse_noninferior"])
 
 
 if __name__ == "__main__":
