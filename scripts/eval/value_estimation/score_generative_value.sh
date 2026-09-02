@@ -13,12 +13,17 @@ VLLM_TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
 VLLM_DISABLE_CUSTOM_ALL_REDUCE="${VLLM_DISABLE_CUSTOM_ALL_REDUCE:-0}"
+VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-0}"
 GEN_VALUE_SOFT_CLASS_PROBABILITIES="${GEN_VALUE_SOFT_CLASS_PROBABILITIES:-0}"
 RUN_NAME="${RUN_NAME:-generative_value_${CONDITIONING}}"
 PYTHON_EXECUTABLE=${PYTHON_EXECUTABLE:-python}
 
 if [[ ! "${VLLM_DISABLE_CUSTOM_ALL_REDUCE}" =~ ^[01]$ ]]; then
     echo "VLLM_DISABLE_CUSTOM_ALL_REDUCE must be 0 or 1: ${VLLM_DISABLE_CUSTOM_ALL_REDUCE}" >&2
+    exit 1
+fi
+if [[ ! "${VLLM_ENFORCE_EAGER}" =~ ^[01]$ ]]; then
+    echo "VLLM_ENFORCE_EAGER must be 0 or 1: ${VLLM_ENFORCE_EAGER}" >&2
     exit 1
 fi
 if [[ ! "${GEN_VALUE_SOFT_CLASS_PROBABILITIES}" =~ ^[01]$ ]]; then
@@ -43,6 +48,9 @@ score_args=(
 )
 if [[ "${VLLM_DISABLE_CUSTOM_ALL_REDUCE}" == "1" ]]; then
     score_args+=(--vllm_disable_custom_all_reduce)
+fi
+if [[ "${VLLM_ENFORCE_EAGER}" == "1" ]]; then
+    score_args+=(--vllm_enforce_eager)
 fi
 if [[ "${GEN_VALUE_SOFT_CLASS_PROBABILITIES}" == "1" ]]; then
     score_args+=(--gen_value_soft_class_probabilities)

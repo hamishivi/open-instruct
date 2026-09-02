@@ -143,6 +143,7 @@ class ScoreDatasetConfig:
     vllm_max_model_len: int = 32768
     vllm_enable_prefix_caching: bool = True
     vllm_disable_custom_all_reduce: bool = False
+    vllm_enforce_eager: bool = False
     gen_value_soft_class_probabilities: bool = False
     """Also score the critic's discrete answer distribution after its greedy rationale.
 
@@ -1506,6 +1507,7 @@ def _score_with_generative_value(
         max_model_len=cfg.vllm_max_model_len,
         enable_prefix_caching=cfg.vllm_enable_prefix_caching,
         disable_custom_all_reduce=cfg.vllm_disable_custom_all_reduce,
+        enforce_eager=cfg.vllm_enforce_eager,
     )
     sp = SamplingParams(
         n=1,

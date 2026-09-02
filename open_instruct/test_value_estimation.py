@@ -42,6 +42,7 @@ class TestValueEstimationStates(unittest.TestCase):
         self.assertEqual(config.vllm_max_model_len, 32768)
         self.assertTrue(config.vllm_enable_prefix_caching)
         self.assertFalse(config.vllm_disable_custom_all_reduce)
+        self.assertFalse(config.vllm_enforce_eager)
         self.assertFalse(config.gen_value_soft_class_probabilities)
 
     def test_soft_class_diagnostic_conditions_on_generated_rationale(self):
@@ -118,6 +119,7 @@ class TestValueEstimationStates(unittest.TestCase):
                 "CAPTURE_ARGS": str(captured_args),
                 "ACTOR_TOKENIZER_NAME_OR_PATH": "actor-tokenizer",
                 "VLLM_DISABLE_CUSTOM_ALL_REDUCE": "1",
+                "VLLM_ENFORCE_EAGER": "1",
                 "GEN_VALUE_SOFT_CLASS_PROBABILITIES": "1",
             }
 
@@ -142,6 +144,7 @@ class TestValueEstimationStates(unittest.TestCase):
             tokenizer_index = arguments.index("--actor_tokenizer_name_or_path")
             self.assertEqual(arguments[tokenizer_index + 1], "actor-tokenizer")
             self.assertIn("--vllm_disable_custom_all_reduce", arguments)
+            self.assertIn("--vllm_enforce_eager", arguments)
             self.assertIn("--gen_value_soft_class_probabilities", arguments)
 
     def test_mc_dataset_split_keeps_normalized_problem_pairs_disjoint(self):
