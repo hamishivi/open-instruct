@@ -10,7 +10,18 @@
 
 set -euo pipefail
 
-REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
+if [[ -n "${GENAC_REPO_ROOT:-}" ]]; then
+    REPO_ROOT="${GENAC_REPO_ROOT}"
+elif [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/pyproject.toml" ]]; then
+    REPO_ROOT="${SLURM_SUBMIT_DIR}"
+elif [[ -f "${PWD}/pyproject.toml" ]]; then
+    # `--chdir` controls the batch working directory but does not rewrite
+    # SLURM_SUBMIT_DIR. Prefer the actual checkout when sbatch was invoked from
+    # somewhere else (for example, a login-shell home directory).
+    REPO_ROOT="${PWD}"
+else
+    REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+fi
 cd "${REPO_ROOT}"
 mkdir -p logs
 
