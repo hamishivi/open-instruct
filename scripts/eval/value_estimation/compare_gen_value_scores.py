@@ -336,6 +336,30 @@ def _metrics(rows: list[dict[str, Any]]) -> dict[str, float | None]:
         selection_metrics = _mc_selection_metrics(group, trajectory_band=None)
         for name, value in selection_metrics.items():
             metrics[f"{metric_prefix}_mc_selection_{name}"] = value
+        for outcome_name, outcome in (("correct", True), ("incorrect", False)):
+            outcome_group = [
+                row for row in group if row["state_kind"] == "intermediate" and row["rollout_is_correct"] is outcome
+            ]
+            outcome_parsed = [row for row in outcome_group if row["prediction"] is not None]
+            outcome_prefix = f"{metric_prefix}_intermediate_{outcome_name}"
+            metrics[f"{outcome_prefix}_examples"] = float(len(outcome_group))
+            outcome_errors = [
+                1.0 if row["prediction"] is None else (row["prediction"] - row["target"]) ** 2
+                for row in outcome_group
+            ]
+            metrics[f"{outcome_prefix}_penalized_mse"] = (
+                float(np.mean(outcome_errors)) if outcome_errors else None
+            )
+            if outcome_parsed:
+                target_mean = float(np.mean([row["target"] for row in outcome_parsed]))
+                prediction_mean = float(np.mean([row["prediction"] for row in outcome_parsed]))
+                metrics[f"{outcome_prefix}_target_mean"] = target_mean
+                metrics[f"{outcome_prefix}_prediction_mean"] = prediction_mean
+                metrics[f"{outcome_prefix}_calibration_bias"] = prediction_mean - target_mean
+            else:
+                metrics[f"{outcome_prefix}_target_mean"] = None
+                metrics[f"{outcome_prefix}_prediction_mean"] = None
+                metrics[f"{outcome_prefix}_calibration_bias"] = None
     return metrics
 
 
@@ -396,6 +420,16 @@ def compare_scores(
         "ge_4096": {},
         "ge_2048": {},
     }
+    absolute_prefix_intermediate_outcome_problem_deltas: dict[str, dict[str, dict[str, list[float]]]] = {
+        outcome: {
+            "lt_1024": {},
+            "1024_2047": {},
+            "2048_4095": {},
+            "ge_4096": {},
+            "ge_2048": {},
+        }
+        for outcome in ("correct", "incorrect")
+    }
     for key in baseline:
         baseline_row = baseline[key]
         candidate_row = candidate[key]
@@ -420,8 +454,15 @@ def compare_scores(
             absolute_prefix_problem_deltas["ge_2048"].setdefault(problem, []).append(error_delta)
         if baseline_row["state_kind"] == "intermediate":
             absolute_prefix_intermediate_problem_deltas[prefix_band].setdefault(problem, []).append(error_delta)
+            outcome = "correct" if baseline_row["rollout_is_correct"] else "incorrect"
+            absolute_prefix_intermediate_outcome_problem_deltas[outcome][prefix_band].setdefault(
+                problem, []
+            ).append(error_delta)
             if prefix_band in {"2048_4095", "ge_4096"}:
                 absolute_prefix_intermediate_problem_deltas["ge_2048"].setdefault(problem, []).append(error_delta)
+                absolute_prefix_intermediate_outcome_problem_deltas[outcome]["ge_2048"].setdefault(
+                    problem, []
+                ).append(error_delta)
 
     baseline_metrics = _metrics(baseline_rows)
     candidate_metrics = _metrics(candidate_rows)
@@ -447,6 +488,17 @@ def compare_scores(
         )
         is not None
     }
+    absolute_prefix_intermediate_outcome_deltas = {
+        outcome: {
+            band: summary
+            for band, deltas in band_deltas.items()
+            if (
+                summary := _clustered_delta_summary(deltas, bootstrap_samples=bootstrap_samples, rng=rng)
+            )
+            is not None
+        }
+        for outcome, band_deltas in absolute_prefix_intermediate_outcome_problem_deltas.items()
+    }
 
     baseline_correct_mse = baseline_metrics["intermediate_correct_penalized_mse"]
     candidate_correct_mse = candidate_metrics["intermediate_correct_penalized_mse"]
@@ -457,6 +509,8 @@ def compare_scores(
     baseline_selection_accuracy = baseline_metrics["intermediate_mc_selection_accuracy"]
     candidate_selection_accuracy = candidate_metrics["intermediate_mc_selection_accuracy"]
     long_prefix_intermediate_delta = absolute_prefix_intermediate_deltas.get("ge_2048")
+    long_successful_prefix_delta = absolute_prefix_intermediate_outcome_deltas["correct"].get("ge_2048")
+    long_failed_prefix_delta = absolute_prefix_intermediate_outcome_deltas["incorrect"].get("ge_2048")
     checks = {
         "candidate_parse_rate_at_least_0_99": candidate_metrics["parse_rate"] >= 0.99,
         "problem_balanced_mse_noninferior": (
@@ -467,9 +521,18 @@ def compare_scores(
             and long_prefix_intermediate_delta["problem_cluster_bootstrap_95pct_ci"][1]
             <= mse_noninferiority_margin
         ),
-        "successful_intermediate_mse_improved": candidate_correct_mse < baseline_correct_mse,
-        "failed_intermediate_mse_noninferior": (
-            candidate_incorrect_mse <= baseline_incorrect_mse + mse_noninferiority_margin
+        "successful_intermediate_mse_noninferior": (
+            candidate_correct_mse <= baseline_correct_mse + mse_noninferiority_margin
+        ),
+        "failed_intermediate_mse_improved": candidate_incorrect_mse < baseline_incorrect_mse,
+        "long_successful_prefix_mse_noninferior": bool(
+            long_successful_prefix_delta is not None
+            and long_successful_prefix_delta["problem_cluster_bootstrap_95pct_ci"][1]
+            <= mse_noninferiority_margin
+        ),
+        "long_failed_prefix_mse_improved": bool(
+            long_failed_prefix_delta is not None
+            and long_failed_prefix_delta["problem_balanced_mse_delta_candidate_minus_baseline"] < 0.0
         ),
         "intermediate_within_problem_auc_noninferior": (
             candidate_auc >= baseline_auc - auc_noninferiority_margin
@@ -491,6 +554,7 @@ def compare_scores(
         "problem_cluster_bootstrap_95pct_ci": overall_delta["problem_cluster_bootstrap_95pct_ci"],
         "absolute_prefix_mse_deltas": absolute_prefix_deltas,
         "absolute_prefix_intermediate_mse_deltas": absolute_prefix_intermediate_deltas,
+        "absolute_prefix_intermediate_outcome_mse_deltas": absolute_prefix_intermediate_outcome_deltas,
         "intermediate_within_problem_auc_delta_candidate_minus_baseline": candidate_auc - baseline_auc,
         "intermediate_mc_selection_accuracy_delta_candidate_minus_baseline": (
             candidate_selection_accuracy - baseline_selection_accuracy
