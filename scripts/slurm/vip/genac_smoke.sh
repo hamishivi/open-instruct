@@ -35,6 +35,10 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TOKENIZERS_PARALLELISM=false
+# A minimal outer `sbatch --export=NIL` is useful when a cluster cannot retrieve
+# the login environment. Nested srun steps must still receive the explicit
+# runtime paths and experiment configuration established by this script.
+export SLURM_EXPORT_ENV=ALL
 export HF_HOME="${HF_HOME:-/mmfs1/gscratch/h2lab/${USER}/huggingface}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 export no_proxy="127.0.0.1,localhost${no_proxy:+,${no_proxy}}"
