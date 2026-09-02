@@ -2193,6 +2193,17 @@ class PolicyTrainerRayProcess(RayProcess):
             _vdiag_preds_all: list[float] = []
             _gen_value_adv_correct: list[float] = []
             _gen_value_adv_incorrect: list[float] = []
+            _gen_value_adv_position_buckets = (
+                ("lt_1024", 0, 1024),
+                ("1024_2047", 1024, 2048),
+                ("2048_4095", 2048, 4096),
+                ("ge_4096", 4096, None),
+            )
+            _gen_value_adv_by_outcome_position: dict[tuple[str, str], list[float]] = {
+                (outcome, bucket_name): []
+                for outcome in ("correct", "incorrect")
+                for bucket_name, _, _ in _gen_value_adv_position_buckets
+            }
             _gen_value_terminal_vhat_correct: list[float] = []
             _gen_value_terminal_vhat_incorrect: list[float] = []
             with Timer("Value forward (no-grad)", noop=self.rank != 0), torch.no_grad():
@@ -2441,6 +2452,12 @@ class PolicyTrainerRayProcess(RayProcess):
                                 continue
                             adv_tokens = adv_np[0, shifted_positions]
                             terminal_vhat = float(vals_np_diag[0, shifted_positions[-1]])
+                            outcome_label = "correct" if is_correct_subseq else "incorrect"
+                            for bucket_name, start, end in _gen_value_adv_position_buckets:
+                                bucket_advantages = adv_tokens[start:end]
+                                _gen_value_adv_by_outcome_position[(outcome_label, bucket_name)].extend(
+                                    float(advantage) for advantage in bucket_advantages
+                                )
                             if is_correct_subseq:
                                 _gen_value_adv_correct.extend([float(x) for x in adv_tokens])
                                 _gen_value_terminal_vhat_correct.append(terminal_vhat)
@@ -2539,6 +2556,12 @@ class PolicyTrainerRayProcess(RayProcess):
                 ("gen_value/terminal_vhat_correct_mean", _gen_value_terminal_vhat_correct),
                 ("gen_value/terminal_vhat_incorrect_mean", _gen_value_terminal_vhat_incorrect),
             ]
+            advantage_position_metric_names: set[str] = set()
+            for outcome in ("correct", "incorrect"):
+                for bucket_name, _, _ in _gen_value_adv_position_buckets:
+                    metric_name = f"gen_value/advantage_{outcome}_pos_{bucket_name}_mean"
+                    advantage_position_metric_names.add(metric_name)
+                    diagnostic_series.append((metric_name, _gen_value_adv_by_outcome_position[(outcome, bucket_name)]))
             edge_bin_count = max(1, _NUM_PCT_BINS // 4)
             diagnostic_series.extend(
                 (
@@ -2594,6 +2617,8 @@ class PolicyTrainerRayProcess(RayProcess):
             for (name, _), (value_sum, value_count) in zip(diagnostic_series, diagnostic_sums.tolist(), strict=True):
                 if value_count > 0.0:
                     sae_step_metrics[name] = value_sum / value_count
+                    if name in advantage_position_metric_names:
+                        sae_step_metrics[f"{name.removesuffix('_mean')}_token_count"] = value_count
 
             correct_advantage = sae_step_metrics.get("gen_value/advantage_correct_mean")
             incorrect_advantage = sae_step_metrics.get("gen_value/advantage_incorrect_mean")
