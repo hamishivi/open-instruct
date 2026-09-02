@@ -46,6 +46,16 @@ def quantize_mc_value(value: float, *, score_max: int = 10) -> int:
     return min(score_max, max(0, math.floor(value * score_max + 0.5)))
 
 
+def optional_binary_outcome(value: Any, *, row_index: int) -> list[float]:
+    """Normalize an optional sampled-rollout outcome for diagnostics."""
+    if value is None:
+        return []
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed not in {0.0, 1.0}:
+        raise ValueError(f"Row {row_index} has invalid rollout_is_correct={value!r}; expected a binary outcome.")
+    return [parsed]
+
+
 def build_mc_sft_examples(
     rows: Sequence[dict[str, Any]],
     *,
@@ -78,6 +88,7 @@ def build_mc_sft_examples(
                 f"Row {row_index} has only {num_continuations} continuations; at least {min_continuations} required."
             )
         rollout_tokens = [int(token) for token in optional_sequence_as_list(row.get("rollout_tokens"))]
+        source_rollout_outcomes = optional_binary_outcome(row.get("rollout_is_correct"), row_index=row_index)
         response_token_limit = int(row.get("response_token_limit", 8192))
         problem = str(row.get("problem", row.get("prompt", "")))
         if not problem:
@@ -127,6 +138,7 @@ def build_mc_sft_examples(
                 "response_token_limit": response_token_limit,
                 "rollout_length": len(rollout_tokens),
                 "source_rollout_lengths": [len(rollout_tokens)],
+                "source_rollout_outcomes": source_rollout_outcomes,
                 "trajectory_fraction": trajectory_fraction,
                 "source_trajectory_fractions": [trajectory_fraction],
                 "num_continuations": num_continuations,
@@ -185,6 +197,10 @@ def build_mc_sft_examples(
                     "source_rollout_lengths": [
                         *optional_sequence_as_list(existing.get("source_rollout_lengths")),
                         len(rollout_tokens),
+                    ],
+                    "source_rollout_outcomes": [
+                        *optional_sequence_as_list(existing.get("source_rollout_outcomes")),
+                        *source_rollout_outcomes,
                     ],
                     "trajectory_fraction": max(float(existing["trajectory_fraction"]), trajectory_fraction),
                     "source_trajectory_fractions": [
@@ -381,6 +397,74 @@ def require_prefix_length_coverage(
     return coverage
 
 
+def summarize_final_action_continuation_shift(
+    examples: Sequence[dict[str, Any]], *, long_prefix_token_threshold: int
+) -> dict[str, int | float | None]:
+    """Compare final-position continuation values with sampled outcomes.
+
+    A final-position probe is the causal state immediately before the sampled
+    EOS action, so its fresh-continuation MC value may legitimately differ from
+    the outcome of the trajectory that supplied the prefix. Large shifts are
+    still important to audit because final-position states are commonly
+    replayed during SFT, including pathological early-stop trajectories.
+    """
+    if isinstance(long_prefix_token_threshold, bool) or not isinstance(long_prefix_token_threshold, int):
+        raise ValueError(
+            f"long_prefix_token_threshold must be a nonnegative integer, got {long_prefix_token_threshold!r}."
+        )
+    if long_prefix_token_threshold < 0:
+        raise ValueError(
+            f"long_prefix_token_threshold must be a nonnegative integer, got {long_prefix_token_threshold}."
+        )
+
+    final_examples = [example for example in examples if example.get("state_kind") == "final_action"]
+    shifts: list[float] = []
+    high_value_after_failed_sample = 0
+    low_value_after_correct_sample = 0
+    examples_with_outcomes = 0
+    source_outcomes = 0
+    for example in final_examples:
+        outcomes = [float(value) for value in optional_sequence_as_list(example.get("source_rollout_outcomes"))]
+        if not outcomes:
+            continue
+        if any(not math.isfinite(value) or value not in {0.0, 1.0} for value in outcomes):
+            raise ValueError(f"Final-action source outcomes must be binary, got {outcomes!r}.")
+        target = float(example["target"])
+        if not math.isfinite(target) or not 0.0 <= target <= 1.0:
+            raise ValueError(f"Monte Carlo value must be finite and in [0, 1], got {target}.")
+        sampled_outcome_mean = math.fsum(outcomes) / len(outcomes)
+        shifts.append(target - sampled_outcome_mean)
+        examples_with_outcomes += 1
+        source_outcomes += len(outcomes)
+        high_value_after_failed_sample += sampled_outcome_mean == 0.0 and target > 0.5
+        low_value_after_correct_sample += sampled_outcome_mean == 1.0 and target < 0.5
+
+    return {
+        "final_action_examples": len(final_examples),
+        "final_action_examples_with_sampled_outcomes": examples_with_outcomes,
+        "final_action_source_outcomes": source_outcomes,
+        "final_action_prefix_lt_1024": sum(
+            int(example.get("response_tokens_used", 0)) < 1024 for example in final_examples
+        ),
+        "final_action_prefix_ge_2048": sum(
+            int(example.get("response_tokens_used", 0)) >= 2048 for example in final_examples
+        ),
+        "final_action_prefix_ge_long_threshold": sum(
+            int(example.get("response_tokens_used", 0)) >= long_prefix_token_threshold
+            for example in final_examples
+        ),
+        "continuation_minus_sampled_outcome_mean": (
+            math.fsum(shifts) / len(shifts) if shifts else None
+        ),
+        "continuation_sampled_outcome_mae": (
+            math.fsum(abs(shift) for shift in shifts) / len(shifts) if shifts else None
+        ),
+        "continuation_sampled_outcome_abs_gap_gt_0_25": sum(abs(shift) > 0.25 for shift in shifts),
+        "high_value_after_failed_sample": high_value_after_failed_sample,
+        "low_value_after_correct_sample": low_value_after_correct_sample,
+    }
+
+
 def read_excluded_problems(path: pathlib.Path | None) -> set[str]:
     if path is None:
         return set()
@@ -486,6 +570,9 @@ def main() -> None:
     source_prefix_length_coverage = summarize_prefix_length_coverage(
         source_examples, long_prefix_token_threshold=args.long_prefix_token_threshold
     )
+    source_final_action_continuation_shift = summarize_final_action_continuation_shift(
+        source_examples, long_prefix_token_threshold=args.long_prefix_token_threshold
+    )
     raw_examples = (
         balance_examples_by_target_and_position(source_examples, seed=args.balance_seed)
         if args.balance_target_position
@@ -500,6 +587,9 @@ def main() -> None:
         raw_examples,
         long_prefix_token_threshold=args.long_prefix_token_threshold,
         min_long_prefix_fraction=args.min_long_prefix_fraction,
+    )
+    final_action_continuation_shift = summarize_final_action_continuation_shift(
+        raw_examples, long_prefix_token_threshold=args.long_prefix_token_threshold
     )
     examples = repeat_examples_for_horizon(
         raw_examples,
@@ -535,6 +625,8 @@ def main() -> None:
                 "raw_trajectory_coverage": trajectory_coverage,
                 "source_prefix_length_coverage": source_prefix_length_coverage,
                 "raw_prefix_length_coverage": prefix_length_coverage,
+                "source_final_action_continuation_shift": source_final_action_continuation_shift,
+                "raw_final_action_continuation_shift": final_action_continuation_shift,
             },
             indent=2,
             sort_keys=True,

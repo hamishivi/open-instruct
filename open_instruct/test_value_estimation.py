@@ -450,6 +450,40 @@ esac
                 raw_examples, long_prefix_token_threshold=2048, min_long_prefix_fraction=0.5
             )
 
+    def test_mc_sft_audits_final_action_continuation_shift_before_replay(self):
+        raw_examples = [
+            {
+                "state_kind": "final_action",
+                "response_tokens_used": 2,
+                "target": 0.75,
+                "source_rollout_outcomes": [0.0],
+            },
+            {
+                "state_kind": "final_action",
+                "response_tokens_used": 3072,
+                "target": 0.5,
+                "source_rollout_outcomes": [1.0],
+            },
+            {"state_kind": "final_action", "response_tokens_used": 4096, "target": 1.0, "source_rollout_outcomes": []},
+            {"state_kind": "segment_start", "response_tokens_used": 3, "target": 0.0},
+        ]
+
+        summary = prepare_gen_value_mc_sft.summarize_final_action_continuation_shift(
+            raw_examples, long_prefix_token_threshold=2048
+        )
+
+        self.assertEqual(summary["final_action_examples"], 3)
+        self.assertEqual(summary["final_action_examples_with_sampled_outcomes"], 2)
+        self.assertEqual(summary["final_action_source_outcomes"], 2)
+        self.assertEqual(summary["final_action_prefix_lt_1024"], 1)
+        self.assertEqual(summary["final_action_prefix_ge_2048"], 2)
+        self.assertEqual(summary["final_action_prefix_ge_long_threshold"], 2)
+        self.assertEqual(summary["continuation_minus_sampled_outcome_mean"], 0.125)
+        self.assertEqual(summary["continuation_sampled_outcome_mae"], 0.625)
+        self.assertEqual(summary["continuation_sampled_outcome_abs_gap_gt_0_25"], 2)
+        self.assertEqual(summary["high_value_after_failed_sample"], 1)
+        self.assertEqual(summary["low_value_after_correct_sample"], 0)
+
     def test_mc_sft_target_position_balance_is_deterministic_and_does_not_duplicate_states(self):
         examples = []
         identifier = 0
@@ -502,6 +536,7 @@ esac
             [
                 {
                     "problem": "Compute the answer.",
+                    "rollout_is_correct": True,
                     "rollout_tokens": [10, 11, 12],
                     "probe_positions": [0, 2],
                     "mc_values": [0.25, 1.0],
@@ -509,6 +544,7 @@ esac
                 },
                 {
                     "problem": "Compute the answer.",
+                    "rollout_is_correct": False,
                     "rollout_tokens": [10, 13],
                     "probe_positions": [0, 1],
                     "mc_values": [0.5, 0.0],
@@ -526,6 +562,7 @@ esac
         self.assertEqual(pooled["num_continuations"], 48)
         self.assertEqual(pooled["mc_source_count"], 2)
         self.assertEqual(pooled["source_rollout_lengths"], [3, 2])
+        self.assertEqual(pooled["source_rollout_outcomes"], [1.0, 0.0])
         self.assertEqual(pooled["source_trajectory_fractions"], [0.0, 0.0])
 
     def test_mc_sft_rejects_prompt_collisions_with_inconsistent_metadata(self):
