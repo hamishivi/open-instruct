@@ -3052,11 +3052,10 @@ class PolicyTrainerRayProcess(RayProcess):
             # For reference policy, we save just the model weights
             # We can't use save_checkpoint because it would try to save DummyOptim
             # which doesn't have state_dict
+            model_utils.save_model_state_dict(
+                self.ref_policy, os.path.join(ref_policy_dir, "pytorch_model.bin"), self.rank
+            )
             if self.rank == 0:
-                # Only rank 0 saves the model state
-                model_to_save = self.ref_policy.module if hasattr(self.ref_policy, "module") else self.ref_policy
-                # Save the state dict
-                torch.save(model_to_save.state_dict(), os.path.join(ref_policy_dir, "pytorch_model.bin"))
                 logger.info(f"Saved reference policy model to {ref_policy_dir}")
 
             client_state["ref_policy_saved"] = True

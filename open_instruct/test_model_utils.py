@@ -1,11 +1,76 @@
+import contextlib
 import pathlib
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 import open_instruct.model_utils
 from open_instruct.model_utils import Batch, TensorCache
+
+
+class TestPortableModelStateDict(unittest.TestCase):
+    def test_save_and_load_vanilla_model(self):
+        source = torch.nn.Linear(3, 2)
+        target = torch.nn.Linear(3, 2)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = pathlib.Path(tmpdir) / "model.bin"
+            open_instruct.model_utils.save_model_state_dict(source, checkpoint_path, rank=0)
+            open_instruct.model_utils.maybe_load_checkpoint(target, str(checkpoint_path), torch.device("cpu"), rank=0)
+
+        for source_parameter, target_parameter in zip(source.parameters(), target.parameters()):
+            self.assertTrue(torch.equal(source_parameter, target_parameter))
+
+    def test_zero3_save_gathers_each_parameter(self):
+        model = torch.nn.Linear(3, 2)
+        for parameter in model.parameters():
+            parameter.ds_id = 0
+            parameter.ds_numel = parameter.numel()
+
+        gather_calls = []
+
+        def gathered_parameters(parameters, **kwargs):
+            gather_calls.append((list(parameters), kwargs))
+            return contextlib.nullcontext()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = pathlib.Path(tmpdir) / "model.bin"
+            with patch("open_instruct.model_utils.deepspeed.zero.GatheredParameters", side_effect=gathered_parameters):
+                open_instruct.model_utils.save_model_state_dict(model, checkpoint_path, rank=0)
+            state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+
+        self.assertEqual(len(gather_calls), len(list(model.parameters())))
+        self.assertTrue(all(call_kwargs["enabled"] for _, call_kwargs in gather_calls))
+        self.assertEqual(set(state_dict), set(model.state_dict()))
+        self.assertTrue(all(tensor.numel() > 0 for tensor in state_dict.values()))
+
+    def test_zero3_load_gathers_full_model_on_rank_zero(self):
+        source = torch.nn.Linear(3, 2)
+        target = torch.nn.Linear(3, 2)
+        for parameter in target.parameters():
+            parameter.ds_id = 0
+
+        gather_calls = []
+
+        def gathered_parameters(parameters, **kwargs):
+            gather_calls.append((list(parameters), kwargs))
+            return contextlib.nullcontext()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = pathlib.Path(tmpdir) / "model.bin"
+            torch.save(source.state_dict(), checkpoint_path)
+            with patch("open_instruct.model_utils.deepspeed.zero.GatheredParameters", side_effect=gathered_parameters):
+                open_instruct.model_utils.maybe_load_checkpoint(
+                    SimpleNamespace(module=target), str(checkpoint_path), torch.device("cpu"), rank=0
+                )
+
+        self.assertEqual(len(gather_calls), 1)
+        self.assertEqual(gather_calls[0][1]["modifier_rank"], 0)
+        for source_parameter, target_parameter in zip(source.parameters(), target.parameters()):
+            self.assertTrue(torch.equal(source_parameter, target_parameter))
 
 
 class TestBatchSlicing(unittest.TestCase):
