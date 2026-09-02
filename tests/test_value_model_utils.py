@@ -148,6 +148,78 @@ def test_mark_gen_value_training_pairs_for_optimizer_is_unbiased_for_unequal_gro
     assert expected_estimator == pytest.approx(sum(pair["contribution"] for pair in pairs))
 
 
+def test_mark_gen_value_training_pairs_for_optimizer_stratifies_rare_long_successes():
+    pairs = []
+    identifier = 0
+    specifications = [
+        ("segment_start", 512, 0.0, 12),
+        ("segment_start", 512, 1.0, 12),
+        ("segment_start", 5000, 0.0, 12),
+        ("segment_start", 5000, 1.0, 2),
+    ]
+    for state_kind, response_tokens_used, outcome, count in specifications:
+        for _ in range(count):
+            pairs.append(
+                dict(
+                    _pair([identifier], outcome, state_kind=state_kind, response_tokens_used=response_tokens_used),
+                    identifier=identifier,
+                )
+            )
+            identifier += 1
+
+    marked, mean_probability, _ = value_model_utils.mark_gen_value_training_pairs_for_optimizer(
+        pairs, 12, random.Random(11), sampling_strategy="length_outcome_stratified"
+    )
+
+    rare_long_successes = [pair for pair in marked if pair["response_tokens_used"] >= 4096 and pair["outcome"] > 0.5]
+    assert rare_long_successes
+    assert all(value_model_utils.gen_value_optimizer_selected(pair) for pair in rare_long_successes)
+    assert all(
+        value_model_utils.gen_value_optimizer_inclusion_probability(pair) == 1.0 for pair in rare_long_successes
+    )
+    assert 0.0 < mean_probability < 1.0
+
+
+def test_stratified_gen_value_optimizer_probabilities_preserve_full_objective_in_expectation():
+    pairs = []
+    identifier = 0
+    specifications = [("segment_start", 128, 0.0, 9), ("segment_start", 2500, 1.0, 3), ("final_action", 5000, 1.0, 1)]
+    for state_kind, response_tokens_used, outcome, count in specifications:
+        for _ in range(count):
+            pairs.append(
+                dict(
+                    _pair([identifier], outcome, state_kind=state_kind, response_tokens_used=response_tokens_used),
+                    contribution=float(identifier + 1),
+                )
+            )
+            identifier += 1
+
+    rng = random.Random(3)
+    estimates = []
+    for _ in range(5_000):
+        marked, _, _ = value_model_utils.mark_gen_value_training_pairs_for_optimizer(
+            pairs, 6, rng, sampling_strategy="length_outcome_stratified"
+        )
+        estimates.append(
+            sum(
+                pair["contribution"] / value_model_utils.gen_value_optimizer_inclusion_probability(pair)
+                for pair in marked
+                if value_model_utils.gen_value_optimizer_selected(pair)
+            )
+        )
+
+    assert sum(estimates) / len(estimates) == pytest.approx(
+        sum(pair["contribution"] for pair in pairs), rel=0.02
+    )
+
+
+def test_mark_gen_value_training_pairs_for_optimizer_rejects_unknown_strategy():
+    with pytest.raises(ValueError, match="sampling strategy"):
+        value_model_utils.mark_gen_value_training_pairs_for_optimizer(
+            [], 1, random.Random(0), sampling_strategy="biased"
+        )
+
+
 def test_expected_gen_value_score_from_logprobs_is_continuous_and_normalized():
     expected_score, probabilities = value_model_utils.expected_gen_value_score_from_logprobs(
         list(range(11)), [0.0] * 11

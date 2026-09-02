@@ -926,11 +926,78 @@ def generative_value_prediction_outcome_metrics(
 
 _GEN_VALUE_SAMPLE_ID_KEY = "_gen_value_sample_id"
 _GEN_VALUE_OPTIMIZER_SELECTED_KEY = "_gen_value_optimizer_selected"
+_GEN_VALUE_OPTIMIZER_INCLUSION_PROBABILITY_KEY = "_gen_value_optimizer_inclusion_probability"
 _GEN_VALUE_REPLAY_MULTIPLICITY_KEY = "_gen_value_replay_multiplicity"
 
 
+def _gen_value_optimizer_stratum(pair_group: Sequence[dict[str, Any]]) -> tuple[str, str]:
+    """Return a stable state-length/outcome stratum for one shared-state group."""
+    if not pair_group:
+        raise ValueError("Cannot stratify an empty generative-value pair group.")
+
+    state_kinds = {str(pair.get("state_kind", "segment_start")) for pair in pair_group}
+    if len(state_kinds) != 1:
+        raise ValueError(f"Token-identical generative-value states disagree on state kind: {state_kinds}.")
+    state_kind = next(iter(state_kinds))
+    if state_kind == "final_action":
+        state_length_stratum = "final_action"
+    else:
+        response_positions = {pair.get("response_tokens_used") for pair in pair_group}
+        if len(response_positions) != 1:
+            raise ValueError(
+                f"Token-identical generative-value states disagree on response_tokens_used: {response_positions}."
+            )
+        response_tokens_used = next(iter(response_positions))
+        if isinstance(response_tokens_used, bool) or not isinstance(response_tokens_used, int):
+            raise ValueError(
+                "Length-outcome-stratified critic sampling requires integer response_tokens_used, got "
+                f"{response_tokens_used!r}."
+            )
+        if response_tokens_used < 0:
+            raise ValueError(f"response_tokens_used must be nonnegative, got {response_tokens_used}.")
+        if response_tokens_used < 1024:
+            state_length_stratum = "prefix_lt_1024"
+        elif response_tokens_used < 2048:
+            state_length_stratum = "prefix_1024_2047"
+        elif response_tokens_used < 4096:
+            state_length_stratum = "prefix_2048_4095"
+        else:
+            state_length_stratum = "prefix_ge_4096"
+
+    outcomes = [float(pair["outcome"]) for pair in pair_group]
+    if any(not math.isfinite(outcome) or not 0.0 <= outcome <= 1.0 for outcome in outcomes):
+        raise ValueError(f"Generative-value outcomes must be finite and in [0, 1], got {outcomes}.")
+    outcome_stratum = "correct" if sum(outcomes) / len(outcomes) > 0.5 else "incorrect"
+    return state_length_stratum, outcome_stratum
+
+
+def _allocate_gen_value_stratum_targets(
+    stratum_sizes: dict[tuple[str, str], int], target: int
+) -> dict[tuple[str, str], float]:
+    """Water-fill an example target equally across nonempty strata without oversampling."""
+    remaining_target = float(target)
+    active = set(stratum_sizes)
+    allocations: dict[tuple[str, str], float] = {}
+    while active:
+        equal_share = remaining_target / len(active)
+        saturated = {stratum for stratum in active if stratum_sizes[stratum] <= equal_share}
+        if not saturated:
+            allocations.update({stratum: equal_share for stratum in active})
+            break
+        for stratum in saturated:
+            allocation = float(stratum_sizes[stratum])
+            allocations[stratum] = allocation
+            remaining_target -= allocation
+        active -= saturated
+    return allocations
+
+
 def mark_gen_value_training_pairs_for_optimizer(
-    training_pairs: Sequence[dict[str, Any]], target_examples: int, rng: random.Random
+    training_pairs: Sequence[dict[str, Any]],
+    target_examples: int,
+    rng: random.Random,
+    *,
+    sampling_strategy: str = "uniform",
 ) -> tuple[list[dict[str, Any]], float, int]:
     """Mark an unbiased critic minibatch while retaining shared-state groups.
 
@@ -938,10 +1005,17 @@ def mark_gen_value_training_pairs_for_optimizer(
     rollout batch can nevertheless contain thousands of segment-state critic
     examples, making one optimizer update substantially slower than a policy step.
 
-    Each token-identical prompt group is independently retained with probability
-    ``target_examples / len(training_pairs)``. If the Bernoulli draw is empty, one
-    group is chosen uniformly. The returned inclusion probability accounts for
-    that fallback exactly, so the trainer can use a Horvitz-Thompson gradient scale.
+    With uniform sampling, each token-identical prompt group is independently
+    retained with probability ``target_examples / len(training_pairs)``. The
+    optional ``length_outcome_stratified`` strategy water-fills the target equally
+    across state-length/outcome strata, then samples whole prompt groups using the
+    stratum-specific probabilities. This reduces the chance that rare long,
+    successful states disappear from a critic update without changing the
+    full-batch objective in expectation.
+
+    If the Bernoulli draw is empty, one group is chosen uniformly. Every returned
+    pair carries its exact inclusion probability, including that fallback, so the
+    trainer can apply a per-example Horvitz-Thompson gradient scale.
     All pairs are returned: unselected pairs still define the original shared-state
     return targets and leave-one-out baseline, while only marked pairs participate
     in the expensive forward/backward pass. This makes the stochastic gradient an
@@ -955,9 +1029,20 @@ def mark_gen_value_training_pairs_for_optimizer(
     """
     if target_examples <= 0:
         raise ValueError(f"Generative-value training target examples must be positive, got {target_examples}.")
+    if sampling_strategy not in {"uniform", "length_outcome_stratified"}:
+        raise ValueError(
+            "Generative-value optimizer sampling strategy must be 'uniform' or "
+            f"'length_outcome_stratified', got {sampling_strategy!r}."
+        )
     if len(training_pairs) <= target_examples:
         return (
-            [dict(pair, **{_GEN_VALUE_OPTIMIZER_SELECTED_KEY: True}) for pair in training_pairs],
+            [
+                dict(
+                    pair,
+                    **{_GEN_VALUE_OPTIMIZER_SELECTED_KEY: True, _GEN_VALUE_OPTIMIZER_INCLUSION_PROBABILITY_KEY: 1.0},
+                )
+                for pair in training_pairs
+            ],
             1.0,
             len(training_pairs),
         )
@@ -967,21 +1052,53 @@ def mark_gen_value_training_pairs_for_optimizer(
         prompt_ids = tuple(int(token_id) for token_id in pair["request_output"].prompt_token_ids)
         grouped_pairs.setdefault(prompt_ids, []).append(pair)
 
-    base_probability = target_examples / len(training_pairs)
-    retained_groups = {prompt_ids for prompt_ids in grouped_pairs if rng.random() < base_probability}
-    empty_draw_probability = (1.0 - base_probability) ** len(grouped_pairs)
-    inclusion_probability = base_probability + empty_draw_probability / len(grouped_pairs)
+    if sampling_strategy == "uniform":
+        base_probabilities = {prompt_ids: target_examples / len(training_pairs) for prompt_ids in grouped_pairs}
+    else:
+        grouped_strata = {
+            prompt_ids: _gen_value_optimizer_stratum(pair_group) for prompt_ids, pair_group in grouped_pairs.items()
+        }
+        stratum_sizes: dict[tuple[str, str], int] = {}
+        for prompt_ids, pair_group in grouped_pairs.items():
+            stratum = grouped_strata[prompt_ids]
+            stratum_sizes[stratum] = stratum_sizes.get(stratum, 0) + len(pair_group)
+        allocations = _allocate_gen_value_stratum_targets(stratum_sizes, target_examples)
+        base_probabilities = {
+            prompt_ids: min(allocations[grouped_strata[prompt_ids]] / stratum_sizes[grouped_strata[prompt_ids]], 1.0)
+            for prompt_ids in grouped_pairs
+        }
+
+    retained_groups = {
+        prompt_ids for prompt_ids, probability in base_probabilities.items() if rng.random() < probability
+    }
+    empty_draw_probability = math.prod(1.0 - probability for probability in base_probabilities.values())
+    fallback_probability = empty_draw_probability / len(grouped_pairs)
+    inclusion_probabilities = {
+        prompt_ids: probability + fallback_probability for prompt_ids, probability in base_probabilities.items()
+    }
     if not retained_groups:
         retained_groups.add(rng.choice(list(grouped_pairs)))
 
     marked_pairs = []
     selected_examples = 0
+    inclusion_probability_sum = 0.0
     for pair in training_pairs:
         prompt_ids = tuple(int(token_id) for token_id in pair["request_output"].prompt_token_ids)
         optimizer_selected = prompt_ids in retained_groups
-        marked_pairs.append(dict(pair, **{_GEN_VALUE_OPTIMIZER_SELECTED_KEY: optimizer_selected}))
+        inclusion_probability = inclusion_probabilities[prompt_ids]
+        marked_pairs.append(
+            dict(
+                pair,
+                **{
+                    _GEN_VALUE_OPTIMIZER_SELECTED_KEY: optimizer_selected,
+                    _GEN_VALUE_OPTIMIZER_INCLUSION_PROBABILITY_KEY: inclusion_probability,
+                },
+            )
+        )
         selected_examples += int(optimizer_selected)
-    return marked_pairs, inclusion_probability, selected_examples
+        inclusion_probability_sum += inclusion_probability
+    mean_inclusion_probability = inclusion_probability_sum / len(training_pairs)
+    return marked_pairs, mean_inclusion_probability, selected_examples
 
 
 def gen_value_optimizer_selected(pair: dict[str, Any]) -> bool:
@@ -990,6 +1107,19 @@ def gen_value_optimizer_selected(pair: dict[str, Any]) -> bool:
     if not isinstance(selected, bool):
         raise ValueError(f"Generative-value optimizer selection flag must be boolean, got {selected!r}.")
     return selected
+
+
+def gen_value_optimizer_inclusion_probability(pair: dict[str, Any], default: float = 1.0) -> float:
+    """Return the exact probability that a critic pair entered the optimizer batch."""
+    probability = pair.get(_GEN_VALUE_OPTIMIZER_INCLUSION_PROBABILITY_KEY, default)
+    if isinstance(probability, bool) or not isinstance(probability, int | float):
+        raise ValueError(f"Generative-value optimizer inclusion probability must be numeric, got {probability!r}.")
+    probability = float(probability)
+    if not math.isfinite(probability) or not 0.0 < probability <= 1.0:
+        raise ValueError(
+            f"Generative-value optimizer inclusion probability must be finite and in (0, 1], got {probability}."
+        )
+    return probability
 
 
 def gen_value_pair_sample_id(pair: dict[str, Any]) -> int:
@@ -1059,6 +1189,7 @@ def collapse_replayed_gen_value_optimizer_examples(examples: Sequence[dict[str, 
         "outcome",
         "state_kind",
         "optimizer_selected",
+        "optimizer_inclusion_probability",
         "parsed",
         "prediction",
         "squared_error",

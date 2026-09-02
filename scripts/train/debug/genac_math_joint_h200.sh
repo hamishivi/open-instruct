@@ -85,6 +85,10 @@ GEN_VALUE_TRAINER_NUM_GPUS="${GEN_VALUE_TRAINER_NUM_GPUS:-1}"
 # shared-state-preserving stochastic minibatch of approximately this many critic
 # examples per fresh policy batch.
 GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE="${GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE:-0}"
+# Optional variance reduction for the unchanged Horvitz-Thompson critic
+# minibatch objective. The stratified mode gives each state-length/outcome
+# stratum an expected share before inverse-probability correction.
+GEN_VALUE_OPTIMIZER_SAMPLING_STRATEGY="${GEN_VALUE_OPTIMIZER_SAMPLING_STRATEGY:-uniform}"
 # Keep the advantage gap as a critic-compute diagnostic by default. A numeric
 # threshold is an explicit opt-in policy guard; even 0.0 is not equivalent to
 # disabling it because a noisy negative batch gap would still pause the actor.
@@ -111,6 +115,14 @@ if [[ ! "${GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE}" =~ ^[0-9]+$ ]]; then
     echo "ERROR: GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE must be a nonnegative integer" >&2
     exit 1
 fi
+case "${GEN_VALUE_OPTIMIZER_SAMPLING_STRATEGY}" in
+    uniform | length_outcome_stratified)
+        ;;
+    *)
+        echo "ERROR: GEN_VALUE_OPTIMIZER_SAMPLING_STRATEGY must be uniform or length_outcome_stratified" >&2
+        exit 1
+        ;;
+esac
 if [[ ! "${GEN_VALUE_TRAINER_NUM_GPUS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: GEN_VALUE_TRAINER_NUM_GPUS must be a positive integer" >&2
     exit 1
@@ -232,6 +244,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --gen_value_final_action_replay_weight 4 \
     --gen_value_sync_freq "${GEN_VALUE_SYNC_FREQ}" \
     --gen_value_max_async_steps "${GEN_VALUE_MAX_ASYNC_STEPS}" \
+    --gen_value_optimizer_sampling_strategy "${GEN_VALUE_OPTIMIZER_SAMPLING_STRATEGY}" \
     "${GEN_VALUE_TRAIN_TARGET_ARGS[@]}" \
     "${GEN_VALUE_POLICY_GUARD_ARGS[@]}" \
     --gen_value_diagnostic_scoring_freq 0 \

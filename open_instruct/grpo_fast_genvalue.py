@@ -584,6 +584,11 @@ class GenValueTrainerActor:
                     "reward": reward,
                     "source_pair_id": sample_id,
                     "optimizer_selected": value_model_utils.gen_value_optimizer_selected(pair),
+                    "optimizer_inclusion_probability": (
+                        value_model_utils.gen_value_optimizer_inclusion_probability(
+                            pair, default=optimizer_inclusion_probability
+                        )
+                    ),
                     "parsed": v_hat is not None,
                     "prediction": v_hat,
                     "squared_error": squared_error,
@@ -643,12 +648,10 @@ class GenValueTrainerActor:
         optimizer_reinforce_tokens = sum(len(example["generated_ids"]) for example in optimizer_examples)
         # DeepSpeed averages data-parallel gradients. Multiplying each local loss
         # by world size therefore recovers the exact single-worker global token
-        # sum after the all-reduce.
-        gradient_scale = (
-            self._reinforce_coef
-            * self._trainer_world_size
-            / (max(candidate_reinforce_tokens, 1) * optimizer_inclusion_probability)
-        )
+        # sum after the all-reduce. Each selected example applies its own inverse
+        # inclusion probability below; uniform sampling exactly recovers the old
+        # scalar Horvitz-Thompson gradient.
+        gradient_scale = self._reinforce_coef * self._trainer_world_size / max(candidate_reinforce_tokens, 1)
         total_loss = 0.0
         optimization_parsed_count = sum(bool(example["parsed"]) for example in optimizer_examples)
         unique_parsed_count = len(unique_v_hats)
@@ -680,6 +683,7 @@ class GenValueTrainerActor:
                 target_ids_list = [pad_token_id]
                 rollout_logprobs_list = [0.0]
                 rewards_list = [0.0]
+                inclusion_probabilities_list = [1.0]
                 replay_multiplicities = [1]
             else:
                 pack = local_packs[local_pack_position]
@@ -693,6 +697,11 @@ class GenValueTrainerActor:
                     rewards_list,
                 ) = flattened
                 pack_token_counts.append(len(input_ids_list))
+                inclusion_probabilities_list = [
+                    float(example["optimizer_inclusion_probability"])
+                    for example in pack
+                    for _ in example["generated_ids"]
+                ]
                 replay_multiplicities = [
                     value_model_utils.gen_value_replay_multiplicity(example)
                     for example in pack
@@ -739,7 +748,8 @@ class GenValueTrainerActor:
                 tis_mask_total_tokens += sum(replay_multiplicities)
 
             token_rewards = torch.tensor(rewards_list, dtype=torch.float32, device="cuda")
-            per_token_loss = -token_logprobs * token_rewards
+            inclusion_probabilities = torch.tensor(inclusion_probabilities_list, dtype=torch.float32, device="cuda")
+            per_token_loss = -token_logprobs * token_rewards / inclusion_probabilities
             if tis_weights is not None:
                 per_token_loss = per_token_loss * tis_weights
             effective_weights = token_rewards != 0.0
@@ -1009,6 +1019,10 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
     # instead of accumulating every segment example into one slow optimizer step.
     # Exact shared-state groups remain intact, so realized size varies around the target.
     gen_value_train_target_examples_per_update: int | None = None
+    # Variance-reduction strategy for the unbiased optimizer subset. Stratified
+    # sampling gives rare long-success states reliable coverage while retaining
+    # the exact full-batch objective through per-example inverse-probability weights.
+    gen_value_optimizer_sampling_strategy: str = "uniform"
     # Maximum source-policy lag retained for critic training. This is intentionally
     # independent of the policy rollout pipeline's async_steps: enqueue never
     # blocks policy training, the consumer prefers the freshest available
@@ -1130,6 +1144,11 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
             raise ValueError(
                 "--gen_value_train_target_examples_per_update must be > 0 when set, got "
                 f"{self.gen_value_train_target_examples_per_update}."
+            )
+        if self.gen_value_optimizer_sampling_strategy not in {"uniform", "length_outcome_stratified"}:
+            raise ValueError(
+                "--gen_value_optimizer_sampling_strategy must be 'uniform' or "
+                f"'length_outcome_stratified', got {self.gen_value_optimizer_sampling_strategy!r}."
             )
         if self.gen_value_max_async_steps <= 0:
             raise ValueError(f"--gen_value_max_async_steps must be > 0, got {self.gen_value_max_async_steps}.")
@@ -1777,6 +1796,7 @@ def _gen_value_reinforce_loop(
     training_progress: Any,
     batch_size: int,
     target_examples_per_update: int | None,
+    optimizer_sampling_strategy: str,
     max_async_steps: int,
     training_seed: int,
     stop_event: threading.Event,
@@ -1934,7 +1954,10 @@ def _gen_value_reinforce_loop(
             if target_examples_per_update is not None:
                 pairs, optimizer_inclusion_probability, optimizer_unique_pair_count = (
                     value_model_utils.mark_gen_value_training_pairs_for_optimizer(
-                        pairs, target_examples_per_update, pair_sampling_rng
+                        pairs,
+                        target_examples_per_update,
+                        pair_sampling_rng,
+                        sampling_strategy=optimizer_sampling_strategy,
                     )
                 )
             unique_pair_count = candidate_pair_count
@@ -2703,6 +2726,7 @@ def main():
             gen_value_training_progress,
             gen_value_batch_size,
             args.gen_value_train_target_examples_per_update,
+            args.gen_value_optimizer_sampling_strategy,
             args.gen_value_max_async_steps,
             args.seed,
             gen_value_stop_event,

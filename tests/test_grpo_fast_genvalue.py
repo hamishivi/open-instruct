@@ -548,6 +548,7 @@ def test_gen_value_reinforce_loop_trains_queued_batches_consecutively_freshest_f
         training_progress=training_progress,
         batch_size=2,
         target_examples_per_update=1,
+        optimizer_sampling_strategy="uniform",
         max_async_steps=4,
         training_seed=0,
         stop_event=stop_event,
