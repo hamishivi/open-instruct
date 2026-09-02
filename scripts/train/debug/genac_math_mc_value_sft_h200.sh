@@ -24,7 +24,7 @@ fi
 
 PYTHON_EXECUTABLE="${PYTHON_EXECUTABLE:-python}"
 MC_SFT_JSONL="${MC_SFT_JSONL:-${PWD}/inputs/mc_sft/direct_mc_value_sft.jsonl}"
-TOKENIZER_NAME_OR_PATH="${TOKENIZER_NAME_OR_PATH:-Qwen/Qwen3-4B-Base}"
+ACTOR_TOKENIZER_NAME_OR_PATH="${ACTOR_TOKENIZER_NAME_OR_PATH:-${TOKENIZER_NAME_OR_PATH:-Qwen/Qwen3-4B-Base}}"
 MIN_CONTINUATIONS="${MIN_CONTINUATIONS:-16}"
 MIN_MC_EXAMPLES="${MIN_MC_EXAMPLES:-512}"
 MIN_EARLY_MIDDLE_FRACTION="${MIN_EARLY_MIDDLE_FRACTION:-0}"
@@ -51,7 +51,7 @@ prepare_args=(
     scripts/data/prepare_gen_value_mc_sft.py
     "${MC_VALUE_PARQUET}"
     --output "${MC_SFT_JSONL}"
-    --tokenizer_name_or_path "${TOKENIZER_NAME_OR_PATH}"
+    --tokenizer_name_or_path "${ACTOR_TOKENIZER_NAME_OR_PATH}"
     --exclude_problem_dataset_path "${HELDOUT_VALUE_PARQUET}"
     --min_continuations "${MIN_CONTINUATIONS}"
     --min_examples "${MIN_MC_EXAMPLES}"

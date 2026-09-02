@@ -38,6 +38,68 @@ class TestValueEstimationStates(unittest.TestCase):
         self.assertEqual(config.vllm_max_model_len, 32768)
         self.assertTrue(config.vllm_enable_prefix_caching)
 
+    def test_generative_score_uses_actor_tokenizer_instead_of_critic_tokenizer(self):
+        config = value_estimation.ScoreDatasetConfig(
+            input_dataset_path="input.parquet", output_path="scores.parquet", value_model_path="critic"
+        )
+        self.assertEqual(
+            value_estimation._resolve_generative_value_actor_tokenizer_path(
+                config, ["Qwen/Qwen3-4B-Base", "Qwen/Qwen3-4B-Base"]
+            ),
+            "Qwen/Qwen3-4B-Base",
+        )
+
+        config.actor_tokenizer_name_or_path = "explicit-actor-tokenizer"
+        self.assertEqual(
+            value_estimation._resolve_generative_value_actor_tokenizer_path(config, ["actor-metadata"]),
+            "explicit-actor-tokenizer",
+        )
+
+    def test_generative_score_rejects_ambiguous_or_missing_actor_tokenizer(self):
+        config = value_estimation.ScoreDatasetConfig(
+            input_dataset_path="input.parquet", output_path="scores.parquet", value_model_path="critic"
+        )
+        with self.assertRaisesRegex(ValueError, "multiple actor models"):
+            value_estimation._resolve_generative_value_actor_tokenizer_path(config, ["actor-a", "actor-b"])
+        with self.assertRaisesRegex(ValueError, "needs the tokenizer"):
+            value_estimation._resolve_generative_value_actor_tokenizer_path(config, [])
+
+    def test_generative_score_wrapper_forwards_actor_tokenizer(self):
+        repository_root = pathlib.Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory(prefix="gen-value-score-wrapper-") as directory:
+            test_root = pathlib.Path(directory)
+            captured_args = test_root / "args.txt"
+            fake_python = test_root / "fake-python"
+            fake_python.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$CAPTURE_ARGS"\n')
+            fake_python.chmod(0o755)
+            environment = {
+                **os.environ,
+                "PYTHON_EXECUTABLE": str(fake_python),
+                "CAPTURE_ARGS": str(captured_args),
+                "ACTOR_TOKENIZER_NAME_OR_PATH": "actor-tokenizer",
+            }
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    "scripts/eval/value_estimation/score_generative_value.sh",
+                    "critic",
+                    "input.parquet",
+                    "output.parquet",
+                    "gt",
+                ],
+                cwd=repository_root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            arguments = captured_args.read_text().splitlines()
+            tokenizer_index = arguments.index("--actor_tokenizer_name_or_path")
+            self.assertEqual(arguments[tokenizer_index + 1], "actor-tokenizer")
+
     def test_mc_dataset_split_keeps_normalized_problem_pairs_disjoint(self):
         rows = [
             {"id": "a1", "problem": "problem  a\n", "ground_truth": "1", "rollout_is_correct": True},
@@ -103,6 +165,7 @@ class TestValueEstimationStates(unittest.TestCase):
                 "MODEL_PATH": str(model_path),
                 "PYTHON_EXECUTABLE": str(fake_python),
                 "CAPTURE_ARGS": str(captured_args),
+                "ACTOR_TOKENIZER_NAME_OR_PATH": "actor-tokenizer",
                 "LONG_PREFIX_TOKEN_THRESHOLD": "3072",
                 "MIN_LONG_PREFIX_FRACTION": "0.15",
             }
@@ -120,8 +183,10 @@ class TestValueEstimationStates(unittest.TestCase):
             arguments = captured_args.read_text().splitlines()
             threshold_index = arguments.index("--long_prefix_token_threshold")
             fraction_index = arguments.index("--min_long_prefix_fraction")
+            tokenizer_index = arguments.index("--tokenizer_name_or_path")
             self.assertEqual(arguments[threshold_index + 1], "3072")
             self.assertEqual(arguments[fraction_index + 1], "0.15")
+            self.assertEqual(arguments[tokenizer_index + 1], "actor-tokenizer")
 
     def test_mc_sft_holdout_pipeline_preserves_conditioning_and_scores_every_epoch(self):
         repository_root = pathlib.Path(__file__).parents[1]
@@ -175,11 +240,13 @@ printf '\n' >> "$CALL_LOG"
 case "$1" in
 *score_generative_value.sh)
     [ "$5" = gt ]
+    [ "$ACTOR_TOKENIZER_NAME_OR_PATH" = Qwen/Qwen3-4B-Base ]
     : > "$4"
     ;;
 *genac_math_mc_value_sft_h200.sh)
     [ "$GEN_VALUE_CONDITIONING" = gt ]
     [ "$MIN_LONG_PREFIX_FRACTION" = 0.15 ]
+    [ "$ACTOR_TOKENIZER_NAME_OR_PATH" = Qwen/Qwen3-4B-Base ]
     mkdir -p "$OUTPUT_DIR/epoch_1_model" "$OUTPUT_DIR/epoch_2_model"
     ;;
 *) exit 97 ;;

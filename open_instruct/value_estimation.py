@@ -128,6 +128,11 @@ class ScoreDatasetConfig:
     gen_value_max_new_tokens: int = 1024
     gen_value_actor_model_name: str | None = None
     gen_value_actor_success_rate: float | None = None
+    # Tokenizer that produced prompt_token_ids and rollout_tokens. Generative
+    # critics consume decoded actor text, so this is intentionally independent
+    # from the tokenizer bundled with value_model_path.
+    actor_tokenizer_name_or_path: str | None = None
+    # Legacy override retained for scalar-value scoring and older callers.
     tokenizer_name_or_path: str | None = None
     run_name: str = "value_estimation_run"
     device: str = "cuda"
@@ -1268,6 +1273,36 @@ def _collate_generative_value_generations(
     return predictions, raw_generations
 
 
+def _resolve_generative_value_actor_tokenizer_path(cfg: ScoreDatasetConfig, actor_model_names: Sequence[Any]) -> str:
+    """Choose the tokenizer that originally produced actor rollout token IDs."""
+    if cfg.actor_tokenizer_name_or_path:
+        return cfg.actor_tokenizer_name_or_path
+    if cfg.tokenizer_name_or_path:
+        logger.warning(
+            "Using legacy --tokenizer_name_or_path as the actor tokenizer for generative-value scoring; "
+            "prefer --actor_tokenizer_name_or_path."
+        )
+        return cfg.tokenizer_name_or_path
+
+    normalized_actor_names = {
+        str(actor_model_name).strip()
+        for actor_model_name in actor_model_names
+        if isinstance(actor_model_name, str) and actor_model_name.strip()
+    }
+    if len(normalized_actor_names) == 1:
+        return normalized_actor_names.pop()
+    if len(normalized_actor_names) > 1:
+        raise ValueError(
+            "Generative-value scoring received rollouts from multiple actor models but no "
+            "--actor_tokenizer_name_or_path override: "
+            f"{sorted(normalized_actor_names)}."
+        )
+    raise ValueError(
+        "Generative-value scoring needs the tokenizer that produced the actor token IDs. "
+        "Set --actor_tokenizer_name_or_path or retain one consistent actor_model_name column in the dataset."
+    )
+
+
 def _score_with_generative_value(
     df, cfg: ScoreDatasetConfig
 ) -> tuple[list[list[float | None]], list[list[str | None]]]:
@@ -1277,7 +1312,9 @@ def _score_with_generative_value(
 
     from open_instruct import value_model_utils  # noqa: PLC0415
 
-    tok_path = cfg.tokenizer_name_or_path or cfg.value_model_path
+    actor_model_names = df["actor_model_name"].tolist() if "actor_model_name" in df.columns else []
+    tok_path = _resolve_generative_value_actor_tokenizer_path(cfg, actor_model_names)
+    logger.info("Decoding actor prompt and rollout token IDs with %s", tok_path)
     tokenizer = AutoTokenizer.from_pretrained(tok_path)
     llm = LLM(
         model=cfg.value_model_path,
