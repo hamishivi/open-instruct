@@ -10,6 +10,7 @@ CONDITIONING="${4:-${CONDITIONING:-none}}"  # none | gt | correct_demo | rollout
 GEN_VALUE_MAX_NEW_TOKENS="${GEN_VALUE_MAX_NEW_TOKENS:-1024}"
 VLLM_TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
+VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
 RUN_NAME="${RUN_NAME:-generative_value_${CONDITIONING}}"
 PYTHON_EXECUTABLE=${PYTHON_EXECUTABLE:-python}
 
@@ -24,4 +25,6 @@ PYTHON_EXECUTABLE=${PYTHON_EXECUTABLE:-python}
     --gen_value_max_new_tokens "${GEN_VALUE_MAX_NEW_TOKENS}" \
     --vllm_tensor_parallel_size "${VLLM_TENSOR_PARALLEL_SIZE}" \
     --vllm_gpu_memory_utilization "${VLLM_GPU_MEMORY_UTILIZATION}" \
+    --vllm_max_model_len "${VLLM_MAX_MODEL_LEN}" \
+    --vllm_enable_prefix_caching \
     --run_name "${RUN_NAME}"

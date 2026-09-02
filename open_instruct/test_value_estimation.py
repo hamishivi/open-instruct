@@ -30,6 +30,14 @@ class _FakeTokenizer:
 
 
 class TestValueEstimationStates(unittest.TestCase):
+    def test_generative_score_defaults_match_online_long_context_serving(self):
+        config = value_estimation.ScoreDatasetConfig(
+            input_dataset_path="input.parquet", output_path="scores.parquet", value_model_path="critic"
+        )
+
+        self.assertEqual(config.vllm_max_model_len, 32768)
+        self.assertTrue(config.vllm_enable_prefix_caching)
+
     def test_mc_dataset_split_keeps_normalized_problem_pairs_disjoint(self):
         rows = [
             {"id": "a1", "problem": "problem  a\n", "ground_truth": "1", "rollout_is_correct": True},

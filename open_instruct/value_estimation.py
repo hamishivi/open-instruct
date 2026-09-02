@@ -135,6 +135,8 @@ class ScoreDatasetConfig:
     # vLLM options used only for generative value models.
     vllm_tensor_parallel_size: int = 1
     vllm_gpu_memory_utilization: float = 0.85
+    vllm_max_model_len: int = 32768
+    vllm_enable_prefix_caching: bool = True
 
 
 @dataclass
@@ -1281,6 +1283,8 @@ def _score_with_generative_value(
         model=cfg.value_model_path,
         tensor_parallel_size=cfg.vllm_tensor_parallel_size,
         gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
+        max_model_len=cfg.vllm_max_model_len,
+        enable_prefix_caching=cfg.vllm_enable_prefix_caching,
     )
     sp = SamplingParams(
         n=1,
