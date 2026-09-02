@@ -78,6 +78,9 @@ export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-4}"
 export LEARNING_RATE="${LEARNING_RATE:-5e-7}"
 export NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-4}"
 export SAVE_MODEL_EACH_EPOCH="${SAVE_MODEL_EACH_EPOCH:-1}"
+# Direct-MC completions contain only the scalar judgment. Make the value score,
+# rather than the surrounding answer tags, the default supervised objective.
+export SCORE_TOKEN_ONLY_LOSS="${SCORE_TOKEN_ONLY_LOSS:-1}"
 if [[ "${GEN_VALUE_CONDITIONING}" == "gt" ]]; then
     export ALLOW_GROUND_TRUTH_CONDITIONING=1
 fi
