@@ -607,8 +607,8 @@ def test_gen_value_policy_guard_rejects_invalid_threshold():
         value_model_utils.gen_value_policy_guard_active(-0.1, 0.3)
 
 
-def test_scalar_value_outcome_position_samples_aligns_predictions_and_returns():
-    samples = value_model_utils.scalar_value_outcome_position_samples(
+def test_value_outcome_position_samples_aligns_predictions_and_returns():
+    samples = value_model_utils.value_outcome_position_samples(
         predictions=torch.tensor([[0.1, 0.2, 0.3, 0.4, 9.0]]),
         returns=torch.tensor([[0.5, 0.6, 0.7, 0.8, 9.0]]),
         value_mask=torch.tensor([[True, True, True, True, False]]),
@@ -625,7 +625,7 @@ def test_scalar_value_outcome_position_samples_aligns_predictions_and_returns():
     }
 
 
-def test_scalar_value_outcome_position_samples_rejects_invalid_shape_and_bins():
+def test_value_outcome_position_samples_rejects_invalid_shape_and_bins():
     tensors = {
         "predictions": torch.zeros((1, 2)),
         "returns": torch.zeros((1, 2)),
@@ -635,10 +635,10 @@ def test_scalar_value_outcome_position_samples_rejects_invalid_shape_and_bins():
         "num_bins": 2,
     }
     with pytest.raises(ValueError, match="Masked percentile bins"):
-        value_model_utils.scalar_value_outcome_position_samples(**tensors)
+        value_model_utils.value_outcome_position_samples(**tensors)
 
     with pytest.raises(ValueError, match="same shape"):
-        value_model_utils.scalar_value_outcome_position_samples(
+        value_model_utils.value_outcome_position_samples(
             **{**tensors, "returns": torch.zeros((1, 1)), "percentile_bins": torch.tensor([[0, 1]])}
         )
 

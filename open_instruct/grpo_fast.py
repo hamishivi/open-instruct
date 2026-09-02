@@ -2516,7 +2516,7 @@ class PolicyTrainerRayProcess(RayProcess):
                             f"correct={tuple(full_correct.shape)}, bins={tuple(full_bins.shape)}, "
                             f"values={tuple(value_mask.shape)}."
                         )
-                    position_samples = value_model_utils.scalar_value_outcome_position_samples(
+                    position_samples = value_model_utils.value_outcome_position_samples(
                         torch.from_numpy(vals_np),
                         torch.from_numpy(returns_np),
                         torch.from_numpy(vm_np),

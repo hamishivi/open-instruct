@@ -604,7 +604,7 @@ def regression_metrics_from_sums(metric_sums: torch.Tensor) -> dict[str, float]:
     }
 
 
-def scalar_value_outcome_position_samples(
+def value_outcome_position_samples(
     predictions: torch.Tensor,
     returns: torch.Tensor,
     value_mask: torch.Tensor,
@@ -612,7 +612,7 @@ def scalar_value_outcome_position_samples(
     percentile_bins: torch.Tensor,
     num_bins: int,
 ) -> dict[str, list[list[float]]]:
-    """Split scalar-value predictions and return targets by outcome and trajectory position.
+    """Split value predictions and return targets by outcome and trajectory position.
 
     The caller reduces the returned samples across data-parallel ranks. Keeping
     predictions and their training targets under the same labels distinguishes a
