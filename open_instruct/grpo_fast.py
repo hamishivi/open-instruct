@@ -2623,6 +2623,10 @@ class PolicyTrainerRayProcess(RayProcess):
             correct_advantage = sae_step_metrics.get("gen_value/advantage_correct_mean")
             incorrect_advantage = sae_step_metrics.get("gen_value/advantage_incorrect_mean")
             if correct_advantage is not None and incorrect_advantage is not None:
+                # With gamma=lambda=1 these are outcome-minus-value residuals.
+                # Their gap measures remaining actor signal, not critic quality:
+                # a perfectly calibrated critic drives both residuals (and the
+                # gap) to zero while retaining perfect outcome discrimination.
                 sae_step_metrics["gen_value/advantage_gap"] = correct_advantage - incorrect_advantage
             min_advantage_gap = getattr(self.args, "gen_value_min_advantage_gap_for_policy_update", None)
             policy_guard_active = value_model_utils.gen_value_policy_guard_active(

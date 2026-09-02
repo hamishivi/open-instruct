@@ -389,7 +389,29 @@ class TestGAEVariants(unittest.TestCase):
 
         np.testing.assert_allclose(advantages[0, [2, 3, 4]], 1.0 - values[0, [2, 3, 4]])
         np.testing.assert_allclose(advantages[0, [7, 8, 9, 10]], -values[0, [7, 8, 9, 10]])
+        self.assertTrue((advantages[0, [2, 3, 4]] >= 0.0).all())
+        self.assertTrue((advantages[0, [7, 8, 9, 10]] <= 0.0).all())
         self.assertGreater(boundary_fraction, 0.0)
+
+        # A perfectly calibrated critic leaves no residual actor signal. In
+        # particular, the correct-minus-incorrect advantage gap is then zero;
+        # it is not a standalone measure of critic discrimination at lambda=1.
+        perfect_values = np.zeros_like(values)
+        perfect_values[0, [2, 3, 4]] = 1.0
+        perfect_advantages, _, _ = calculate_advantages_packed_sae(
+            perfect_values,
+            rewards,
+            gamma=1.0,
+            lam=1.0,
+            dones=dones,
+            response_masks=response_masks,
+            logprobs=logprobs,
+            sae_threshold=0.2,
+        )
+        correct_mean = perfect_advantages[0, [2, 3, 4]].mean()
+        incorrect_mean = perfect_advantages[0, [7, 8, 9, 10]].mean()
+        np.testing.assert_allclose(perfect_advantages[response_masks > 0], 0.0)
+        self.assertAlmostEqual(correct_mean - incorrect_mean, 0.0)
 
     def test_sae_vapo_combines_variants(self):
         v, r, d, m, logp = self._inputs()
