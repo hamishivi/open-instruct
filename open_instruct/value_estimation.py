@@ -282,6 +282,8 @@ def _run_rollouts_replica_worker(
     tensor_parallel_size: int,
     gpu_memory_utilization: float,
     logprobs: bool,
+    mc_continuation_metadata: list[tuple[list[int], str, str]] | None,
+    keep_continuation_texts: bool,
     result_queue: Any,
 ) -> None:
     """Generate one prompt shard after masking the process to its assigned GPUs."""
@@ -298,6 +300,16 @@ def _run_rollouts_replica_worker(
             gpu_memory_utilization=gpu_memory_utilization,
             logprobs=logprobs,
         )
+        if mc_continuation_metadata is not None:
+            from transformers import AutoTokenizer  # noqa: PLC0415
+
+            tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+            shard_results = _reduce_mc_continuation_results(
+                shard_results,
+                mc_continuation_metadata,
+                tokenizer=tokenizer,
+                keep_continuation_texts=keep_continuation_texts,
+            )
         result_queue.put(
             (replica_rank, list(zip((index for index, _ in indexed_prompts), shard_results, strict=True)), None)
         )
@@ -318,7 +330,9 @@ def _run_rollouts(
     data_parallel_size: int,
     gpu_memory_utilization: float,
     logprobs: bool = False,
-) -> list[list[dict[str, Any]]]:
+    mc_continuation_metadata: Sequence[tuple[list[int], str, str]] | None = None,
+    keep_continuation_texts: bool = False,
+) -> list[Any]:
     """Run `n` rollouts per prompt through independent dense-model replicas.
 
     vLLM's built-in offline ``data_parallel_size`` mode targets MoE expert
@@ -334,8 +348,13 @@ def _run_rollouts(
                 f"max_tokens must be one integer or one value per prompt ({len(max_tokens)} != {len(prompts)})."
             )
         max_tokens = [int(value) for value in max_tokens]
+    if mc_continuation_metadata is not None and len(mc_continuation_metadata) != len(prompts):
+        raise ValueError(
+            "mc_continuation_metadata must contain one item per prompt "
+            f"({len(mc_continuation_metadata)} != {len(prompts)})."
+        )
     if data_parallel_size == 1:
-        return _run_rollouts_single_replica(
+        results = _run_rollouts_single_replica(
             prompts,
             model_name_or_path=model_name_or_path,
             n=n,
@@ -345,6 +364,14 @@ def _run_rollouts(
             tensor_parallel_size=tensor_parallel_size,
             gpu_memory_utilization=gpu_memory_utilization,
             logprobs=logprobs,
+        )
+        if mc_continuation_metadata is None:
+            return results
+        from transformers import AutoTokenizer  # noqa: PLC0415
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+        return _reduce_mc_continuation_results(
+            results, mc_continuation_metadata, tokenizer=tokenizer, keep_continuation_texts=keep_continuation_texts
         )
 
     replica_count = min(data_parallel_size, len(prompts))
@@ -367,6 +394,11 @@ def _run_rollouts(
             shard_max_tokens: int | list[int] = [max_tokens[index] for index, _ in indexed_prompts]
         else:
             shard_max_tokens = max_tokens
+        shard_mc_metadata = (
+            [mc_continuation_metadata[index] for index, _ in indexed_prompts]
+            if mc_continuation_metadata is not None
+            else None
+        )
         process = context.Process(
             target=_run_rollouts_replica_worker,
             kwargs={
@@ -381,6 +413,8 @@ def _run_rollouts(
                 "tensor_parallel_size": tensor_parallel_size,
                 "gpu_memory_utilization": gpu_memory_utilization,
                 "logprobs": logprobs,
+                "mc_continuation_metadata": shard_mc_metadata,
+                "keep_continuation_texts": keep_continuation_texts,
                 "result_queue": result_queue,
             },
             name=f"vllm-data-replica-{replica_rank}",
@@ -443,6 +477,35 @@ def _decode_full_continuation(
 ) -> str:
     """Decode the complete candidate response that the verifier must grade."""
     return tokenizer.decode([*rollout_prefix_token_ids, *continuation_token_ids], skip_special_tokens=True)
+
+
+def _reduce_mc_continuation_results(
+    results: Sequence[Sequence[dict[str, Any]]],
+    metadata: Sequence[tuple[list[int], str, str]],
+    *,
+    tokenizer: Any,
+    keep_continuation_texts: bool,
+) -> list[dict[str, Any]]:
+    """Reduce generated continuations to MC values before replica IPC.
+
+    Dense data-parallel collection can produce hundreds of thousands of long
+    continuations. Decoding and verifying inside each already-running replica
+    avoids serializing all token lists back to one process and then leaving the
+    allocated GPUs idle during single-core verification.
+    """
+    if len(results) != len(metadata):
+        raise ValueError(f"Continuation results and metadata differ in length ({len(results)} != {len(metadata)}).")
+    reduced: list[dict[str, Any]] = []
+    for candidates, (rollout_prefix, ground_truth, verifier_name) in zip(results, metadata, strict=True):
+        full_responses = [
+            _decode_full_continuation(tokenizer, rollout_prefix, candidate["token_ids"]) for candidate in candidates
+        ]
+        correct = sum(_verify(response, ground_truth, verifier_name) for response in full_responses)
+        item: dict[str, Any] = {"mc_value": correct / max(len(full_responses), 1)}
+        if keep_continuation_texts:
+            item["continuation_texts"] = full_responses
+        reduced.append(item)
+    return reduced
 
 
 def _fixed_probe_positions(
@@ -752,6 +815,7 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
     continuation_prompts: list[list[int]] = []
     continuation_max_tokens: list[int] = []
     continuation_indices: list[tuple[int, int]] = []  # (row_idx, probe_idx)
+    continuation_metadata: list[tuple[list[int], str, str]] = []
     for orig_idx, cands, verdicts in kept:
         gt = ground_truths[orig_idx]
         prompt = prompts[orig_idx]
@@ -815,9 +879,11 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
             row_idx = len(rows)
             rows.append(row)
             for p_idx, t in enumerate(probe_positions):
+                rollout_prefix = main["token_ids"][:t]
                 continuation_prompts.append(_actor_state_token_ids(main["prompt_token_ids"], main["token_ids"], t))
                 continuation_max_tokens.append(cfg.max_response_length - t)
                 continuation_indices.append((row_idx, p_idx))
+                continuation_metadata.append((rollout_prefix, gt, cfg.verifier_name))
 
     # Compute MC values per probe by generating 32 continuations in one big vLLM batch.
     if continuation_prompts:
@@ -835,17 +901,13 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
             tensor_parallel_size=cfg.tensor_parallel_size,
             data_parallel_size=cfg.data_parallel_size,
             gpu_memory_utilization=cfg.gpu_memory_utilization,
+            mc_continuation_metadata=continuation_metadata,
+            keep_continuation_texts=cfg.keep_continuation_texts,
         )
-        for (row_idx, p_idx), cands in zip(continuation_indices, conts):
-            gt = rows[row_idx]["ground_truth"]
-            probe = rows[row_idx]["probe_positions"][p_idx]
-            rollout_prefix = rows[row_idx]["rollout_tokens"][:probe]
-            full_responses = [_decode_full_continuation(tokenizer, rollout_prefix, c["token_ids"]) for c in cands]
-            verdicts = [_verify(response, gt, rows[row_idx]["verifier_name"]) for response in full_responses]
-            mc = sum(1 for v in verdicts if v) / max(len(verdicts), 1)
-            rows[row_idx]["mc_values"].append(float(mc))
+        for (row_idx, _p_idx), result in zip(continuation_indices, conts, strict=True):
+            rows[row_idx]["mc_values"].append(float(result["mc_value"]))
             if cfg.keep_continuation_texts:
-                rows[row_idx].setdefault("continuation_texts", []).append(full_responses)
+                rows[row_idx].setdefault("continuation_texts", []).append(result["continuation_texts"])
 
     pathlib.Path(os.path.dirname(cfg.output_path) or ".").mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_parquet(cfg.output_path, index=False)

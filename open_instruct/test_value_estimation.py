@@ -850,6 +850,42 @@ esac
         self.assertEqual(decoded, "10:11:12:13")
         self.assertEqual(tokenizer.skip_special_tokens_calls, [True])
 
+    def test_mc_continuations_are_reduced_to_values_before_replica_ipc(self):
+        tokenizer = _FakeTokenizer()
+        results = [[{"token_ids": [12]}, {"token_ids": [13]}], [{"token_ids": [22]}, {"token_ids": [23]}]]
+        metadata = [([10, 11], "first", "math"), ([20, 21], "second", "math")]
+
+        with mock.patch.object(
+            value_estimation,
+            "_verify",
+            side_effect=lambda response, ground_truth, _verifier: response.endswith("12")
+            or (ground_truth == "second" and response.endswith("23")),
+        ):
+            reduced = value_estimation._reduce_mc_continuation_results(
+                results, metadata, tokenizer=tokenizer, keep_continuation_texts=True
+            )
+
+        self.assertEqual([item["mc_value"] for item in reduced], [0.5, 0.5])
+        self.assertEqual(
+            [item["continuation_texts"] for item in reduced], [["10:11:12", "10:11:13"], ["20:21:22", "20:21:23"]]
+        )
+        self.assertEqual(tokenizer.skip_special_tokens_calls, [True] * 4)
+
+    def test_mc_continuation_metadata_must_align_with_prompts(self):
+        with self.assertRaisesRegex(ValueError, "one item per prompt"):
+            value_estimation._run_rollouts(
+                ["one", "two"],
+                model_name_or_path="model",
+                n=2,
+                temperature=1.0,
+                top_p=1.0,
+                max_tokens=8,
+                tensor_parallel_size=1,
+                data_parallel_size=1,
+                gpu_memory_utilization=0.9,
+                mc_continuation_metadata=[([], "answer", "math")],
+            )
+
     def test_sampled_eos_does_not_define_remaining_horizon(self):
         positions = value_estimation._fixed_probe_positions(
             rollout_length=1000,
