@@ -1057,6 +1057,60 @@ class TestGenerativeValueScoreComparison(unittest.TestCase):
         self.assertAlmostEqual(summary["problem_balanced_mse_delta_candidate_minus_baseline"], 0.0)
         self.assertEqual(len(summary["problem_cluster_bootstrap_95pct_ci"]), 2)
 
+    def test_metrics_report_score_scale_coverage_and_calibration(self):
+        rows = [
+            {
+                "problem": "a",
+                "rollout_is_correct": True,
+                "state_kind": "intermediate",
+                "trajectory_band": "early",
+                "absolute_prefix_band": "lt_1024",
+                "target": 0.0,
+                "prediction": 0.3,
+            },
+            {
+                "problem": "a",
+                "rollout_is_correct": False,
+                "state_kind": "intermediate",
+                "trajectory_band": "early",
+                "absolute_prefix_band": "lt_1024",
+                "target": 0.1,
+                "prediction": 0.3,
+            },
+            {
+                "problem": "b",
+                "rollout_is_correct": True,
+                "state_kind": "intermediate",
+                "trajectory_band": "late",
+                "absolute_prefix_band": "2048_4095",
+                "target": 1.0,
+                "prediction": 0.9,
+            },
+            {
+                "problem": "b",
+                "rollout_is_correct": False,
+                "state_kind": "intermediate",
+                "trajectory_band": "late",
+                "absolute_prefix_band": "2048_4095",
+                "target": 0.5,
+                "prediction": None,
+            },
+        ]
+
+        metrics = compare_gen_value_scores._metrics(rows)
+
+        self.assertEqual(metrics["prediction_decile_coverage"], 2.0)
+        self.assertEqual(metrics["prediction_decile_3_examples"], 2.0)
+        self.assertEqual(metrics["prediction_decile_9_examples"], 1.0)
+        self.assertAlmostEqual(metrics["target_decile_0_calibration_bias"], 0.3)
+        self.assertAlmostEqual(metrics["target_decile_1_calibration_bias"], 0.2)
+        self.assertAlmostEqual(metrics["target_decile_10_calibration_bias"], -0.1)
+        self.assertEqual(metrics["target_decile_5_penalized_mse"], 1.0)
+
+    def test_score_scale_metrics_reject_out_of_range_values(self):
+        with self.assertRaisesRegex(ValueError, "normalized score"):
+            compare_gen_value_scores._score_scale_metrics([{"target": 0.0, "prediction": 1.1}])
+
     def test_auc_is_problem_balanced_and_restricted_to_real_selection_pairs(self):
         rows = [
             {

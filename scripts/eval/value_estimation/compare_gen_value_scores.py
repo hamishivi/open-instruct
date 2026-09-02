@@ -114,6 +114,53 @@ def _spearman_correlation(left: list[float], right: list[float]) -> float | None
     return float(np.corrcoef(left_ranks, right_ranks)[0, 1])
 
 
+def _quantized_decile(value: float) -> int:
+    """Map a normalized value to the direct-MC critic's integer score."""
+    if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ValueError(f"Expected a finite normalized score in [0, 1], got {value}.")
+    return int(np.floor(value * 10.0 + 0.5))
+
+
+def _score_scale_metrics(rows: list[dict[str, Any]]) -> dict[str, float | None]:
+    """Report use and calibration of the critic's discrete 0--10 score scale."""
+    parsed_rows = [row for row in rows if row["prediction"] is not None]
+    prediction_counts = np.zeros(11, dtype=np.int64)
+    for row in parsed_rows:
+        prediction_counts[_quantized_decile(float(row["prediction"]))] += 1
+
+    metrics: dict[str, float | None] = {
+        "prediction_decile_coverage": float(np.count_nonzero(prediction_counts)),
+    }
+    if parsed_rows:
+        probabilities = prediction_counts[prediction_counts > 0] / len(parsed_rows)
+        metrics["prediction_decile_entropy_bits"] = float(-np.sum(probabilities * np.log2(probabilities)))
+    else:
+        metrics["prediction_decile_entropy_bits"] = None
+
+    for decile in range(11):
+        metrics[f"prediction_decile_{decile}_examples"] = float(prediction_counts[decile])
+        target_group = [row for row in rows if _quantized_decile(float(row["target"])) == decile]
+        parsed_target_group = [row for row in target_group if row["prediction"] is not None]
+        prefix = f"target_decile_{decile}"
+        metrics[f"{prefix}_examples"] = float(len(target_group))
+        if parsed_target_group:
+            target_mean = float(np.mean([row["target"] for row in parsed_target_group]))
+            prediction_mean = float(np.mean([row["prediction"] for row in parsed_target_group]))
+            metrics[f"{prefix}_target_mean"] = target_mean
+            metrics[f"{prefix}_prediction_mean"] = prediction_mean
+            metrics[f"{prefix}_calibration_bias"] = prediction_mean - target_mean
+        else:
+            metrics[f"{prefix}_target_mean"] = None
+            metrics[f"{prefix}_prediction_mean"] = None
+            metrics[f"{prefix}_calibration_bias"] = None
+        errors = [
+            1.0 if row["prediction"] is None else (row["prediction"] - row["target"]) ** 2
+            for row in target_group
+        ]
+        metrics[f"{prefix}_penalized_mse"] = float(np.mean(errors)) if errors else None
+    return metrics
+
+
 def _mc_selection_metrics(
     rows: list[dict[str, Any]], *, trajectory_band: str | None
 ) -> dict[str, float | None]:
@@ -204,6 +251,7 @@ def _metrics(rows: list[dict[str, Any]]) -> dict[str, float | None]:
         )
     else:
         metrics["spearman"] = None
+    metrics.update(_score_scale_metrics(rows))
 
     for state_kind in ("final_action", "intermediate"):
         for outcome_name, outcome in (("correct", True), ("incorrect", False)):
