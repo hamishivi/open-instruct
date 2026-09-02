@@ -27,6 +27,7 @@ if [[ "${GEN_VALUE_CONDITIONING}" != "none" && "${GEN_VALUE_CONDITIONING}" != "g
 fi
 
 PYTHON_EXECUTABLE="${PYTHON_EXECUTABLE:-python}"
+BASH_EXECUTABLE="${BASH_EXECUTABLE:-bash}"
 HELDOUT_PROBLEM_COUNT="${HELDOUT_PROBLEM_COUNT:-80}"
 SPLIT_SEED="${SPLIT_SEED:-37}"
 NUM_GPUS="${NUM_GPUS:-4}"
@@ -55,7 +56,7 @@ VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION}" \
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN}" \
 GEN_VALUE_MAX_NEW_TOKENS="${GEN_VALUE_MAX_NEW_TOKENS}" \
 RUN_NAME="baseline" \
-bash scripts/eval/value_estimation/score_generative_value.sh \
+"${BASH_EXECUTABLE}" scripts/eval/value_estimation/score_generative_value.sh \
     "${MODEL_PATH}" "${HELDOUT_PARQUET}" "${BASELINE_SCORE}" "${GEN_VALUE_CONDITIONING}"
 
 MC_VALUE_PARQUET="${TRAIN_PARQUET}" \
@@ -69,7 +70,7 @@ GEN_VALUE_CONDITIONING="${GEN_VALUE_CONDITIONING}" \
 MC_SFT_JSONL="${EXPERIMENT_ROOT}/data/train.jsonl" \
 OUTPUT_DIR="${SFT_OUTPUT_DIR}" \
 EXP_NAME="${EXP_NAME:-genac-math-current-policy-direct-mc-sft}" \
-bash scripts/train/debug/genac_math_mc_value_sft_h200.sh
+"${BASH_EXECUTABLE}" scripts/train/debug/genac_math_mc_value_sft_h200.sh
 
 shopt -s nullglob
 candidate_models=("${SFT_OUTPUT_DIR}"/epoch_*_model)
@@ -87,7 +88,7 @@ for candidate_model in "${candidate_models[@]}"; do
     VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN}" \
     GEN_VALUE_MAX_NEW_TOKENS="${GEN_VALUE_MAX_NEW_TOKENS}" \
     RUN_NAME="${candidate_name}" \
-    bash scripts/eval/value_estimation/score_generative_value.sh \
+    "${BASH_EXECUTABLE}" scripts/eval/value_estimation/score_generative_value.sh \
         "${candidate_model}" "${HELDOUT_PARQUET}" "${candidate_score}" "${GEN_VALUE_CONDITIONING}"
     "${PYTHON_EXECUTABLE}" scripts/eval/value_estimation/compare_gen_value_scores.py \
         --baseline "${BASELINE_SCORE}" \

@@ -123,6 +123,101 @@ class TestValueEstimationStates(unittest.TestCase):
             self.assertEqual(arguments[threshold_index + 1], "3072")
             self.assertEqual(arguments[fraction_index + 1], "0.15")
 
+    def test_mc_sft_holdout_pipeline_preserves_conditioning_and_scores_every_epoch(self):
+        repository_root = pathlib.Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory(prefix="gen-value-holdout-pipeline-") as directory:
+            test_root = pathlib.Path(directory)
+            source_parquet = test_root / "source.parquet"
+            model_path = test_root / "model"
+            experiment_root = test_root / "experiment"
+            call_log = test_root / "calls.log"
+            fake_python = test_root / "fake-python"
+            fake_bash = test_root / "fake-bash"
+            source_parquet.touch()
+            model_path.mkdir()
+            fake_python.write_text(
+                """#!/bin/sh
+set -eu
+printf 'python' >> "$CALL_LOG"
+printf ' <%s>' "$@" >> "$CALL_LOG"
+printf '\n' >> "$CALL_LOG"
+case "$1" in
+*split_gen_value_mc_dataset.py)
+    shift
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+        --train_output) train_output="$2"; shift 2 ;;
+        --heldout_output) heldout_output="$2"; shift 2 ;;
+        *) shift ;;
+        esac
+    done
+    : > "$train_output"
+    : > "$heldout_output"
+    ;;
+*compare_gen_value_scores.py)
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = --output_json ]; then
+            : > "$2"
+            break
+        fi
+        shift
+    done
+    ;;
+esac
+"""
+            )
+            fake_bash.write_text(
+                """#!/bin/sh
+set -eu
+printf 'bash' >> "$CALL_LOG"
+printf ' <%s>' "$@" >> "$CALL_LOG"
+printf '\n' >> "$CALL_LOG"
+case "$1" in
+*score_generative_value.sh)
+    [ "$5" = gt ]
+    : > "$4"
+    ;;
+*genac_math_mc_value_sft_h200.sh)
+    [ "$GEN_VALUE_CONDITIONING" = gt ]
+    [ "$MIN_LONG_PREFIX_FRACTION" = 0.15 ]
+    mkdir -p "$OUTPUT_DIR/epoch_1_model" "$OUTPUT_DIR/epoch_2_model"
+    ;;
+*) exit 97 ;;
+esac
+"""
+            )
+            fake_python.chmod(0o755)
+            fake_bash.chmod(0o755)
+            environment = {
+                **os.environ,
+                "MC_VALUE_PARQUET": str(source_parquet),
+                "MODEL_PATH": str(model_path),
+                "EXPERIMENT_ROOT": str(experiment_root),
+                "GEN_VALUE_CONDITIONING": "gt",
+                "PYTHON_EXECUTABLE": str(fake_python),
+                "BASH_EXECUTABLE": str(fake_bash),
+                "CALL_LOG": str(call_log),
+            }
+
+            result = subprocess.run(
+                ["/bin/bash", "scripts/eval/value_estimation/run_genac_mc_sft_holdout_h200.sh"],
+                cwd=repository_root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = call_log.read_text().splitlines()
+            self.assertEqual(sum("score_generative_value.sh" in call for call in calls), 3)
+            self.assertEqual(sum("genac_math_mc_value_sft_h200.sh" in call for call in calls), 1)
+            self.assertEqual(sum("compare_gen_value_scores.py" in call for call in calls), 2)
+            self.assertTrue((experiment_root / "data/train.parquet").is_file())
+            self.assertTrue((experiment_root / "data/heldout.parquet").is_file())
+            self.assertTrue((experiment_root / "comparisons/epoch_1_model.json").is_file())
+            self.assertTrue((experiment_root / "comparisons/epoch_2_model.json").is_file())
+
     def test_trace_sft_can_target_prefix_states_without_discarding_other_kinds_by_default(self):
         examples = [{"id": "early", "state_kind": "segment_start"}, {"id": "terminal", "state_kind": "final_action"}]
 
