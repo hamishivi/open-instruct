@@ -98,6 +98,20 @@ JOINT_TRAINING_STEPS="${JOINT_TRAINING_STEPS:-300}"
 VALUE_WARMUP_STEPS="${VALUE_WARMUP_STEPS:-0}"
 NUM_UNIQUE_PROMPTS_ROLLOUT="${NUM_UNIQUE_PROMPTS_ROLLOUT:-32}"
 NUM_SAMPLES_PER_PROMPT_ROLLOUT="${NUM_SAMPLES_PER_PROMPT_ROLLOUT:-8}"
+NUM_POLICY_LEARNERS="${NUM_POLICY_LEARNERS:-1}"
+NUM_POLICY_VLLM_ENGINES="${NUM_POLICY_VLLM_ENGINES:-1}"
+POLICY_LEARNING_RATE="${POLICY_LEARNING_RATE:-5e-7}"
+POLICY_WEIGHT_DECAY="${POLICY_WEIGHT_DECAY:-0.01}"
+POLICY_BETA="${POLICY_BETA:-0.01}"
+NUM_EPOCHS="${NUM_EPOCHS:-2}"
+ACTIVE_SAMPLING="${ACTIVE_SAMPLING:-false}"
+FILTER_ZERO_STD_SAMPLES="${FILTER_ZERO_STD_SAMPLES:-false}"
+INFLIGHT_UPDATES="${INFLIGHT_UPDATES:-false}"
+ASYNC_STEPS="${ASYNC_STEPS:-1}"
+NO_RESAMPLING_PASS_RATE="${NO_RESAMPLING_PASS_RATE:-none}"
+TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP="${TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP:-0.0}"
+USE_VLLM_LOGPROBS="${USE_VLLM_LOGPROBS:-true}"
+DEEPSPEED_OFFLOAD_OPTIMIZER="${DEEPSPEED_OFFLOAD_OPTIMIZER:-true}"
 
 if [[ ! "${JOINT_TRAINING_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: JOINT_TRAINING_STEPS must be at least 1" >&2
@@ -139,6 +153,36 @@ if [[ ! "${NUM_SAMPLES_PER_PROMPT_ROLLOUT}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: NUM_SAMPLES_PER_PROMPT_ROLLOUT must be a positive integer" >&2
     exit 1
 fi
+if [[ ! "${NUM_POLICY_LEARNERS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: NUM_POLICY_LEARNERS must be a positive integer" >&2
+    exit 1
+fi
+if [[ ! "${NUM_POLICY_VLLM_ENGINES}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: NUM_POLICY_VLLM_ENGINES must be a positive integer" >&2
+    exit 1
+fi
+if [[ ! "${NUM_EPOCHS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: NUM_EPOCHS must be a positive integer" >&2
+    exit 1
+fi
+if [[ ! "${ASYNC_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: ASYNC_STEPS must be a positive integer" >&2
+    exit 1
+fi
+for bool_var in ACTIVE_SAMPLING FILTER_ZERO_STD_SAMPLES INFLIGHT_UPDATES USE_VLLM_LOGPROBS DEEPSPEED_OFFLOAD_OPTIMIZER; do
+    case "${!bool_var}" in
+        true | false)
+            ;;
+        *)
+            echo "ERROR: ${bool_var} must be true or false" >&2
+            exit 1
+            ;;
+    esac
+done
+if [[ "${ACTIVE_SAMPLING}" == "true" && "${FILTER_ZERO_STD_SAMPLES}" != "true" ]]; then
+    echo "ERROR: ACTIVE_SAMPLING=true requires FILTER_ZERO_STD_SAMPLES=true" >&2
+    exit 1
+fi
 GEN_VALUE_TRAIN_TARGET_ARGS=()
 if ((GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE > 0)); then
     GEN_VALUE_TRAIN_TARGET_ARGS+=(
@@ -155,6 +199,18 @@ case "${GEN_VALUE_MIN_ADVANTAGE_GAP,,}" in
         )
         ;;
 esac
+NO_RESAMPLING_ARGS=()
+if [[ "${NO_RESAMPLING_PASS_RATE}" != "none" ]]; then
+    NO_RESAMPLING_ARGS+=(--no_resampling_pass_rate "${NO_RESAMPLING_PASS_RATE}")
+fi
+VLLM_LOGPROB_ARGS=()
+if [[ "${USE_VLLM_LOGPROBS}" == "true" ]]; then
+    VLLM_LOGPROB_ARGS+=(--use_vllm_logprobs)
+fi
+DEEPSPEED_OFFLOAD_ARGS=()
+if [[ "${DEEPSPEED_OFFLOAD_OPTIMIZER}" == "true" ]]; then
+    DEEPSPEED_OFFLOAD_ARGS+=(--deepspeed_offload_optimizer)
+fi
 TOTAL_TRAINING_STEPS=$((VALUE_WARMUP_STEPS + JOINT_TRAINING_STEPS))
 TOTAL_EPISODES=$((TOTAL_TRAINING_STEPS * NUM_UNIQUE_PROMPTS_ROLLOUT * NUM_SAMPLES_PER_PROMPT_ROLLOUT))
 
@@ -173,37 +229,38 @@ python open_instruct/grpo_fast_genvalue.py \
     --per_device_train_batch_size 1 \
     --num_unique_prompts_rollout "${NUM_UNIQUE_PROMPTS_ROLLOUT}" \
     --num_samples_per_prompt_rollout "${NUM_SAMPLES_PER_PROMPT_ROLLOUT}" \
-    --active_sampling false \
-    --filter_zero_std_samples false \
+    --active_sampling "${ACTIVE_SAMPLING}" \
+    --filter_zero_std_samples "${FILTER_ZERO_STD_SAMPLES}" \
+    "${NO_RESAMPLING_ARGS[@]}" \
     --model_name_or_path Qwen/Qwen3-4B-Base \
     --chat_template_name qwen_instruct_user_boxed_math \
     --temperature 1.0 \
     --apply_verifiable_reward true \
     --verification_reward 1.0 \
     --non_stop_penalty false \
-    --beta 0.01 \
+    --beta "${POLICY_BETA}" \
     --loss_fn dapo \
     --clip_higher 0.272 \
-    --use_vllm_logprobs \
-    --truncated_importance_sampling_ratio_cap 0.0 \
+    "${VLLM_LOGPROB_ARGS[@]}" \
+    --truncated_importance_sampling_ratio_cap "${TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP}" \
     --advantage_normalization_type centered \
-    --learning_rate 5e-7 \
-    --weight_decay 0.01 \
+    --learning_rate "${POLICY_LEARNING_RATE}" \
+    --weight_decay "${POLICY_WEIGHT_DECAY}" \
     --lr_scheduler_type constant \
     --total_episodes "${TOTAL_EPISODES}" \
-    --num_epochs 2 \
+    --num_epochs "${NUM_EPOCHS}" \
     --num_mini_batches 1 \
     --deepspeed_stage 3 \
-    --deepspeed_offload_optimizer \
-    --num_learners_per_node 1 \
+    "${DEEPSPEED_OFFLOAD_ARGS[@]}" \
+    --num_learners_per_node "${NUM_POLICY_LEARNERS}" \
     --sequence_parallel_size 1 \
-    --vllm_num_engines 1 \
+    --vllm_num_engines "${NUM_POLICY_VLLM_ENGINES}" \
     --vllm_tensor_parallel_size 1 \
     --vllm_gpu_memory_utilization 0.85 \
     --vllm_top_p 1.0 \
     --vllm_enable_prefix_caching \
-    --inflight_updates false \
-    --async_steps 1 \
+    --inflight_updates "${INFLIGHT_UPDATES}" \
+    --async_steps "${ASYNC_STEPS}" \
     --seed 1 \
     --local_eval_every 25 \
     --eval_on_step_0 true \
