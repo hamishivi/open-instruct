@@ -967,6 +967,46 @@ def _bucketed_prediction_metrics(
     return metrics
 
 
+def _bucketed_absolute_prefix_metrics(
+    predictions: Sequence[float | None], targets: Sequence[float], prefix_token_counts: Sequence[int]
+) -> dict[str, float]:
+    """Summarize critic quality in fixed absolute response-prefix length bands.
+
+    Fractional trajectory and horizon bands answer useful but different questions:
+    a state 2,500 tokens into a short trajectory is late by trajectory fraction but
+    still exercises the long-prefix regime seen by the online critic. Fixed bands
+    make held-out evaluation sensitive to that regime directly.
+    """
+    if len(predictions) != len(targets) or len(predictions) != len(prefix_token_counts):
+        raise ValueError(
+            "Predictions, targets, and prefix token counts must have the same length "
+            f"({len(predictions)}, {len(targets)}, {len(prefix_token_counts)})."
+        )
+
+    buckets = {
+        "lt_1024": [index for index, count in enumerate(prefix_token_counts) if int(count) < 1024],
+        "1024_2047": [index for index, count in enumerate(prefix_token_counts) if 1024 <= int(count) < 2048],
+        "2048_4095": [index for index, count in enumerate(prefix_token_counts) if 2048 <= int(count) < 4096],
+        "ge_4096": [index for index, count in enumerate(prefix_token_counts) if int(count) >= 4096],
+    }
+    metrics: dict[str, float] = {}
+    for name, indices in buckets.items():
+        if not indices:
+            continue
+        bucket_predictions = [predictions[index] for index in indices]
+        bucket_targets = [float(targets[index]) for index in indices]
+        bucket_metrics = _prediction_group_metrics(bucket_predictions, bucket_targets, prefix=f"prefix_tokens_{name}")
+        # Match the fractional bucket convention: expose the target mean over
+        # parsed examples as mc_mean while keeping parse failures explicit.
+        target_mean_key = f"prefix_tokens_{name}_target_mean"
+        parsed_target_mean_key = f"prefix_tokens_{name}_parsed_target_mean"
+        bucket_metrics.pop(target_mean_key)
+        if parsed_target_mean_key in bucket_metrics:
+            bucket_metrics[f"prefix_tokens_{name}_mc_mean"] = bucket_metrics.pop(parsed_target_mean_key)
+        metrics.update(bucket_metrics)
+    return metrics
+
+
 def score_dataset(cfg: ScoreDatasetConfig) -> str:
     import pandas as pd  # noqa: PLC0415
 
@@ -1004,6 +1044,7 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
     all_mc: list[float] = []
     all_horizon_fractions: list[float] = []
     all_trajectory_fractions: list[float] = []
+    all_prefix_token_counts: list[int] = []
     grouped_predictions: dict[str, list[float | None]] = {
         "final_action_correct": [],
         "final_action_incorrect": [],
@@ -1045,6 +1086,7 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
             trajectory_fraction = int(pos) / max(rollout_length - 1, 1)
             all_horizon_fractions.append(horizon_fraction)
             all_trajectory_fractions.append(trajectory_fraction)
+            all_prefix_token_counts.append(int(pos))
             if prediction is not None:
                 if is_correct:
                     correct_preds.append(prediction)
@@ -1111,6 +1153,7 @@ def score_dataset(cfg: ScoreDatasetConfig) -> str:
         # response can be early in the former sense and late in the latter, so
         # reporting only one view can hide the prefix-ranking failure we care about.
         metrics.update(_bucketed_prediction_metrics(all_preds, all_mc, all_trajectory_fractions, prefix="trajectory"))
+        metrics.update(_bucketed_absolute_prefix_metrics(all_preds, all_mc, all_prefix_token_counts))
 
     if correct_preds:
         metrics["correct_pred_mean"] = float(np.mean(correct_preds))

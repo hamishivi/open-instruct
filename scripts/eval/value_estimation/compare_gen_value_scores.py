@@ -40,6 +40,16 @@ def _trajectory_band(position: int, final_position: int) -> str:
     return "late"
 
 
+def _absolute_prefix_band(position: int) -> str:
+    if position < 1024:
+        return "lt_1024"
+    if position < 2048:
+        return "1024_2047"
+    if position < 4096:
+        return "2048_4095"
+    return "ge_4096"
+
+
 def _flatten_scores(path: pathlib.Path) -> dict[tuple[str, bool, str, int], dict[str, Any]]:
     frame = pd.read_parquet(path)
     required = {"problem", "rollout_tokens", "rollout_is_correct", "probe_positions", "mc_values", "predicted_values"}
@@ -67,6 +77,7 @@ def _flatten_scores(path: pathlib.Path) -> dict[tuple[str, bool, str, int], dict
                 "rollout_is_correct": is_correct,
                 "state_kind": state_kind,
                 "trajectory_band": _trajectory_band(position, final_position),
+                "absolute_prefix_band": _absolute_prefix_band(position),
                 "target": float(target),
                 "prediction": _optional_float(prediction),
             }
@@ -257,6 +268,26 @@ def _metrics(rows: list[dict[str, Any]]) -> dict[str, float | None]:
         band_suffix = "" if trajectory_band is None else f"_{trajectory_band}"
         for name, value in selection_metrics.items():
             metrics[f"intermediate_mc_selection{band_suffix}_{name}"] = value
+
+    for prefix_band in ("lt_1024", "1024_2047", "2048_4095", "ge_4096"):
+        group = [row for row in rows if row["absolute_prefix_band"] == prefix_band]
+        if not group:
+            continue
+        parsed_group = [row for row in group if row["prediction"] is not None]
+        penalized_errors = [
+            1.0 if row["prediction"] is None else (row["prediction"] - row["target"]) ** 2 for row in group
+        ]
+        metric_prefix = f"absolute_prefix_{prefix_band}"
+        metrics[f"{metric_prefix}_examples"] = float(len(group))
+        metrics[f"{metric_prefix}_parse_rate"] = float(len(parsed_group) / len(group))
+        metrics[f"{metric_prefix}_penalized_mse"] = float(np.mean(penalized_errors))
+        metrics[f"{metric_prefix}_target_mean"] = float(np.mean([row["target"] for row in group]))
+        metrics[f"{metric_prefix}_prediction_mean"] = (
+            float(np.mean([row["prediction"] for row in parsed_group])) if parsed_group else None
+        )
+        selection_metrics = _mc_selection_metrics(group, trajectory_band=None)
+        for name, value in selection_metrics.items():
+            metrics[f"{metric_prefix}_mc_selection_{name}"] = value
     return metrics
 
 

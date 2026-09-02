@@ -780,6 +780,24 @@ class TestValueEstimationStates(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "same length"):
             value_estimation._bucketed_prediction_metrics([0.1], [0.0], [], prefix="trajectory")
 
+    def test_absolute_prefix_metrics_use_fixed_token_bands_and_penalize_parse_failures(self):
+        metrics = value_estimation._bucketed_absolute_prefix_metrics(
+            [0.1, 0.5, None, 0.9], [0.0, 0.5, 1.0, 1.0], [100, 1024, 2048, 4096]
+        )
+
+        self.assertEqual(metrics["prefix_tokens_lt_1024_examples"], 1.0)
+        self.assertAlmostEqual(metrics["prefix_tokens_lt_1024_mse"], 0.01)
+        self.assertEqual(metrics["prefix_tokens_1024_2047_examples"], 1.0)
+        self.assertAlmostEqual(metrics["prefix_tokens_1024_2047_mc_mean"], 0.5)
+        self.assertEqual(metrics["prefix_tokens_2048_4095_parse_rate"], 0.0)
+        self.assertEqual(metrics["prefix_tokens_2048_4095_penalized_mse"], 1.0)
+        self.assertEqual(metrics["prefix_tokens_ge_4096_examples"], 1.0)
+        self.assertAlmostEqual(metrics["prefix_tokens_ge_4096_mse"], 0.01)
+
+    def test_absolute_prefix_metrics_reject_length_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "same length"):
+            value_estimation._bucketed_absolute_prefix_metrics([0.1], [0.0], [])
+
 
 class TestGenerativeValueScoreComparison(unittest.TestCase):
     def test_auc_is_problem_balanced_and_restricted_to_real_selection_pairs(self):
@@ -789,6 +807,7 @@ class TestGenerativeValueScoreComparison(unittest.TestCase):
                 "rollout_is_correct": True,
                 "state_kind": "intermediate",
                 "trajectory_band": "early",
+                "absolute_prefix_band": "lt_1024",
                 "target": 0.2,
                 "prediction": 0.6,
             },
@@ -797,6 +816,7 @@ class TestGenerativeValueScoreComparison(unittest.TestCase):
                 "rollout_is_correct": False,
                 "state_kind": "intermediate",
                 "trajectory_band": "early",
+                "absolute_prefix_band": "lt_1024",
                 "target": 0.8,
                 "prediction": 0.5,
             },
@@ -805,6 +825,7 @@ class TestGenerativeValueScoreComparison(unittest.TestCase):
                 "rollout_is_correct": True,
                 "state_kind": "intermediate",
                 "trajectory_band": "early",
+                "absolute_prefix_band": "2048_4095",
                 "target": 0.9,
                 "prediction": 0.2,
             },
@@ -813,6 +834,7 @@ class TestGenerativeValueScoreComparison(unittest.TestCase):
                 "rollout_is_correct": False,
                 "state_kind": "intermediate",
                 "trajectory_band": "early",
+                "absolute_prefix_band": "2048_4095",
                 "target": 0.1,
                 "prediction": 0.1,
             },
@@ -835,6 +857,10 @@ class TestGenerativeValueScoreComparison(unittest.TestCase):
         self.assertAlmostEqual(metrics["intermediate_mc_selection_gain_over_random"], 0.05)
         self.assertEqual(metrics["intermediate_mc_selection_problems"], 2.0)
         self.assertEqual(metrics["intermediate_mc_selection_pairs"], 2.0)
+        self.assertEqual(metrics["absolute_prefix_lt_1024_examples"], 2.0)
+        self.assertAlmostEqual(metrics["absolute_prefix_lt_1024_mc_selection_accuracy"], 0.0)
+        self.assertEqual(metrics["absolute_prefix_2048_4095_examples"], 2.0)
+        self.assertAlmostEqual(metrics["absolute_prefix_2048_4095_mc_selection_accuracy"], 1.0)
 
 
 if __name__ == "__main__":
