@@ -335,9 +335,7 @@ def test_actor_values_and_reinforce_samples_use_independent_temperatures(monkeyp
     trainer = object.__new__(trainer_cls)
     trainer._gen_value_version = 7
     trainer.args = SimpleNamespace(
-        gen_value_max_new_tokens=16,
-        gen_value_temperature=1.0,
-        gen_value_inference_temperature=0.0,
+        gen_value_max_new_tokens=16, gen_value_temperature=1.0, gen_value_inference_temperature=0.0
     )
 
     engine = MagicMock()
@@ -366,9 +364,7 @@ def test_matching_critic_temperatures_reuse_one_completion(monkeypatch):
     trainer = object.__new__(trainer_cls)
     trainer._gen_value_version = 3
     trainer.args = SimpleNamespace(
-        gen_value_max_new_tokens=16,
-        gen_value_temperature=0.7,
-        gen_value_inference_temperature=None,
+        gen_value_max_new_tokens=16, gen_value_temperature=0.7, gen_value_inference_temperature=None
     )
 
     engine = MagicMock()
@@ -396,9 +392,7 @@ def test_critic_pool_shards_round_robin_and_restores_request_order(monkeypatch):
     trainer = object.__new__(trainer_cls)
     trainer._gen_value_version = 11
     trainer.args = SimpleNamespace(
-        gen_value_max_new_tokens=16,
-        gen_value_temperature=0.0,
-        gen_value_inference_temperature=0.0,
+        gen_value_max_new_tokens=16, gen_value_temperature=0.0, gen_value_inference_temperature=0.0
     )
 
     engines = []
@@ -413,20 +407,11 @@ def test_critic_pool_shards_round_robin_and_restores_request_order(monkeypatch):
         return torch.zeros(len(outputs)), [{"prompt": output, "request": request} for output in outputs]
 
     trainer._finish_gen_value_scoring_request = MethodType(finish, trainer)
-    requests = [
-        {"prompts": [f"p{i}" for i in range(7)]},
-        {"prompts": [f"p{i}" for i in range(7, 12)]},
-    ]
+    requests = [{"prompts": [f"p{i}" for i in range(7)]}, {"prompts": [f"p{i}" for i in range(7, 12)]}]
 
     results = trainer._score_gen_value_requests(requests)
 
-    expected_buckets = [
-        ["p0", "p5", "p10"],
-        ["p1", "p6", "p11"],
-        ["p2", "p7"],
-        ["p3", "p8"],
-        ["p4", "p9"],
-    ]
+    expected_buckets = [["p0", "p5", "p10"], ["p1", "p6", "p11"], ["p2", "p7"], ["p3", "p8"], ["p4", "p9"]]
     for engine, expected_prompts in zip(engines, expected_buckets, strict=True):
         engine.generate_request_outputs.remote.assert_called_once()
         assert engine.generate_request_outputs.remote.call_args.args[0] == expected_prompts
@@ -445,9 +430,7 @@ def test_gen_value_generation_progress_snapshot_does_not_wait(monkeypatch):
         def remote(self):
             return 4
 
-    trainer._gen_value_training_progress = SimpleNamespace(
-        get_latest_processed_policy_step=RemoteMethod()
-    )
+    trainer._gen_value_training_progress = SimpleNamespace(get_latest_processed_policy_step=RemoteMethod())
     monkeypatch.setattr(grpo_fast.ray, "get", lambda value: value)
 
     assert trainer._get_gen_value_processed_policy_step() == 4
@@ -534,9 +517,7 @@ def test_gen_value_reinforce_loop_trains_queued_batches_consecutively_freshest_f
     training_queue.put([make_rollout(1, 10), make_rollout(1, 11)])
     training_queue.put([make_rollout(2, 20), make_rollout(2, 21)])
 
-    monkeypatch.setattr(
-        "open_instruct.grpo_fast_genvalue.utils.ray_get_with_progress", lambda refs, **_: (refs, None)
-    )
+    monkeypatch.setattr("open_instruct.grpo_fast_genvalue.utils.ray_get_with_progress", lambda refs, **_: (refs, None))
     monkeypatch.setattr("open_instruct.grpo_fast_genvalue.ray.get", lambda value: value)
     monkeypatch.setattr(
         "open_instruct.grpo_fast_genvalue._wait_for_gen_value_publish_barrier", lambda *_args, **_kwargs: 0.0
@@ -648,9 +629,7 @@ def test_gen_value_checkpoint_hold_acknowledges_idle_trainer_until_release():
     result: list[float] = []
 
     waiter = threading.Thread(
-        target=lambda: result.append(
-            _hold_gen_value_training_for_checkpoint(pause_event, paused_event, stop_event)
-        )
+        target=lambda: result.append(_hold_gen_value_training_for_checkpoint(pause_event, paused_event, stop_event))
     )
     waiter.start()
 
@@ -671,8 +650,7 @@ def test_gen_value_checkpoint_hold_shutdown_releases_waiter():
     pause_event.set()
 
     waiter = threading.Thread(
-        target=_hold_gen_value_training_for_checkpoint,
-        args=(pause_event, paused_event, stop_event),
+        target=_hold_gen_value_training_for_checkpoint, args=(pause_event, paused_event, stop_event)
     )
     waiter.start()
 
@@ -687,9 +665,7 @@ def test_gen_value_checkpoint_hold_shutdown_releases_waiter():
 def test_gen_value_checkpoint_hold_is_noop_without_pause():
     paused_event = threading.Event()
 
-    wait_seconds = _hold_gen_value_training_for_checkpoint(
-        threading.Event(), paused_event, threading.Event()
-    )
+    wait_seconds = _hold_gen_value_training_for_checkpoint(threading.Event(), paused_event, threading.Event())
 
     assert wait_seconds == 0.0
     assert not paused_event.is_set()
@@ -869,6 +845,9 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
             "gen_value/source_policy_lag_min": 0,
             "gen_value/source_policy_lag_max": 1,
             "gen_value/discarded_stale_rollouts_since_update": 1,
+            "gen_value/candidate_optimizer_pairs/prefix_ge_4096_correct": 2,
+            "gen_value/selected_optimizer_pairs/prefix_ge_4096_correct": 2,
+            "gen_value/optimizer_inclusion_probability/prefix_ge_4096_correct": 1.0,
         },
         "REINFORCE",
     )
@@ -930,6 +909,9 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
             "gen_value/source_policy_lag_min": 1,
             "gen_value/source_policy_lag_max": 3,
             "gen_value/discarded_stale_rollouts_since_update": 2,
+            "gen_value/candidate_optimizer_pairs/prefix_ge_4096_correct": 6,
+            "gen_value/selected_optimizer_pairs/prefix_ge_4096_correct": 3,
+            "gen_value/optimizer_inclusion_probability/prefix_ge_4096_correct": 0.5,
         },
         "REINFORCE",
     )
@@ -992,6 +974,9 @@ def test_multiple_critic_updates_are_token_and_example_weighted():
     assert metrics["gen_value/source_policy_lag_min"] == 0
     assert metrics["gen_value/source_policy_lag_max"] == 3
     assert metrics["gen_value/discarded_stale_rollouts_since_update"] == 3
+    assert metrics["gen_value/candidate_optimizer_pairs/prefix_ge_4096_correct"] == 8
+    assert metrics["gen_value/selected_optimizer_pairs/prefix_ge_4096_correct"] == 5
+    assert metrics["gen_value/optimizer_inclusion_probability/prefix_ge_4096_correct"] == pytest.approx(0.625)
 
 
 def test_worker_async_queue_metrics_use_global_reductions():

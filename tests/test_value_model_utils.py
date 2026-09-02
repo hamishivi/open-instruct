@@ -179,6 +179,28 @@ def test_mark_gen_value_training_pairs_for_optimizer_stratifies_rare_long_succes
     )
     assert 0.0 < mean_probability < 1.0
 
+    metrics = value_model_utils.gen_value_optimizer_stratum_metrics(marked)
+    assert metrics["gen_value/candidate_optimizer_pairs/prefix_ge_4096_correct"] == 2
+    assert metrics["gen_value/selected_optimizer_pairs/prefix_ge_4096_correct"] == 2
+    assert metrics["gen_value/optimizer_inclusion_probability/prefix_ge_4096_correct"] == 1.0
+    assert metrics["gen_value/candidate_optimizer_pairs/prefix_lt_1024_incorrect"] == 12
+    assert metrics["gen_value/optimizer_inclusion_probability/prefix_lt_1024_incorrect"] < 1.0
+    assert metrics["gen_value/candidate_optimizer_pairs/final_action_correct"] == 0
+    assert metrics["gen_value/selected_optimizer_pairs/final_action_correct"] == 0
+
+
+def test_gen_value_optimizer_stratum_metrics_rejects_split_group_selection():
+    pairs = [
+        dict(
+            _pair([1], 1.0, state_kind="segment_start", response_tokens_used=5000),
+            _gen_value_optimizer_selected=selected,
+        )
+        for selected in (True, False)
+    ]
+
+    with pytest.raises(ValueError, match="disagree on optimizer selection"):
+        value_model_utils.gen_value_optimizer_stratum_metrics(pairs)
+
 
 def test_stratified_gen_value_optimizer_probabilities_preserve_full_objective_in_expectation():
     pairs = []
@@ -208,9 +230,7 @@ def test_stratified_gen_value_optimizer_probabilities_preserve_full_objective_in
             )
         )
 
-    assert sum(estimates) / len(estimates) == pytest.approx(
-        sum(pair["contribution"] for pair in pairs), rel=0.02
-    )
+    assert sum(estimates) / len(estimates) == pytest.approx(sum(pair["contribution"] for pair in pairs), rel=0.02)
 
 
 def test_mark_gen_value_training_pairs_for_optimizer_rejects_unknown_strategy():
@@ -534,9 +554,7 @@ def test_generative_value_reinforce_outcome_mass_metrics_reject_invalid_token_co
 @pytest.mark.parametrize("token_count", [-1, True, 1.5])
 def test_generative_value_reinforce_state_kind_mass_metrics_reject_invalid_token_counts(token_count):
     with pytest.raises(ValueError, match="nonnegative integers"):
-        value_model_utils.generative_value_reinforce_state_kind_mass_metrics(
-            [0.5], ["segment_start"], [token_count]
-        )
+        value_model_utils.generative_value_reinforce_state_kind_mass_metrics([0.5], ["segment_start"], [token_count])
 
 
 def test_generative_value_reinforce_state_kind_mass_metrics_reject_invalid_state_kind():

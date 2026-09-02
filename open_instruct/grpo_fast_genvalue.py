@@ -1524,6 +1524,15 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
         if mean is not None:
             merged[metric] = mean
 
+    stratum_probability_prefix = "gen_value/optimizer_inclusion_probability/"
+    for metric in {
+        metric for update in reinforce_updates for metric in update if metric.startswith(stratum_probability_prefix)
+    }:
+        suffix = metric.removeprefix(stratum_probability_prefix)
+        mean = weighted_mean(metric, f"gen_value/candidate_optimizer_pairs/{suffix}")
+        if mean is not None:
+            merged[metric] = mean
+
     summed_metrics = {
         "gen_value/batch_rollouts",
         "gen_value/batch_pairs",
@@ -1585,6 +1594,13 @@ def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
         "gen_value/skipped_empty_generation",
         "gen_value/update_skipped",
     }
+    summed_metrics.update(
+        metric
+        for update in reinforce_updates
+        for metric in update
+        if metric.startswith("gen_value/candidate_optimizer_pairs/")
+        or metric.startswith("gen_value/selected_optimizer_pairs/")
+    )
     for metric in summed_metrics:
         values = [float(update[metric]) for update in reinforce_updates if metric in update]
         if values:
@@ -1960,6 +1976,11 @@ def _gen_value_reinforce_loop(
                         sampling_strategy=optimizer_sampling_strategy,
                     )
                 )
+            optimizer_stratum_metrics = (
+                value_model_utils.gen_value_optimizer_stratum_metrics(pairs)
+                if optimizer_sampling_strategy == "length_outcome_stratified"
+                else {}
+            )
             unique_pair_count = candidate_pair_count
             pairs = value_model_utils.replay_gen_value_final_actions(pairs, final_action_replay_weight)
             optimizer_pairs = [pair for pair in pairs if value_model_utils.gen_value_optimizer_selected(pair)]
@@ -2099,6 +2120,7 @@ def _gen_value_reinforce_loop(
                 }
             )
             metrics.update(capture_metrics)
+            metrics.update(optimizer_stratum_metrics)
             # Publish optimizer metrics before blocking so the policy callback
             # cannot race past and defer the whole update to its next W&B step.
             _put_gen_value_metrics(metrics_Q, metrics, "REINFORCE")

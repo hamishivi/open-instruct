@@ -1122,6 +1122,51 @@ def gen_value_optimizer_inclusion_probability(pair: dict[str, Any], default: flo
     return probability
 
 
+def gen_value_optimizer_stratum_metrics(training_pairs: Sequence[dict[str, Any]]) -> dict[str, float]:
+    """Count candidate and selected critic examples in every sampling stratum.
+
+    Counts use the unique, pre-replay optimizer candidates. Token-identical
+    states are classified together, matching the unit sampled by
+    :func:`mark_gen_value_training_pairs_for_optimizer`. Inclusion probabilities
+    are candidate-weighted so the statistic remains valid if groups within one
+    stratum ever receive different probabilities.
+    """
+    state_length_strata = ("final_action", "prefix_lt_1024", "prefix_1024_2047", "prefix_2048_4095", "prefix_ge_4096")
+    outcome_strata = ("correct", "incorrect")
+    candidate_counts = {
+        (state_length, outcome): 0 for state_length in state_length_strata for outcome in outcome_strata
+    }
+    selected_counts = dict.fromkeys(candidate_counts, 0)
+    probability_sums = dict.fromkeys(candidate_counts, 0.0)
+
+    grouped_pairs: dict[tuple[int, ...], list[dict[str, Any]]] = {}
+    for pair in training_pairs:
+        prompt_ids = tuple(int(token_id) for token_id in pair["request_output"].prompt_token_ids)
+        grouped_pairs.setdefault(prompt_ids, []).append(pair)
+
+    for pair_group in grouped_pairs.values():
+        stratum = _gen_value_optimizer_stratum(pair_group)
+        selections = {gen_value_optimizer_selected(pair) for pair in pair_group}
+        if len(selections) != 1:
+            raise ValueError(f"Token-identical generative-value states disagree on optimizer selection: {selections}.")
+        candidate_counts[stratum] += len(pair_group)
+        if next(iter(selections)):
+            selected_counts[stratum] += len(pair_group)
+        probability_sums[stratum] += sum(gen_value_optimizer_inclusion_probability(pair) for pair in pair_group)
+
+    metrics: dict[str, float] = {}
+    for stratum in candidate_counts:
+        suffix = "_".join(stratum)
+        candidate_count = candidate_counts[stratum]
+        metrics[f"gen_value/candidate_optimizer_pairs/{suffix}"] = float(candidate_count)
+        metrics[f"gen_value/selected_optimizer_pairs/{suffix}"] = float(selected_counts[stratum])
+        if candidate_count > 0:
+            metrics[f"gen_value/optimizer_inclusion_probability/{suffix}"] = (
+                probability_sums[stratum] / candidate_count
+            )
+    return metrics
+
+
 def gen_value_pair_sample_id(pair: dict[str, Any]) -> int:
     """Return the stable per-batch identity of one critic sample.
 
