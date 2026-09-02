@@ -452,6 +452,37 @@ def test_final_action_replay_collapse_rejects_inconsistent_copies():
         value_model_utils.collapse_replayed_gen_value_optimizer_examples([first, dict(first, generated_ids=[3])])
 
 
+def test_normalize_value_loss_preserves_gradient_across_imbalanced_data_parallel_partitions():
+    single_rank_terms = torch.tensor([0.25, -0.5, 1.5, 0.75], dtype=torch.float32, requires_grad=True)
+    single_rank_loss = value_model_utils.normalize_value_loss(
+        single_rank_terms,
+        global_token_count=7,
+        loss_coef=0.1,
+        data_parallel_world_size=1,
+    )
+    single_rank_loss.backward()
+
+    rank_terms = [
+        torch.tensor([0.25, -0.5, 1.5], dtype=torch.float32, requires_grad=True),
+        torch.tensor([0.75], dtype=torch.float32, requires_grad=True),
+        torch.tensor([], dtype=torch.float32, requires_grad=True),
+    ]
+    rank_losses = [
+        value_model_utils.normalize_value_loss(
+            terms,
+            global_token_count=7,
+            loss_coef=0.1,
+            data_parallel_world_size=len(rank_terms),
+        )
+        for terms in rank_terms
+    ]
+    # DeepSpeed averages gradients over ranks. The explicit world-size factor in
+    # each local loss must make that average equal the single-rank global loss.
+    torch.stack(rank_losses).mean().backward()
+
+    torch.testing.assert_close(torch.cat([terms.grad for terms in rank_terms]), single_rank_terms.grad)
+
+
 def test_shared_state_returns_pool_unique_continuations_without_dropping_replays():
     correct = _pair([1, 2], 1.0, state_kind="final_action", response_tokens_used=0)
     incorrect = _pair([1, 2], 0.0, state_kind="segment_start", response_tokens_used=0)

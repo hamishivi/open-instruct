@@ -646,12 +646,11 @@ class GenValueTrainerActor:
         self._optimizer.zero_grad()
         candidate_reinforce_tokens = sum(len(example["generated_ids"]) for example in validated_examples)
         optimizer_reinforce_tokens = sum(len(example["generated_ids"]) for example in optimizer_examples)
-        # DeepSpeed averages data-parallel gradients. Multiplying each local loss
-        # by world size therefore recovers the exact single-worker global token
-        # sum after the all-reduce. Each selected example applies its own inverse
+        # DeepSpeed averages data-parallel gradients. normalize_value_loss applies
+        # the corresponding world-size multiplier against the unchanged global
+        # candidate-token denominator. Each selected example applies its own inverse
         # inclusion probability below; uniform sampling exactly recovers the old
         # scalar Horvitz-Thompson gradient.
-        gradient_scale = self._reinforce_coef * self._trainer_world_size / max(candidate_reinforce_tokens, 1)
         total_loss = 0.0
         optimization_parsed_count = sum(bool(example["parsed"]) for example in optimizer_examples)
         unique_parsed_count = len(unique_v_hats)
@@ -757,7 +756,9 @@ class GenValueTrainerActor:
                 effective_weights &= tis_weights > 0.0
             if bool(effective_weights.any()):
                 has_local_effective_training_signal = True
-            loss = per_token_loss.sum() * gradient_scale
+            loss = value_model_utils.normalize_value_loss(
+                per_token_loss, candidate_reinforce_tokens, self._reinforce_coef, self._trainer_world_size
+            )
             self._model.backward(loss)
             total_loss += float(loss.detach())
             physical_reinforce_token_count += per_token_loss.numel()
