@@ -1179,6 +1179,29 @@ class TestValueLoss(unittest.TestCase):
         self.assertEqual(metrics["gen_value/validation_prefix_late_correct_examples"], 1.0)
         self.assertEqual(metrics["gen_value/validation_prefix_late_incorrect_examples"], 1.0)
 
+    def test_gen_value_validation_absolute_prefix_bands_do_not_overlap_at_boundaries(self):
+        examples = [
+            {"kind": "segment_start", "target": 1.0, "response_tokens_used": 1023},
+            {"kind": "segment_start", "target": 0.0, "response_tokens_used": 1024},
+            {"kind": "segment_start", "target": 1.0, "response_tokens_used": 2047},
+            {"kind": "segment_start", "target": 0.0, "response_tokens_used": 2048},
+            {"kind": "segment_start", "target": 1.0, "response_tokens_used": 4095},
+            {"kind": "segment_start", "target": 0.0, "response_tokens_used": 4096},
+            {"kind": "final_action", "target": 1.0, "response_tokens_used": 8192},
+        ]
+
+        metrics = gen_value_validation_metrics(examples, [0.6, 0.4, 0.7, 0.5, 0.9, 0.2, 1.0])
+
+        self.assertEqual(metrics["gen_value/validation_prefix_tokens_lt_1024_correct_examples"], 1.0)
+        self.assertEqual(metrics["gen_value/validation_prefix_tokens_1024_2048_correct_examples"], 1.0)
+        self.assertEqual(metrics["gen_value/validation_prefix_tokens_1024_2048_incorrect_examples"], 1.0)
+        self.assertEqual(metrics["gen_value/validation_prefix_tokens_2048_4096_correct_examples"], 1.0)
+        self.assertEqual(metrics["gen_value/validation_prefix_tokens_2048_4096_incorrect_examples"], 1.0)
+        self.assertEqual(metrics["gen_value/validation_prefix_tokens_ge_4096_incorrect_examples"], 1.0)
+        self.assertAlmostEqual(metrics["gen_value/validation_prefix_tokens_1024_2048_value_gap"], 0.3)
+        self.assertAlmostEqual(metrics["gen_value/validation_prefix_tokens_2048_4096_value_gap"], 0.4)
+        self.assertNotIn("gen_value/validation_prefix_tokens_ge_4096_correct_examples", metrics)
+
     def test_gen_value_validation_prediction_change_metrics_measure_serving_drift(self):
         metrics = gen_value_validation_prediction_change_metrics([0.2, 0.7, None, 0.4], [0.3, 0.5, 0.8, None])
 

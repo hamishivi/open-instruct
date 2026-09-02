@@ -1509,6 +1509,32 @@ def gen_value_validation_metrics(
         prefix_position_groups[f"prefix_{band}_incorrect"] = [
             (example, prediction) for example, prediction in band_rows if float(example["target"]) <= 0.5
         ]
+    # Trajectory-relative position and absolute context length answer different
+    # questions.  A short failed rollout can already be "late" at 600 tokens,
+    # while the live math actor may routinely reason for several thousand.  Use
+    # non-overlapping absolute bands so validation exposes that distribution
+    # shift without double-counting examples across the reported groups.
+    prefix_token_bands = {
+        "lt_1024": (0, 1024),
+        "1024_2048": (1024, 2048),
+        "2048_4096": (2048, 4096),
+        "ge_4096": (4096, None),
+    }
+    prefix_token_groups: dict[str, list[tuple[dict[str, Any], float]]] = {}
+    for band, (lower, upper) in prefix_token_bands.items():
+        band_rows = [
+            (example, prediction)
+            for example, prediction in prefixes
+            if example.get("response_tokens_used") is not None
+            and lower <= int(example["response_tokens_used"])
+            and (upper is None or int(example["response_tokens_used"]) < upper)
+        ]
+        prefix_token_groups[f"prefix_tokens_{band}_correct"] = [
+            (example, prediction) for example, prediction in band_rows if float(example["target"]) > 0.5
+        ]
+        prefix_token_groups[f"prefix_tokens_{band}_incorrect"] = [
+            (example, prediction) for example, prediction in band_rows if float(example["target"]) <= 0.5
+        ]
     near_horizon_incorrect = [
         (example, prediction)
         for example, prediction in parsed
@@ -1525,6 +1551,8 @@ def gen_value_validation_metrics(
     add_group("prefix_correct", prefix_correct)
     add_group("prefix_incorrect", prefix_incorrect)
     for name, rows in prefix_position_groups.items():
+        add_group(name, rows)
+    for name, rows in prefix_token_groups.items():
         add_group(name, rows)
     add_group("near_horizon_incorrect", near_horizon_incorrect)
     add_binary_macro_mse("final", final_correct, final_incorrect)
@@ -1552,6 +1580,16 @@ def gen_value_validation_metrics(
             metrics[f"gen_value/validation_prefix_{band}_value_gap"] = (
                 metrics[f"gen_value/validation_prefix_{band}_correct_v_hat_mean"]
                 - metrics[f"gen_value/validation_prefix_{band}_incorrect_v_hat_mean"]
+            )
+    for band in prefix_token_bands:
+        correct = prefix_token_groups[f"prefix_tokens_{band}_correct"]
+        incorrect = prefix_token_groups[f"prefix_tokens_{band}_incorrect"]
+        add_binary_macro_mse(f"prefix_tokens_{band}", correct, incorrect)
+        add_binary_ranking_auc(f"prefix_tokens_{band}", correct, incorrect)
+        if correct and incorrect:
+            metrics[f"gen_value/validation_prefix_tokens_{band}_value_gap"] = (
+                metrics[f"gen_value/validation_prefix_tokens_{band}_correct_v_hat_mean"]
+                - metrics[f"gen_value/validation_prefix_tokens_{band}_incorrect_v_hat_mean"]
             )
     for outcome in ("correct", "incorrect"):
         early = metrics.get(f"gen_value/validation_prefix_early_{outcome}_v_hat_mean")
