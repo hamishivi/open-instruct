@@ -1445,6 +1445,55 @@ def gen_value_validation_metrics(
     return metrics
 
 
+def gen_value_validation_prediction_change_metrics(
+    previous_predictions: Sequence[float | None], current_predictions: Sequence[float | None]
+) -> dict[str, float]:
+    """Measure serving-side prediction changes on the same fixed critic panel.
+
+    A completed weight-transfer RPC proves only that vLLM accepted the update
+    request.  Comparing successive predictions on the frozen validation panel
+    provides an end-to-end behavioral check that the serving critic changed.
+    Parse transitions are reported separately so they are not silently treated
+    as numeric score changes.
+    """
+    if len(previous_predictions) != len(current_predictions):
+        raise ValueError(
+            "Previous and current validation predictions differ in length "
+            f"({len(previous_predictions)} != {len(current_predictions)})."
+        )
+    if not current_predictions:
+        return {}
+
+    paired_predictions = [
+        (float(previous), float(current))
+        for previous, current in zip(previous_predictions, current_predictions, strict=True)
+        if previous is not None and current is not None
+    ]
+    parse_status_changes = sum(
+        (previous is None) != (current is None)
+        for previous, current in zip(previous_predictions, current_predictions, strict=True)
+    )
+    metrics = {
+        "gen_value/validation_prediction_change_examples": float(len(current_predictions)),
+        "gen_value/validation_prediction_change_paired_examples": float(len(paired_predictions)),
+        "gen_value/validation_prediction_parse_status_changed_fraction": parse_status_changes
+        / len(current_predictions),
+    }
+    if paired_predictions:
+        changes = [current - previous for previous, current in paired_predictions]
+        absolute_changes = [abs(change) for change in changes]
+        metrics.update(
+            {
+                "gen_value/validation_prediction_mean_change": sum(changes) / len(changes),
+                "gen_value/validation_prediction_mean_abs_change": sum(absolute_changes) / len(absolute_changes),
+                "gen_value/validation_prediction_max_abs_change": max(absolute_changes),
+                "gen_value/validation_prediction_changed_fraction": sum(change != 0.0 for change in changes)
+                / len(changes),
+            }
+        )
+    return metrics
+
+
 def write_gen_value_validation_snapshot(
     output_dir: str,
     version: int,

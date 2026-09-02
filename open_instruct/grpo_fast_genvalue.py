@@ -2467,6 +2467,7 @@ def main():
 
     last_gen_value_engine_health_check = 0.0
     last_gen_value_validation_version: int | None = None
+    last_gen_value_validation_predictions: list[float | None] | None = None
 
     def _one_training_step_with_genvalue(*step_args, **step_kwargs):
         _raise_if_gen_value_background_failed()
@@ -2489,7 +2490,7 @@ def main():
         existing_post_training_metrics_callback = step_kwargs.get("post_training_metrics_callback")
 
         def _critic_post_training_metrics_callback() -> dict[str, Any]:
-            nonlocal last_gen_value_validation_version
+            nonlocal last_gen_value_validation_predictions, last_gen_value_validation_version
             checkpoint_due = (
                 args.checkpoint_state_freq > 0
                 and policy_step % args.checkpoint_state_freq == 0
@@ -2628,7 +2629,14 @@ def main():
                         progress_metrics.update(
                             value_model_utils.gen_value_validation_metrics(validation_examples, predictions)
                         )
+                        if last_gen_value_validation_predictions is not None:
+                            progress_metrics.update(
+                                value_model_utils.gen_value_validation_prediction_change_metrics(
+                                    last_gen_value_validation_predictions, predictions
+                                )
+                            )
                         progress_metrics["gen_value/validation_version"] = float(synced_version)
+                        last_gen_value_validation_predictions = list(predictions)
                         last_gen_value_validation_version = synced_version
             critic_metrics = _drain_gen_value_metrics(gen_value_metrics_Q)
             critic_metrics.update(progress_metrics)

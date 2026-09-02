@@ -56,6 +56,7 @@ from open_instruct.value_model_utils import (
     gen_value_sampled_version_metrics,
     gen_value_training_queue_capacity,
     gen_value_validation_metrics,
+    gen_value_validation_prediction_change_metrics,
     generative_value_reinforce_reward,
     generative_value_reinforce_weights,
     generative_value_reinforce_weights_with_replay,
@@ -1177,6 +1178,21 @@ class TestValueLoss(unittest.TestCase):
         self.assertEqual(metrics["gen_value/validation_prefix_middle_incorrect_examples"], 1.0)
         self.assertEqual(metrics["gen_value/validation_prefix_late_correct_examples"], 1.0)
         self.assertEqual(metrics["gen_value/validation_prefix_late_incorrect_examples"], 1.0)
+
+    def test_gen_value_validation_prediction_change_metrics_measure_serving_drift(self):
+        metrics = gen_value_validation_prediction_change_metrics([0.2, 0.7, None, 0.4], [0.3, 0.5, 0.8, None])
+
+        self.assertEqual(metrics["gen_value/validation_prediction_change_examples"], 4.0)
+        self.assertEqual(metrics["gen_value/validation_prediction_change_paired_examples"], 2.0)
+        self.assertAlmostEqual(metrics["gen_value/validation_prediction_parse_status_changed_fraction"], 0.5)
+        self.assertAlmostEqual(metrics["gen_value/validation_prediction_mean_change"], -0.05)
+        self.assertAlmostEqual(metrics["gen_value/validation_prediction_mean_abs_change"], 0.15)
+        self.assertAlmostEqual(metrics["gen_value/validation_prediction_max_abs_change"], 0.2)
+        self.assertEqual(metrics["gen_value/validation_prediction_changed_fraction"], 1.0)
+
+    def test_gen_value_validation_prediction_change_metrics_validate_lengths(self):
+        with self.assertRaisesRegex(ValueError, "differ in length"):
+            gen_value_validation_prediction_change_metrics([0.1], [0.1, 0.2])
 
     def test_gen_value_validation_snapshot_preserves_inspectable_outputs(self):
         examples = [
