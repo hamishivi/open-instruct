@@ -3,7 +3,9 @@
 # critic path must be the final `gen_value_model` directory produced by
 # genac_math_value_pretrain_h200.sh.
 #
-# GPU layout: one learner, one policy vLLM, one critic vLLM, one critic trainer.
+# Default GPU layout: one learner, one policy vLLM, one critic vLLM, and one
+# critic trainer. Critic inference and data-parallel trainer counts are
+# independently configurable without changing the global learning objective.
 # By default total_episodes = 300 joint steps * 32 prompts * 8 samples = 76,800.
 # The prompt and group dimensions are environment-overridable so matched
 # paper-scale runs can increase optimizer batch size without editing this file.
@@ -77,6 +79,8 @@ GEN_VALUE_TRAIN_PACK_LENGTH="${GEN_VALUE_TRAIN_PACK_LENGTH:-32768}"
 # separate multi-update serving lag after source-data staleness is bounded.
 GEN_VALUE_SYNC_FREQ="${GEN_VALUE_SYNC_FREQ:-1}"
 GEN_VALUE_MAX_ASYNC_STEPS="${GEN_VALUE_MAX_ASYNC_STEPS:-1}"
+GEN_VALUE_VLLM_NUM_ENGINES="${GEN_VALUE_VLLM_NUM_ENGINES:-1}"
+GEN_VALUE_TRAINER_NUM_GPUS="${GEN_VALUE_TRAINER_NUM_GPUS:-1}"
 # Zero preserves full-batch critic optimization. A positive value requests a
 # shared-state-preserving stochastic minibatch of approximately this many critic
 # examples per fresh policy batch.
@@ -105,6 +109,14 @@ if [[ ! "${GEN_VALUE_SCORE_MAX}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [[ ! "${GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE}" =~ ^[0-9]+$ ]]; then
     echo "ERROR: GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE must be a nonnegative integer" >&2
+    exit 1
+fi
+if [[ ! "${GEN_VALUE_TRAINER_NUM_GPUS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: GEN_VALUE_TRAINER_NUM_GPUS must be a positive integer" >&2
+    exit 1
+fi
+if [[ ! "${GEN_VALUE_VLLM_NUM_ENGINES}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: GEN_VALUE_VLLM_NUM_ENGINES must be a positive integer" >&2
     exit 1
 fi
 if [[ ! "${NUM_UNIQUE_PROMPTS_ROLLOUT}" =~ ^[1-9][0-9]*$ ]]; then
@@ -198,8 +210,9 @@ python open_instruct/grpo_fast_genvalue.py \
     --sae_threshold 0.2 \
     --use_generative_value_model \
     --gen_value_model_name_or_path "${GEN_VALUE_MODEL_PATH}" \
-    --gen_value_vllm_num_engines 1 \
+    --gen_value_vllm_num_engines "${GEN_VALUE_VLLM_NUM_ENGINES}" \
     --gen_value_vllm_tensor_parallel_size 1 \
+    --gen_value_trainer_num_gpus "${GEN_VALUE_TRAINER_NUM_GPUS}" \
     --gen_value_segmentation sae \
     --gen_value_max_segments 16 \
     --gen_value_score_min 0 \

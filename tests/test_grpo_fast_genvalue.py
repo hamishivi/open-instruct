@@ -17,11 +17,13 @@ from open_instruct.dataset_transformation import INPUT_IDS_PROMPT_KEY, Tokenizer
 from open_instruct.grpo_fast_genvalue import (
     GenValueTrainingProgress,
     GenValueExperimentConfig,
+    _balance_gen_value_pack_indices,
     _build_sample_scoring_prompts,
     _drain_gen_value_metrics,
     _gen_value_reinforce_loop,
     _gen_value_scoring_loop,
     _hold_gen_value_training_for_checkpoint,
+    _merge_gen_value_trainer_rank_metrics,
     _put_gen_value_metrics,
     _resolve_gen_value_model,
     _resolve_gen_value_train_pack_length,
@@ -117,6 +119,76 @@ def test_genvalue_config_valid():
     cfg = GenValueExperimentConfig(**kwargs)
     assert cfg.use_generative_value_model is True
     assert cfg.gen_value_segmentation == "fixed"
+
+
+def test_genvalue_config_rejects_nonpositive_trainer_world_size():
+    kwargs = _base_kwargs()
+    kwargs["gen_value_trainer_num_gpus"] = 0
+
+    with pytest.raises(ValueError, match="gen_value_trainer_num_gpus must be > 0"):
+        GenValueExperimentConfig(**kwargs)
+
+
+def test_gen_value_pack_balancing_is_deterministic_and_complete():
+    token_counts = [100, 90, 80, 70, 20, 10]
+
+    assignments = _balance_gen_value_pack_indices(token_counts, world_size=3)
+
+    assert assignments == [[0, 5], [1, 4], [2, 3]]
+    assert sorted(index for assignment in assignments for index in assignment) == list(range(len(token_counts)))
+    assert [sum(token_counts[index] for index in assignment) for assignment in assignments] == [110, 110, 150]
+
+
+def test_gen_value_pack_balancing_requires_one_pack_per_rank():
+    with pytest.raises(ValueError, match="at least one packed sequence per rank"):
+        _balance_gen_value_pack_indices([100, 90], world_size=3)
+
+
+def test_merge_gen_value_trainer_rank_metrics_uses_global_counts_and_slowest_time():
+    shared = {
+        "gen_value/version": 4,
+        "gen_value/reinforce_steps": 4,
+        "gen_value/train_examples": 100,
+        "gen_value/unique_examples": 90,
+        "gen_value/optimizer_unique_examples": 80,
+        "gen_value/candidate_train_examples": 120,
+        "gen_value/train_packs": 5,
+        "gen_value/train_pack_tokens": 490,
+        "gen_value/physical_train_tokens": 60,
+        "gen_value/train_tokens": 70,
+        "gen_value/trainer_world_size": 2,
+        "gen_value/training_optimization_seconds": 10.0,
+    }
+    rank_metrics = [
+        {
+            **shared,
+            "gen_value/trainer_rank": 0,
+            "gen_value/reinforce_loss": 0.4,
+            "_gen_value_local_train_packs": 3,
+            "_gen_value_local_train_pack_tokens": 250,
+            "_gen_value_local_physical_train_tokens": 32,
+            "_gen_value_local_train_tokens": 36,
+        },
+        {
+            **shared,
+            "gen_value/trainer_rank": 1,
+            "gen_value/reinforce_loss": 0.6,
+            "gen_value/training_optimization_seconds": 12.0,
+            "_gen_value_local_train_packs": 2,
+            "_gen_value_local_train_pack_tokens": 240,
+            "_gen_value_local_physical_train_tokens": 28,
+            "_gen_value_local_train_tokens": 34,
+        },
+    ]
+
+    merged = _merge_gen_value_trainer_rank_metrics(rank_metrics)
+
+    assert merged["gen_value/reinforce_loss"] == pytest.approx(0.5)
+    assert merged["gen_value/training_optimization_seconds"] == pytest.approx(12.0)
+    assert merged["gen_value/train_packs"] == 5
+    assert merged["gen_value/trainer_local_pack_tokens_min"] == 240
+    assert merged["gen_value/trainer_local_pack_tokens_max"] == 250
+    assert merged["gen_value/trainer_token_load_imbalance"] == pytest.approx(250 / 245)
 
 
 def test_genvalue_tokenizer_defaults_to_policy_and_allows_independent_override():
@@ -471,7 +543,7 @@ def test_gen_value_reinforce_loop_trains_queued_batches_consecutively_freshest_f
     )
 
     _gen_value_reinforce_loop(
-        trainer_actor=trainer_actor,
+        trainer_actors=[trainer_actor],
         training_queue=training_queue,
         training_progress=training_progress,
         batch_size=2,

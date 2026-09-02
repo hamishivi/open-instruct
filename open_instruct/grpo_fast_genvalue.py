@@ -60,6 +60,7 @@ import time
 from collections.abc import Callable
 from concurrent import futures
 from dataclasses import dataclass
+from datetime import timedelta
 from queue import Queue
 from typing import Any
 
@@ -87,6 +88,34 @@ logger = logger_utils.setup_logger(__name__)
 _GEN_VALUE_SAMPLE_SIZE = 4  # prompts sampled per step for background scoring
 _GEN_VALUE_OPERATION_TIMEOUT_S = 7200.0
 _GEN_VALUE_HEALTH_TIMEOUT_S = 60.0
+
+
+def _balance_gen_value_pack_indices(pack_token_counts: list[int], world_size: int) -> list[list[int]]:
+    """Assign whole critic packs to data-parallel ranks with balanced token loads.
+
+    Whole packs remain unchanged, so this only changes which trainer rank evaluates
+    each loss term. Longest-processing-time assignment is deterministic and keeps
+    the slowest rank close to the global average even when trajectory lengths vary.
+    """
+    if world_size <= 0:
+        raise ValueError(f"Generative-critic trainer world size must be positive, got {world_size}.")
+    if len(pack_token_counts) < world_size:
+        raise ValueError(
+            "Generative-critic data parallelism requires at least one packed sequence per rank, got "
+            f"{len(pack_token_counts)} packs for {world_size} ranks."
+        )
+    if any(token_count <= 0 for token_count in pack_token_counts):
+        raise ValueError(f"Generative-critic pack token counts must be positive, got {pack_token_counts}.")
+
+    assignments: list[list[int]] = [[] for _ in range(world_size)]
+    assigned_tokens = [0] * world_size
+    for pack_index in sorted(range(len(pack_token_counts)), key=lambda index: (-pack_token_counts[index], index)):
+        rank = min(range(world_size), key=lambda candidate: (assigned_tokens[candidate], candidate))
+        assignments[rank].append(pack_index)
+        assigned_tokens[rank] += pack_token_counts[pack_index]
+    for assignment in assignments:
+        assignment.sort()
+    return assignments
 
 
 def _check_gen_value_engines(vllm_engines: list) -> None:
@@ -149,6 +178,10 @@ class GenValueTrainerActor:
         checkpoint_tag: str | None = None,
         trace_reservoir_size: int = 0,
         trace_seed: int = 0,
+        trainer_world_size: int = 1,
+        trainer_rank: int = 0,
+        trainer_master_addr: str | None = None,
+        trainer_master_port: int | None = None,
     ) -> None:
         self._score_min = score_min
         self._score_max = score_max
@@ -167,6 +200,15 @@ class GenValueTrainerActor:
         self._trace_rng = random.Random(trace_seed)
         self._trace_reservoirs: dict[str, list[dict[str, Any]]] = {"correct": [], "incorrect": []}
         self._trace_seen_by_outcome = {"correct": 0, "incorrect": 0}
+        self._trainer_world_size = int(trainer_world_size)
+        self._trainer_rank = int(trainer_rank)
+        if self._trainer_world_size <= 0:
+            raise ValueError(f"Generative-critic trainer world size must be positive, got {self._trainer_world_size}.")
+        if not 0 <= self._trainer_rank < self._trainer_world_size:
+            raise ValueError(
+                "Generative-critic trainer rank must be inside its world, got "
+                f"rank={self._trainer_rank}, world_size={self._trainer_world_size}."
+            )
         if self._reinforce_baseline not in {"none", "leave_one_out", "leave_one_out_by_outcome"}:
             raise ValueError(f"Unknown generative-value REINFORCE baseline: {self._reinforce_baseline!r}.")
         if self._trace_reservoir_size < 0:
@@ -180,30 +222,42 @@ class GenValueTrainerActor:
             )
         torch.cuda.set_device(0)
         if dist.is_initialized():
-            if dist.get_world_size() != 1:
+            if dist.get_world_size() != self._trainer_world_size or dist.get_rank() != self._trainer_rank:
                 raise RuntimeError(
-                    "The independent generative critic requires a private world-size-one process group, "
-                    f"but found world size {dist.get_world_size()}."
+                    "The independent generative critic found an unexpected pre-existing process group: "
+                    f"expected rank {self._trainer_rank}/{self._trainer_world_size}, found "
+                    f"rank {dist.get_rank()}/{dist.get_world_size()}."
                 )
         else:
-            master_address = "127.0.0.1"
-            master_port = utils.find_free_port()
+            if self._trainer_world_size == 1:
+                master_address = trainer_master_addr or "127.0.0.1"
+                master_port = trainer_master_port or utils.find_free_port()
+            else:
+                if trainer_master_addr is None or trainer_master_port is None:
+                    raise ValueError(
+                        "Distributed generative-critic trainers require an explicit master address and port."
+                    )
+                master_address = trainer_master_addr
+                master_port = trainer_master_port
             os.environ.update(
                 {
                     "LOCAL_RANK": "0",
-                    "RANK": "0",
-                    "WORLD_SIZE": "1",
+                    "RANK": str(self._trainer_rank),
+                    "WORLD_SIZE": str(self._trainer_world_size),
                     "MASTER_ADDR": master_address,
                     "MASTER_PORT": str(master_port),
                 }
             )
-            deepspeed.init_distributed(
-                dist_backend="nccl",
-                auto_mpi_discovery=False,
+            backend_timeout = timedelta(seconds=_GEN_VALUE_OPERATION_TIMEOUT_S)
+            torch.distributed.distributed_c10d._get_default_timeout = lambda backend: backend_timeout
+            torch.distributed.init_process_group(
+                backend="nccl",
                 init_method=f"tcp://{master_address}:{master_port}",
-                rank=0,
-                world_size=1,
+                rank=self._trainer_rank,
+                world_size=self._trainer_world_size,
+                timeout=backend_timeout,
             )
+            deepspeed.init_distributed(timeout=backend_timeout)
 
         model = AutoModelForCausalLM.from_pretrained(
             model_path, revision=model_revision, dtype=torch.bfloat16, attn_implementation=attn_implementation
@@ -309,7 +363,9 @@ class GenValueTrainerActor:
             "restored" if optimizer_state_available else "cold_start",
         )
 
-    def save_checkpoint(self, checkpoint_state_dir: str, policy_step: int) -> dict[str, Any]:
+    def save_checkpoint(
+        self, checkpoint_state_dir: str, policy_step: int, write_rank_zero_artifacts: bool = True
+    ) -> dict[str, Any]:
         checkpoint_dir = pathlib.Path(checkpoint_state_dir) / "gen_value_model" / "deepspeed"
         checkpoint_tag = f"global_step{policy_step}"
         client_state = {"gen_value_version": self._step_count, "reinforce_steps": self._step_count}
@@ -318,7 +374,7 @@ class GenValueTrainerActor:
         )
         if saved is False:
             raise RuntimeError(f"Failed to save generative-value DeepSpeed checkpoint to {checkpoint_dir}.")
-        trace_path = self._write_trace_reservoir(checkpoint_state_dir)
+        trace_path = self._write_trace_reservoir(checkpoint_state_dir) if write_rank_zero_artifacts else None
         checkpoint_metadata = {
             "gen_value_trainer_saved": True,
             "gen_value_trainer_checkpoint": str(checkpoint_dir.relative_to(checkpoint_state_dir)),
@@ -573,18 +629,34 @@ class GenValueTrainerActor:
         packed_optimizer_examples = value_model_utils.collapse_replayed_gen_value_optimizer_examples(
             optimizer_examples
         )
-        packs = value_model_utils.pack_gen_value_examples(packed_optimizer_examples, self._pack_length)
+        all_packs = value_model_utils.pack_gen_value_examples(packed_optimizer_examples, self._pack_length)
+        all_pack_token_counts = [len(value_model_utils.flatten_gen_value_pack(pack)[0]) for pack in all_packs]
+        pack_assignments = _balance_gen_value_pack_indices(all_pack_token_counts, self._trainer_world_size)
+        local_pack_indices = pack_assignments[self._trainer_rank]
+        local_packs = [all_packs[index] for index in local_pack_indices]
+        max_packs_per_rank = max(len(assignment) for assignment in pack_assignments)
         training_packing_seconds = time.perf_counter() - packing_started_at
         # DeepSpeed's BF16 optimizer owns the FP32 accumulation buffers, so clear
         # it directly rather than only clearing the BF16 module gradients.
         self._optimizer.zero_grad()
         candidate_reinforce_tokens = sum(len(example["generated_ids"]) for example in validated_examples)
         optimizer_reinforce_tokens = sum(len(example["generated_ids"]) for example in optimizer_examples)
-        gradient_scale = self._reinforce_coef / (max(candidate_reinforce_tokens, 1) * optimizer_inclusion_probability)
+        # DeepSpeed averages data-parallel gradients. Multiplying each local loss
+        # by world size therefore recovers the exact single-worker global token
+        # sum after the all-reduce.
+        gradient_scale = (
+            self._reinforce_coef
+            * self._trainer_world_size
+            / (max(candidate_reinforce_tokens, 1) * optimizer_inclusion_probability)
+        )
         total_loss = 0.0
         optimization_parsed_count = sum(bool(example["parsed"]) for example in optimizer_examples)
         unique_parsed_count = len(unique_v_hats)
-        has_effective_training_signal = False
+        # Every rank must make the same step/no-step decision or the distributed
+        # optimizer will deadlock. TIS can remove the last non-zero local token,
+        # so determine effective signal after applying the local TIS terms and
+        # reduce that decision across all ranks below.
+        has_local_effective_training_signal = False
         reinforce_token_count = 0
         tis_ratio_sum = 0.0
         tis_token_count = 0
@@ -595,22 +667,37 @@ class GenValueTrainerActor:
 
         optimization_started_at = time.perf_counter()
         pack_token_counts: list[int] = []
-        for pack_idx, pack in enumerate(packs):
-            flattened = value_model_utils.flatten_gen_value_pack(pack)
-            (
-                input_ids_list,
-                position_ids_list,
-                logit_positions_list,
-                target_ids_list,
-                rollout_logprobs_list,
-                rewards_list,
-            ) = flattened
-            pack_token_counts.append(len(input_ids_list))
-            replay_multiplicities = [
-                value_model_utils.gen_value_replay_multiplicity(example)
-                for example in pack
-                for _ in example["generated_ids"]
-            ]
+        for local_pack_position in range(max_packs_per_rank):
+            is_padding_pack = local_pack_position >= len(local_packs)
+            if is_padding_pack:
+                # All ranks execute the same number of backward passes. A tiny
+                # zero-loss pack keeps DeepSpeed's gradient-accumulation and
+                # collective call order identical without changing the update.
+                pad_token_id = int(self._tokenizer.pad_token_id)
+                input_ids_list = [pad_token_id, pad_token_id]
+                position_ids_list = [0, 1]
+                logit_positions_list = [0]
+                target_ids_list = [pad_token_id]
+                rollout_logprobs_list = [0.0]
+                rewards_list = [0.0]
+                replay_multiplicities = [1]
+            else:
+                pack = local_packs[local_pack_position]
+                flattened = value_model_utils.flatten_gen_value_pack(pack)
+                (
+                    input_ids_list,
+                    position_ids_list,
+                    logit_positions_list,
+                    target_ids_list,
+                    rollout_logprobs_list,
+                    rewards_list,
+                ) = flattened
+                pack_token_counts.append(len(input_ids_list))
+                replay_multiplicities = [
+                    value_model_utils.gen_value_replay_multiplicity(example)
+                    for example in pack
+                    for _ in example["generated_ids"]
+                ]
             input_ids = torch.tensor([input_ids_list], dtype=torch.long, device="cuda")
             position_ids = torch.tensor([position_ids_list], dtype=torch.long, device="cuda")
             logit_positions = torch.tensor(logit_positions_list, dtype=torch.long, device="cuda")
@@ -620,7 +707,7 @@ class GenValueTrainerActor:
             # Transformers uses these resets to select isolated variable-length FlashAttention,
             # so examples in one pack cannot attend to each other. Selecting the prediction
             # positions directly also avoids materializing prompt-token logits.
-            self._model.set_gradient_accumulation_boundary(pack_idx == len(packs) - 1)
+            self._model.set_gradient_accumulation_boundary(local_pack_position == max_packs_per_rank - 1)
             outputs = self._model(
                 input_ids=input_ids, attention_mask=None, position_ids=position_ids, logits_to_keep=logit_positions
             )
@@ -628,6 +715,9 @@ class GenValueTrainerActor:
             token_logprobs = -torch.nn.functional.cross_entropy(
                 logits.reshape(-1, logits.shape[-1]), target_ids.reshape(-1), reduction="none"
             )
+            if is_padding_pack:
+                self._model.backward(token_logprobs.sum() * 0.0)
+                continue
             rollout_logprobs = torch.tensor(rollout_logprobs_list, dtype=torch.float32, device="cuda")
             response_mask = torch.ones_like(token_logprobs, dtype=torch.bool)
             rollout_logprobs = grpo_utils.mask_logprobs(rollout_logprobs, response_mask)
@@ -652,17 +742,20 @@ class GenValueTrainerActor:
             per_token_loss = -token_logprobs * token_rewards
             if tis_weights is not None:
                 per_token_loss = per_token_loss * tis_weights
+            effective_weights = token_rewards != 0.0
+            if tis_weights is not None:
+                effective_weights &= tis_weights > 0.0
+            if bool(effective_weights.any()):
+                has_local_effective_training_signal = True
             loss = per_token_loss.sum() * gradient_scale
             self._model.backward(loss)
             total_loss += float(loss.detach())
             physical_reinforce_token_count += per_token_loss.numel()
             reinforce_token_count += sum(replay_multiplicities)
-            effective_weights = token_rewards != 0.0
-            if tis_weights is not None:
-                effective_weights &= tis_weights > 0.0
-            if bool(effective_weights.any()):
-                has_effective_training_signal = True
-
+        effective_signal = torch.tensor(int(has_local_effective_training_signal), dtype=torch.int32, device="cuda")
+        if self._trainer_world_size > 1:
+            dist.all_reduce(effective_signal, op=dist.ReduceOp.MAX)
+        has_effective_training_signal = bool(effective_signal.item())
         grad_norm: float | None = None
         if self._reinforce_coef > 0.0 and has_effective_training_signal:
             self._model.step()
@@ -699,7 +792,7 @@ class GenValueTrainerActor:
             "gen_value/optimization_parse_rate": optimization_parsed_count / len(optimizer_examples),
             "gen_value/version": self._step_count,
             "gen_value/reinforce_steps": self._step_count,
-            "gen_value/train_tokens": reinforce_token_count,
+            "gen_value/train_tokens": optimizer_reinforce_tokens,
             "gen_value/candidate_train_tokens": candidate_reinforce_tokens,
             "gen_value/candidate_train_examples": len(validated_examples),
             "gen_value/train_examples": len(optimizer_examples),
@@ -712,14 +805,22 @@ class GenValueTrainerActor:
             "gen_value/optimizer_inclusion_probability": optimizer_inclusion_probability,
             "gen_value/optimizer_token_sampling_fraction": optimizer_reinforce_tokens
             / max(candidate_reinforce_tokens, 1),
-            "gen_value/train_packs": len(packs),
+            "gen_value/train_packs": len(all_packs),
             "gen_value/train_pack_target_tokens": self._pack_length,
-            "gen_value/train_pack_tokens": sum(pack_token_counts),
-            "gen_value/train_examples_per_pack": len(optimizer_examples) / len(packs),
-            "gen_value/physical_train_examples_per_pack": len(packed_optimizer_examples) / len(packs),
-            "gen_value/physical_train_tokens": physical_reinforce_token_count,
-            "gen_value/train_mean_pack_tokens": sum(pack_token_counts) / len(packs),
-            "gen_value/train_max_pack_tokens": max(pack_token_counts),
+            "gen_value/train_pack_tokens": sum(all_pack_token_counts),
+            "gen_value/train_examples_per_pack": len(optimizer_examples) / len(all_packs),
+            "gen_value/physical_train_examples_per_pack": len(packed_optimizer_examples) / len(all_packs),
+            "gen_value/physical_train_tokens": sum(
+                len(example["generated_ids"]) for example in packed_optimizer_examples
+            ),
+            "gen_value/train_mean_pack_tokens": sum(all_pack_token_counts) / len(all_packs),
+            "gen_value/train_max_pack_tokens": max(all_pack_token_counts),
+            "gen_value/trainer_world_size": self._trainer_world_size,
+            "gen_value/trainer_rank": self._trainer_rank,
+            "_gen_value_local_train_packs": len(local_packs),
+            "_gen_value_local_train_pack_tokens": sum(pack_token_counts),
+            "_gen_value_local_physical_train_tokens": physical_reinforce_token_count,
+            "_gen_value_local_train_tokens": reinforce_token_count,
             "gen_value/training_preparation_seconds": training_preparation_seconds,
             "gen_value/training_packing_seconds": training_packing_seconds,
             "gen_value/training_optimization_seconds": training_optimization_seconds,
@@ -848,6 +949,10 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
     gen_value_tokenizer_revision: str | None = None
     gen_value_vllm_num_engines: int = 1
     gen_value_vllm_tensor_parallel_size: int = 1
+    # Independent data-parallel workers for generative-critic optimization.
+    # The global examples, loss normalization, and optimizer update remain the
+    # same; whole packed sequences are balanced across these trainer ranks.
+    gen_value_trainer_num_gpus: int = 1
     # Segmentation: 'sae' uses the policy-logprob-based SAE boundaries (requires --use_sae);
     # 'fixed' queries the gen value model every `gen_value_chunk_size` response tokens.
     gen_value_segmentation: str = "sae"
@@ -959,6 +1064,8 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
             raise ValueError(
                 f"--gen_value_vllm_tensor_parallel_size must be > 0, got {self.gen_value_vllm_tensor_parallel_size}."
             )
+        if self.gen_value_trainer_num_gpus <= 0:
+            raise ValueError(f"--gen_value_trainer_num_gpus must be > 0, got {self.gen_value_trainer_num_gpus}.")
         if self.gen_value_segmentation not in {"sae", "fixed"}:
             raise ValueError(
                 f"--gen_value_segmentation must be 'sae' or 'fixed', got {self.gen_value_segmentation!r}."
@@ -1212,6 +1319,118 @@ def _build_sample_scoring_prompts(
 def _put_gen_value_metrics(metrics_Q: Queue, metrics: dict[str, Any], source: str) -> None:
     """Send background-thread metrics through the main training step for aligned W&B logging."""
     metrics_Q.put_nowait({"_gen_value_metric_source": source, **metrics})
+
+
+def _merge_gen_value_trainer_rank_metrics(rank_metrics: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge one synchronous data-parallel critic update across trainer ranks."""
+    if not rank_metrics:
+        raise ValueError("Cannot merge an empty set of generative-critic trainer metrics.")
+    if len(rank_metrics) == 1:
+        merged = dict(rank_metrics[0])
+        for metric in list(merged):
+            if metric.startswith("_gen_value_local_") or metric == "gen_value/trainer_rank":
+                merged.pop(metric)
+        return merged
+
+    merged = dict(rank_metrics[0])
+    expected_world_size = len(rank_metrics)
+    invariant_metrics = (
+        "gen_value/version",
+        "gen_value/reinforce_steps",
+        "gen_value/train_examples",
+        "gen_value/unique_examples",
+        "gen_value/optimizer_unique_examples",
+        "gen_value/candidate_train_examples",
+        "gen_value/train_packs",
+        "gen_value/train_pack_tokens",
+        "gen_value/physical_train_tokens",
+    )
+    for metric in invariant_metrics:
+        values = [rank.get(metric) for rank in rank_metrics]
+        if any(value != values[0] for value in values[1:]):
+            raise RuntimeError(f"Generative-critic trainer ranks disagree on {metric}: {values}.")
+
+    reported_world_sizes = [int(rank.get("gen_value/trainer_world_size", 1)) for rank in rank_metrics]
+    if any(world_size != expected_world_size for world_size in reported_world_sizes):
+        raise RuntimeError(
+            "Generative-critic trainer ranks reported the wrong world size: "
+            f"expected {expected_world_size}, got {reported_world_sizes}."
+        )
+    reported_ranks = sorted(int(rank.get("gen_value/trainer_rank", 0)) for rank in rank_metrics)
+    if reported_ranks != list(range(expected_world_size)):
+        raise RuntimeError(
+            f"Generative-critic trainer ranks must cover 0..{expected_world_size - 1}, got {reported_ranks}."
+        )
+
+    for metric in (
+        "gen_value/training_preparation_seconds",
+        "gen_value/training_packing_seconds",
+        "gen_value/training_optimization_seconds",
+        "gen_value/reinforce_step_seconds",
+    ):
+        values = [float(rank[metric]) for rank in rank_metrics if metric in rank]
+        if values:
+            merged[metric] = max(values)
+
+    reinforce_losses = [float(rank["gen_value/reinforce_loss"]) for rank in rank_metrics]
+    merged["gen_value/reinforce_loss"] = sum(reinforce_losses) / len(reinforce_losses)
+
+    for value_metric, count_metric in (
+        ("gen_value/tis_ratio", "gen_value/tis_tokens"),
+        ("gen_value/tis_clipfrac", "gen_value/tis_tokens"),
+        ("gen_value/tis_mask_frac_kept", "gen_value/tis_mask_tokens"),
+    ):
+        numerator = 0.0
+        denominator = 0.0
+        for rank in rank_metrics:
+            if value_metric in rank and count_metric in rank:
+                count = float(rank[count_metric])
+                numerator += float(rank[value_metric]) * count
+                denominator += count
+        if denominator > 0.0:
+            merged[value_metric] = numerator / denominator
+            merged[count_metric] = denominator
+
+    local_pack_counts = [int(rank["_gen_value_local_train_packs"]) for rank in rank_metrics]
+    local_pack_tokens = [int(rank["_gen_value_local_train_pack_tokens"]) for rank in rank_metrics]
+    local_physical_tokens = [int(rank["_gen_value_local_physical_train_tokens"]) for rank in rank_metrics]
+    local_reinforce_tokens = [int(rank["_gen_value_local_train_tokens"]) for rank in rank_metrics]
+    if sum(local_pack_counts) != int(merged["gen_value/train_packs"]):
+        raise RuntimeError(
+            "Generative-critic rank pack accounting diverged: "
+            f"local sum {sum(local_pack_counts)} != global {merged['gen_value/train_packs']}."
+        )
+    if sum(local_pack_tokens) != int(merged["gen_value/train_pack_tokens"]):
+        raise RuntimeError(
+            "Generative-critic rank token accounting diverged: "
+            f"local sum {sum(local_pack_tokens)} != global {merged['gen_value/train_pack_tokens']}."
+        )
+    if sum(local_physical_tokens) != int(merged["gen_value/physical_train_tokens"]):
+        raise RuntimeError(
+            "Generative-critic rank physical-token accounting diverged: "
+            f"local sum {sum(local_physical_tokens)} != global {merged['gen_value/physical_train_tokens']}."
+        )
+    if sum(local_reinforce_tokens) != int(merged["gen_value/train_tokens"]):
+        raise RuntimeError(
+            "Generative-critic rank REINFORCE-token accounting diverged: "
+            f"local sum {sum(local_reinforce_tokens)} != global {merged['gen_value/train_tokens']}."
+        )
+    merged.update(
+        {
+            "gen_value/trainer_world_size": expected_world_size,
+            "gen_value/trainer_local_packs_min": min(local_pack_counts),
+            "gen_value/trainer_local_packs_max": max(local_pack_counts),
+            "gen_value/trainer_local_pack_tokens_min": min(local_pack_tokens),
+            "gen_value/trainer_local_pack_tokens_max": max(local_pack_tokens),
+            "gen_value/trainer_token_load_imbalance": (
+                max(local_pack_tokens) / (sum(local_pack_tokens) / expected_world_size)
+            ),
+        }
+    )
+    for metric in list(merged):
+        if metric.startswith("_gen_value_local_") or metric == "gen_value/trainer_rank":
+            merged.pop(metric)
+    return merged
 
 
 def _drain_gen_value_metrics(metrics_Q: Queue) -> dict[str, Any]:
@@ -1553,7 +1772,7 @@ def _gen_value_scoring_loop(
 
 
 def _gen_value_reinforce_loop(
-    trainer_actor: Any,
+    trainer_actors: list[Any],
     training_queue: ray_queue.Queue,
     training_progress: Any,
     batch_size: int,
@@ -1578,8 +1797,12 @@ def _gen_value_reinforce_loop(
     publish_complete_event: threading.Event,
 ) -> None:
     """Continuously train policy-sized, latest-first critic batches."""
+    if not trainer_actors:
+        raise ValueError("The generative-critic training loop requires at least one trainer actor.")
     logger.info(
-        "[GenValue] latest-first asynchronous critic trainer started (batch_size=%d, max_async_steps=%d).",
+        "[GenValue] latest-first asynchronous critic trainer started "
+        "(data_parallel=%d, batch_size=%d, max_async_steps=%d).",
+        len(trainer_actors),
         batch_size,
         max_async_steps,
     )
@@ -1739,13 +1962,17 @@ def _gen_value_reinforce_loop(
             # the selected, still-fresh batch.
             _hold_gen_value_training_for_checkpoint(checkpoint_pause_event, checkpoint_paused_event, stop_event)
             trained_rollouts += len(rollouts)
-            metrics, _ = utils.ray_get_with_progress(
-                [trainer_actor.reinforce_step.remote(pairs, optimizer_inclusion_probability)],
+            pairs_payload = pairs if len(trainer_actors) == 1 else ray.put(pairs)
+            rank_metrics, _ = utils.ray_get_with_progress(
+                [
+                    trainer_actor.reinforce_step.remote(pairs_payload, optimizer_inclusion_probability)
+                    for trainer_actor in trainer_actors
+                ],
                 desc="Training generative critic",
                 enable=False,
                 timeout=_GEN_VALUE_OPERATION_TIMEOUT_S,
             )
-            metrics = metrics[0]
+            metrics = _merge_gen_value_trainer_rank_metrics(rank_metrics)
             reported_train_examples = metrics.get("gen_value/train_examples")
             if reported_train_examples != len(optimizer_pairs):
                 raise RuntimeError(
@@ -1771,7 +1998,7 @@ def _gen_value_reinforce_loop(
             if model_snapshot_freq > 0 and critic_version % model_snapshot_freq == 0:
                 snapshot_start = time.perf_counter()
                 snapshot_paths, _ = utils.ray_get_with_progress(
-                    [trainer_actor.save_versioned_model.remote(output_dir, critic_version)],
+                    [trainer_actors[0].save_versioned_model.remote(output_dir, critic_version)],
                     desc=f"Saving generative critic version {critic_version}",
                     enable=False,
                     timeout=_GEN_VALUE_OPERATION_TIMEOUT_S,
@@ -1997,13 +2224,15 @@ def main():
         vllm_tensor_parallel_size=vllm_config.vllm_tensor_parallel_size,
     )
     gen_value_pool_gpus = args.gen_value_vllm_num_engines * args.gen_value_vllm_tensor_parallel_size
-    gen_value_trainer_gpus = 1
+    gen_value_trainer_gpus = args.gen_value_trainer_num_gpus
     gen_value_extra_gpus = gen_value_pool_gpus + gen_value_trainer_gpus
     combined_reqs = dict(base_reqs)
     combined_reqs["additional_topology_gpus"] = gen_value_extra_gpus
-    combined_reqs["additional_topology_cpus"] = gen_value_pool_gpus + 1
+    combined_reqs["additional_topology_cpus"] = gen_value_pool_gpus + gen_value_trainer_gpus
     combined_reqs["min_total_cluster_gpus"] = base_reqs["min_total_cluster_gpus"] + gen_value_extra_gpus
-    combined_reqs["min_total_cluster_cpus"] = base_reqs["min_total_cluster_cpus"] + gen_value_pool_gpus + 1
+    combined_reqs["min_total_cluster_cpus"] = (
+        base_reqs["min_total_cluster_cpus"] + gen_value_pool_gpus + gen_value_trainer_gpus
+    )
     logger.info(
         "Gen-value adds %d GPU(s): %d for the second vLLM pool (%d engine(s) × TP%d) "
         "and %d for the trainer. "
@@ -2253,6 +2482,7 @@ def main():
     # rollouts flow through one bounded queue; the critic consumes fixed batches independently
     # of policy steps and policy world size.
     gen_value_trainer: Any = None
+    gen_value_trainers: list[Any] = []
     gen_value_training_queue: ray_queue.Queue | None = None
     gen_value_training_progress: Any = None
     gen_value_checkpoint_path: str | None = None
@@ -2284,44 +2514,59 @@ def main():
                     "Generative-value trainer checkpoint is missing: "
                     f"{gen_value_checkpoint_path}/{gen_value_checkpoint_tag}"
                 )
-        gen_value_trainer = GenValueTrainerActor.remote(
-            gen_value_model_path,
-            gen_value_model_revision,
-            gen_value_tokenizer_path,
-            gen_value_tokenizer_revision,
-            gv_lr,
-            args.gen_value_score_min,
-            args.gen_value_score_max,
-            tensor_parallel_size=args.gen_value_vllm_tensor_parallel_size,
-            max_sequence_tokens=gen_value_max_model_len,
-            pack_length=gen_value_train_pack_length,
-            attn_implementation=olmo_core_attn_to_hf(model_config.attn_implementation),
-            gradient_checkpointing=model_config.gradient_checkpointing,
-            temperature=args.gen_value_temperature,
-            truncated_importance_sampling_ratio_cap=args.truncated_importance_sampling_ratio_cap,
-            tis_mask_lower=args.tis_mask_lower,
-            tis_mask_upper=args.tis_mask_upper,
-            reinforce_coef=args.gen_value_reinforce_coef,
-            reinforce_baseline=args.gen_value_reinforce_baseline,
-            pool_shared_state_returns=args.gen_value_pool_shared_state_returns,
-            weight_decay=args.weight_decay,
-            set_weight_decay_on_bias_and_norm=args.set_weight_decay_on_bias_and_norm,
-            fused_optimizer=args.fused_optimizer,
-            max_grad_norm=args.max_grad_norm if args.max_grad_norm is not None else 0.0,
-            checkpoint_path=gen_value_checkpoint_path,
-            checkpoint_tag=gen_value_checkpoint_tag,
-            trace_reservoir_size=args.gen_value_trace_reservoir_size,
-            trace_seed=args.seed,
-        )
+        trainer_master_addr = ray._private.services.get_node_ip_address().strip("[]")
+        trainer_master_port = utils.find_free_port()
+        for trainer_rank in range(args.gen_value_trainer_num_gpus):
+            gen_value_trainers.append(
+                GenValueTrainerActor.remote(
+                    gen_value_model_path,
+                    gen_value_model_revision,
+                    gen_value_tokenizer_path,
+                    gen_value_tokenizer_revision,
+                    gv_lr,
+                    args.gen_value_score_min,
+                    args.gen_value_score_max,
+                    tensor_parallel_size=args.gen_value_vllm_tensor_parallel_size,
+                    max_sequence_tokens=gen_value_max_model_len,
+                    pack_length=gen_value_train_pack_length,
+                    attn_implementation=olmo_core_attn_to_hf(model_config.attn_implementation),
+                    gradient_checkpointing=model_config.gradient_checkpointing,
+                    temperature=args.gen_value_temperature,
+                    truncated_importance_sampling_ratio_cap=args.truncated_importance_sampling_ratio_cap,
+                    tis_mask_lower=args.tis_mask_lower,
+                    tis_mask_upper=args.tis_mask_upper,
+                    reinforce_coef=args.gen_value_reinforce_coef,
+                    reinforce_baseline=args.gen_value_reinforce_baseline,
+                    pool_shared_state_returns=args.gen_value_pool_shared_state_returns,
+                    weight_decay=args.weight_decay,
+                    set_weight_decay_on_bias_and_norm=args.set_weight_decay_on_bias_and_norm,
+                    fused_optimizer=args.fused_optimizer,
+                    max_grad_norm=args.max_grad_norm if args.max_grad_norm is not None else 0.0,
+                    checkpoint_path=gen_value_checkpoint_path,
+                    checkpoint_tag=gen_value_checkpoint_tag,
+                    trace_reservoir_size=args.gen_value_trace_reservoir_size,
+                    trace_seed=args.seed,
+                    trainer_world_size=args.gen_value_trainer_num_gpus,
+                    trainer_rank=trainer_rank,
+                    trainer_master_addr=trainer_master_addr,
+                    trainer_master_port=trainer_master_port,
+                )
+            )
+        gen_value_trainer = gen_value_trainers[0]
         ready_results, _ = utils.ray_get_with_progress(
-            [gen_value_trainer.ready.remote(), gen_value_trainer.get_version.remote()],
+            [trainer.ready.remote() for trainer in gen_value_trainers]
+            + [trainer.get_version.remote() for trainer in gen_value_trainers],
             desc="Starting generative critic trainer",
             timeout=_GEN_VALUE_OPERATION_TIMEOUT_S,
         )
-        initial_gen_value_version = int(ready_results[1])
+        trainer_versions = [int(version) for version in ready_results[len(gen_value_trainers) :]]
+        if len(set(trainer_versions)) != 1:
+            raise RuntimeError(f"Generative-critic trainer ranks restored different versions: {trainer_versions}.")
+        initial_gen_value_version = trainer_versions[0]
         logger.info(
             "======== ✅ Gen-value trainer actor ready "
-            "(lr=%.2e, pack_length=%d, attention=%s, gradient_checkpointing=%s) =========",
+            "(data_parallel=%d, lr=%.2e, pack_length=%d, attention=%s, gradient_checkpointing=%s) =========",
+            len(gen_value_trainers),
             gv_lr,
             gen_value_train_pack_length,
             olmo_core_attn_to_hf(model_config.attn_implementation),
@@ -2453,7 +2698,7 @@ def main():
     if gen_value_trainer is not None:
         gen_value_reinforce_future = executor.submit(
             _gen_value_reinforce_loop,
-            gen_value_trainer,
+            gen_value_trainers,
             gen_value_training_queue,
             gen_value_training_progress,
             gen_value_batch_size,
@@ -2710,7 +2955,12 @@ def main():
                 time.perf_counter() - pause_started_at,
             )
         results, _ = utils.ray_get_with_progress(
-            [gen_value_trainer.save_checkpoint.remote(checkpoint_state_dir, training_step)],
+            [
+                trainer.save_checkpoint.remote(
+                    checkpoint_state_dir, training_step, write_rank_zero_artifacts=trainer_rank == 0
+                )
+                for trainer_rank, trainer in enumerate(gen_value_trainers)
+            ],
             desc="Saving generative critic checkpoint",
             timeout=_GEN_VALUE_OPERATION_TIMEOUT_S,
         )
