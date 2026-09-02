@@ -291,6 +291,24 @@ def _metrics(rows: list[dict[str, Any]]) -> dict[str, float | None]:
     return metrics
 
 
+def _clustered_delta_summary(
+    per_problem_deltas: dict[str, list[float]], *, bootstrap_samples: int, rng: np.random.Generator
+) -> dict[str, Any] | None:
+    """Summarize paired error deltas while treating problems as the independent unit."""
+    if not per_problem_deltas:
+        return None
+    problem_means = np.asarray([np.mean(values) for values in per_problem_deltas.values()], dtype=float)
+    samples = rng.choice(
+        problem_means, size=(bootstrap_samples, len(problem_means)), replace=True
+    ).mean(axis=1)
+    lower, upper = np.quantile(samples, [0.025, 0.975])
+    return {
+        "problems": len(problem_means),
+        "problem_balanced_mse_delta_candidate_minus_baseline": float(np.mean(problem_means)),
+        "problem_cluster_bootstrap_95pct_ci": [float(lower), float(upper)],
+    }
+
+
 def compare_scores(
     baseline_path: pathlib.Path,
     candidate_path: pathlib.Path,
@@ -312,6 +330,13 @@ def compare_scores(
     baseline_rows = []
     candidate_rows = []
     problem_deltas: dict[str, list[float]] = {}
+    absolute_prefix_problem_deltas: dict[str, dict[str, list[float]]] = {
+        "lt_1024": {},
+        "1024_2047": {},
+        "2048_4095": {},
+        "ge_4096": {},
+        "ge_2048": {},
+    }
     for key in baseline:
         baseline_row = baseline[key]
         candidate_row = candidate[key]
@@ -327,17 +352,30 @@ def compare_scores(
             if candidate_row["prediction"] is None
             else (candidate_row["prediction"] - candidate_row["target"]) ** 2
         )
-        problem_deltas.setdefault(baseline_row["problem"], []).append(candidate_error - baseline_error)
+        problem = baseline_row["problem"]
+        error_delta = candidate_error - baseline_error
+        problem_deltas.setdefault(problem, []).append(error_delta)
+        prefix_band = baseline_row["absolute_prefix_band"]
+        absolute_prefix_problem_deltas[prefix_band].setdefault(problem, []).append(error_delta)
+        if prefix_band in {"2048_4095", "ge_4096"}:
+            absolute_prefix_problem_deltas["ge_2048"].setdefault(problem, []).append(error_delta)
 
     baseline_metrics = _metrics(baseline_rows)
     candidate_metrics = _metrics(candidate_rows)
-    per_problem_deltas = np.asarray([np.mean(values) for values in problem_deltas.values()])
     rng = np.random.default_rng(seed)
-    samples = rng.choice(per_problem_deltas, size=(bootstrap_samples, len(per_problem_deltas)), replace=True).mean(
-        axis=1
+    overall_delta = _clustered_delta_summary(
+        problem_deltas, bootstrap_samples=bootstrap_samples, rng=rng
     )
-    delta_ci = np.quantile(samples, [0.025, 0.975])
-    problem_balanced_delta = float(np.mean(per_problem_deltas))
+    if overall_delta is None:
+        raise ValueError("Cannot compare empty score panels.")
+    absolute_prefix_deltas = {
+        band: summary
+        for band, deltas in absolute_prefix_problem_deltas.items()
+        if (
+            summary := _clustered_delta_summary(deltas, bootstrap_samples=bootstrap_samples, rng=rng)
+        )
+        is not None
+    }
 
     baseline_correct_mse = baseline_metrics["intermediate_correct_penalized_mse"]
     candidate_correct_mse = candidate_metrics["intermediate_correct_penalized_mse"]
@@ -347,9 +385,16 @@ def compare_scores(
     candidate_auc = candidate_metrics["intermediate_within_problem_auc"]
     baseline_selection_accuracy = baseline_metrics["intermediate_mc_selection_accuracy"]
     candidate_selection_accuracy = candidate_metrics["intermediate_mc_selection_accuracy"]
+    long_prefix_delta = absolute_prefix_deltas.get("ge_2048")
     checks = {
         "candidate_parse_rate_at_least_0_99": candidate_metrics["parse_rate"] >= 0.99,
-        "problem_balanced_mse_noninferior": float(delta_ci[1]) <= mse_noninferiority_margin,
+        "problem_balanced_mse_noninferior": (
+            overall_delta["problem_cluster_bootstrap_95pct_ci"][1] <= mse_noninferiority_margin
+        ),
+        "long_prefix_mse_noninferior": bool(
+            long_prefix_delta is not None
+            and long_prefix_delta["problem_cluster_bootstrap_95pct_ci"][1] <= mse_noninferiority_margin
+        ),
         "successful_intermediate_mse_improved": candidate_correct_mse < baseline_correct_mse,
         "failed_intermediate_mse_noninferior": (
             candidate_incorrect_mse <= baseline_incorrect_mse + mse_noninferiority_margin
@@ -368,8 +413,11 @@ def compare_scores(
         "probes": len(baseline_rows),
         "baseline": baseline_metrics,
         "candidate": candidate_metrics,
-        "problem_balanced_mse_delta_candidate_minus_baseline": problem_balanced_delta,
-        "problem_cluster_bootstrap_95pct_ci": [float(delta_ci[0]), float(delta_ci[1])],
+        "problem_balanced_mse_delta_candidate_minus_baseline": overall_delta[
+            "problem_balanced_mse_delta_candidate_minus_baseline"
+        ],
+        "problem_cluster_bootstrap_95pct_ci": overall_delta["problem_cluster_bootstrap_95pct_ci"],
+        "absolute_prefix_mse_deltas": absolute_prefix_deltas,
         "intermediate_within_problem_auc_delta_candidate_minus_baseline": candidate_auc - baseline_auc,
         "intermediate_mc_selection_accuracy_delta_candidate_minus_baseline": (
             candidate_selection_accuracy - baseline_selection_accuracy

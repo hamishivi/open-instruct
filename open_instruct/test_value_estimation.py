@@ -800,6 +800,16 @@ class TestValueEstimationStates(unittest.TestCase):
 
 
 class TestGenerativeValueScoreComparison(unittest.TestCase):
+    def test_clustered_delta_summary_uses_problem_means(self):
+        summary = compare_gen_value_scores._clustered_delta_summary(
+            {"a": [0.1, 0.3], "b": [-0.2]}, bootstrap_samples=100, rng=np.random.default_rng(0)
+        )
+
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary["problems"], 2)
+        self.assertAlmostEqual(summary["problem_balanced_mse_delta_candidate_minus_baseline"], 0.0)
+        self.assertEqual(len(summary["problem_cluster_bootstrap_95pct_ci"]), 2)
+
     def test_auc_is_problem_balanced_and_restricted_to_real_selection_pairs(self):
         rows = [
             {
