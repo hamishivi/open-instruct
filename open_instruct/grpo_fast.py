@@ -272,6 +272,19 @@ def wait_for_grpo_fast_placement_group(
         ) from exc
 
 
+@dataclasses.dataclass
+class _PendingGenValueTrainingGeneration:
+    """Stochastic critic completions submitted while policy optimization runs."""
+
+    requests: list[dict[str, Any]]
+    flat_entries: list[tuple[int, int, str]]
+    request_output_sizes: list[int]
+    non_empty_buckets: list[tuple[int, list[tuple[int, str]]]]
+    refs: list[Any]
+    critic_version: int
+    submitted_at: float
+
+
 @ray.remote(num_gpus=1)
 class PolicyTrainerRayProcess(RayProcess):
     def __init__(
@@ -1288,18 +1301,10 @@ class PolicyTrainerRayProcess(RayProcess):
             )
         return values_BT, training_pairs
 
-    def _score_gen_value_requests(self, requests: list[dict[str, Any]]) -> list[tuple[torch.Tensor, list[dict]]]:
-        """Batch actor-value and critic-training completions across the critic pool.
-
-        Actor-facing values may be generated greedily for stable GAE while the
-        independent training completion remains stochastic for REINFORCE. When
-        both temperatures match, retain the original single-generation path.
-        """
-        if not requests:
-            return []
-        if not self._gen_value_engines:
-            return [(torch.zeros(1, request["seq_len"] - 1, device=request["device"]), []) for request in requests]
-
+    def _prepare_gen_value_generation(
+        self, requests: list[dict[str, Any]]
+    ) -> tuple[list[tuple[int, int, str]], list[int], list[tuple[int, list[tuple[int, str]]]]]:
+        """Flatten requests and balance their prompts round-robin across critic engines."""
         flat_entries: list[tuple[int, int, str]] = []
         request_output_sizes: list[int] = []
         for request_idx, request in enumerate(requests):
@@ -1308,66 +1313,195 @@ class PolicyTrainerRayProcess(RayProcess):
             for prompt_idx, prompt in enumerate(prompts):
                 flat_entries.append((request_idx, prompt_idx, prompt))
 
-        critic_version = self._gen_value_version
-        args = self.args
-        max_new_tokens: int = getattr(args, "gen_value_max_new_tokens", 8)
-        training_temperature: float = getattr(args, "gen_value_temperature", 1.0)
-        inference_temperature = getattr(args, "gen_value_inference_temperature", None)
-        if inference_temperature is None:
-            inference_temperature = training_temperature
         n_eng = len(self._gen_value_engines)
         buckets: list[list[tuple[int, str]]] = [[] for _ in range(n_eng)]
         for flat_idx, (_, _, prompt) in enumerate(flat_entries):
             buckets[flat_idx % n_eng].append((flat_idx, prompt))
         non_empty = [(e, b) for e, b in enumerate(buckets) if b]
+        return flat_entries, request_output_sizes, non_empty
 
-        def generate_outputs(temperature: float, description: str) -> list[list[vllm_utils.RequestOutput]]:
-            refs = [
-                self._gen_value_engines[e].generate_request_outputs.remote(
-                    [p for _, p in bucket],
-                    temperature=temperature,
-                    max_tokens=max_new_tokens,
-                    top_p=1.0,
-                    stop=["</answer>"],
-                    include_stop_str_in_output=True,
-                    allow_prompt_truncation=False,
-                )
-                for e, bucket in non_empty
-            ]
-            engine_results, _ = ray_get_with_progress(
-                refs, desc=description, enable=False, timeout=WEIGHT_SYNC_TIMEOUT_S
+    def _submit_gen_value_generation(
+        self, non_empty_buckets: list[tuple[int, list[tuple[int, str]]]], temperature: float
+    ) -> list[Any]:
+        args = self.args
+        max_new_tokens: int = getattr(args, "gen_value_max_new_tokens", 8)
+        return [
+            self._gen_value_engines[engine_idx].generate_request_outputs.remote(
+                [prompt for _, prompt in bucket],
+                temperature=temperature,
+                max_tokens=max_new_tokens,
+                top_p=1.0,
+                stop=["</answer>"],
+                include_stop_str_in_output=True,
+                allow_prompt_truncation=False,
             )
-            outputs_by_request: list[list[vllm_utils.RequestOutput | None]] = [
-                [None] * size for size in request_output_sizes
-            ]
-            for (_, bucket), bucket_outputs in zip(non_empty, engine_results):
-                for (flat_idx, _), request_output in zip(bucket, bucket_outputs):
-                    request_idx, prompt_idx, _ = flat_entries[flat_idx]
-                    outputs_by_request[request_idx][prompt_idx] = request_output
-            if any(output is None for outputs in outputs_by_request for output in outputs):
-                raise RuntimeError("A generative-value completion was not returned by the vLLM pool.")
-            return [[output for output in outputs if output is not None] for outputs in outputs_by_request]
+            for engine_idx, bucket in non_empty_buckets
+        ]
 
-        inference_outputs = generate_outputs(
-            float(inference_temperature), "Scoring rollouts with actor-facing generative critic"
-        )
-        training_outputs = (
-            inference_outputs
-            if float(inference_temperature) == float(training_temperature)
-            else generate_outputs(training_temperature, "Sampling generative critic for REINFORCE")
-        )
+    @staticmethod
+    def _resolve_gen_value_generation(
+        flat_entries: list[tuple[int, int, str]],
+        request_output_sizes: list[int],
+        non_empty_buckets: list[tuple[int, list[tuple[int, str]]]],
+        refs: list[Any],
+        description: str,
+    ) -> list[list[vllm_utils.RequestOutput]]:
+        engine_results, _ = ray_get_with_progress(refs, desc=description, enable=False, timeout=WEIGHT_SYNC_TIMEOUT_S)
+        outputs_by_request: list[list[vllm_utils.RequestOutput | None]] = [
+            [None] * size for size in request_output_sizes
+        ]
+        for (_, bucket), bucket_outputs in zip(non_empty_buckets, engine_results, strict=True):
+            if len(bucket_outputs) != len(bucket):
+                raise RuntimeError(
+                    "A generative-value engine returned the wrong number of completions: "
+                    f"got {len(bucket_outputs)} for {len(bucket)} prompts."
+                )
+            for (flat_idx, _), request_output in zip(bucket, bucket_outputs, strict=True):
+                request_idx, prompt_idx, _ = flat_entries[flat_idx]
+                outputs_by_request[request_idx][prompt_idx] = request_output
+        if any(output is None for outputs in outputs_by_request for output in outputs):
+            raise RuntimeError("A generative-value completion was not returned by the vLLM pool.")
+        return [[output for output in outputs if output is not None] for outputs in outputs_by_request]
 
-        results = []
-        for request, actor_outputs, critic_outputs in zip(requests, inference_outputs, training_outputs, strict=True):
+    def _score_gen_value_requests_deferred_training(
+        self, requests: list[dict[str, Any]]
+    ) -> tuple[list[tuple[torch.Tensor, list[dict]]], _PendingGenValueTrainingGeneration | None]:
+        """Return actor values after submitting, but not waiting for, distinct training samples."""
+        if not requests:
+            return [], None
+        if not self._gen_value_engines:
+            results = [(torch.zeros(1, request["seq_len"] - 1, device=request["device"]), []) for request in requests]
+            return results, None
+
+        flat_entries, request_output_sizes, non_empty_buckets = self._prepare_gen_value_generation(requests)
+        critic_version = self._gen_value_version
+        args = self.args
+        training_temperature: float = getattr(args, "gen_value_temperature", 1.0)
+        inference_temperature = getattr(args, "gen_value_inference_temperature", None)
+        if inference_temperature is None:
+            inference_temperature = training_temperature
+
+        inference_refs = self._submit_gen_value_generation(non_empty_buckets, float(inference_temperature))
+        inference_outputs = self._resolve_gen_value_generation(
+            flat_entries,
+            request_output_sizes,
+            non_empty_buckets,
+            inference_refs,
+            "Scoring rollouts with actor-facing generative critic",
+        )
+        actor_results: list[tuple[torch.Tensor, list[dict]]] = []
+        for request, actor_outputs in zip(requests, inference_outputs, strict=True):
             actor_values, actor_pairs = self._finish_gen_value_scoring_request(request, actor_outputs)
-            if actor_outputs is critic_outputs:
-                training_pairs = actor_pairs
-            else:
-                _, training_pairs = self._finish_gen_value_scoring_request(request, critic_outputs)
-            for pair in training_pairs:
+            for pair in actor_pairs:
                 pair["critic_version"] = critic_version
-            results.append((actor_values, training_pairs))
-        return results
+            actor_results.append((actor_values, actor_pairs))
+
+        if float(inference_temperature) == float(training_temperature):
+            return actor_results, None
+
+        submitted_at = time.perf_counter()
+        training_refs = self._submit_gen_value_generation(non_empty_buckets, training_temperature)
+        pending = _PendingGenValueTrainingGeneration(
+            requests=requests,
+            flat_entries=flat_entries,
+            request_output_sizes=request_output_sizes,
+            non_empty_buckets=non_empty_buckets,
+            refs=training_refs,
+            critic_version=critic_version,
+            submitted_at=submitted_at,
+        )
+        return actor_results, pending
+
+    def _resolve_gen_value_training_generation(
+        self, pending: _PendingGenValueTrainingGeneration
+    ) -> tuple[list[list[dict]], dict[str, float]]:
+        """Join a deferred stochastic pass and convert it into critic-training pairs."""
+        join_started_at = time.perf_counter()
+        training_outputs = self._resolve_gen_value_generation(
+            pending.flat_entries,
+            pending.request_output_sizes,
+            pending.non_empty_buckets,
+            pending.refs,
+            "Joining stochastic generative-critic training samples",
+        )
+        resolved_at = time.perf_counter()
+        training_pairs_by_request: list[list[dict]] = []
+        for request, critic_outputs in zip(pending.requests, training_outputs, strict=True):
+            _, training_pairs = self._finish_gen_value_scoring_request(request, critic_outputs)
+            for pair in training_pairs:
+                pair["critic_version"] = pending.critic_version
+            training_pairs_by_request.append(training_pairs)
+        return training_pairs_by_request, {
+            "gen_value/training_generation_elapsed_seconds": resolved_at - pending.submitted_at,
+            "gen_value/training_generation_submit_to_join_seconds": join_started_at - pending.submitted_at,
+            "gen_value/training_generation_join_wait_seconds": resolved_at - join_started_at,
+        }
+
+    @staticmethod
+    def _replace_deferred_gen_value_training_pairs(
+        rollouts_by_sample_subseq: dict[tuple[int, int], dict], training_pairs_by_request: list[list[dict]]
+    ) -> None:
+        """Replace greedy pair placeholders with the corresponding stochastic samples."""
+        pairs_by_sample_subseq: dict[tuple[int, int], list[dict]] = {}
+        for sample_idx, request_pairs in enumerate(training_pairs_by_request):
+            for pair in request_pairs:
+                key = (sample_idx, int(pair["subseq_idx"]))
+                pairs_by_sample_subseq.setdefault(key, []).append(pair)
+
+        expected_keys = set(rollouts_by_sample_subseq)
+        received_keys = set(pairs_by_sample_subseq)
+        if received_keys != expected_keys:
+            raise RuntimeError(
+                "Deferred generative-critic samples do not match their actor-scoring placeholders: "
+                f"missing={sorted(expected_keys - received_keys)}, extra={sorted(received_keys - expected_keys)}."
+            )
+
+        metadata_keys = (
+            "subseq_idx",
+            "response_tokens_used",
+            "trajectory_fraction",
+            "response_token_limit",
+            "state_kind",
+        )
+        for key, training_pairs in pairs_by_sample_subseq.items():
+            rollout = rollouts_by_sample_subseq[key]
+            placeholder_pairs = rollout["pairs"]
+            if len(training_pairs) != len(placeholder_pairs):
+                raise RuntimeError(
+                    "Deferred generative-critic pair count changed for one rollout: "
+                    f"key={key}, actor={len(placeholder_pairs)}, training={len(training_pairs)}."
+                )
+            outcomes = {pair["outcome"] for pair in placeholder_pairs}
+            if len(outcomes) != 1:
+                raise RuntimeError(
+                    f"Generative-critic rollout {key} has inconsistent placeholder outcomes: {outcomes}."
+                )
+            outcome = outcomes.pop()
+            for placeholder, training_pair in zip(placeholder_pairs, training_pairs, strict=True):
+                if any(placeholder[field] != training_pair[field] for field in metadata_keys):
+                    raise RuntimeError(
+                        "Deferred generative-critic sample metadata changed between actor and training generation: "
+                        f"key={key}."
+                    )
+                if int(training_pair["critic_version"]) != int(rollout["critic_version"]):
+                    raise RuntimeError(
+                        "Deferred generative-critic sample version does not match its rollout: "
+                        f"key={key}, pair={training_pair['critic_version']}, rollout={rollout['critic_version']}."
+                    )
+                training_pair["outcome"] = outcome
+            rollout["pairs"] = training_pairs
+
+    def _score_gen_value_requests(self, requests: list[dict[str, Any]]) -> list[tuple[torch.Tensor, list[dict]]]:
+        """Synchronously score actor values and independent stochastic critic samples."""
+        actor_results, pending = self._score_gen_value_requests_deferred_training(requests)
+        if pending is None:
+            return actor_results
+
+        training_pairs_by_request, _ = self._resolve_gen_value_training_generation(pending)
+        return [
+            (actor_values, training_pairs)
+            for (actor_values, _), training_pairs in zip(actor_results, training_pairs_by_request, strict=True)
+        ]
 
     def _score_rollout_with_gen_value(
         self,
@@ -2153,6 +2287,8 @@ class PolicyTrainerRayProcess(RayProcess):
         # each rollout at fixed-chunk boundaries and use those piecewise-constant estimates as
         # the value function for GAE instead of the scalar value head.
         _gen_value_training_rollouts: list[dict] = []
+        _gen_value_training_rollouts_by_sample_subseq: dict[tuple[int, int], dict] = {}
+        _pending_gen_value_training_generation: _PendingGenValueTrainingGeneration | None = None
         if _use_gen_value and self._gen_value_training_queue is not None:
             latest_processed_step = self._get_gen_value_processed_policy_step()
             latest_trained_step, staleness_backpressure_seconds = self._wait_for_gen_value_source_window(training_step)
@@ -2242,7 +2378,15 @@ class PolicyTrainerRayProcess(RayProcess):
                     num_segment_prompts = sum(len(request["prompts"]) for request in gen_value_requests)
                     sae_step_metrics["gen_value/num_segment_prompts"] = float(num_segment_prompts)
                     gen_value_scoring_started_at = time.perf_counter()
-                    gen_value_results = self._score_gen_value_requests(gen_value_requests)
+                    if bool(getattr(self.args, "gen_value_overlap_training_generation", False)):
+                        gen_value_results, _pending_gen_value_training_generation = (
+                            self._score_gen_value_requests_deferred_training(gen_value_requests)
+                        )
+                        sae_step_metrics["gen_value/training_generation_overlapped"] = float(
+                            _pending_gen_value_training_generation is not None
+                        )
+                    else:
+                        gen_value_results = self._score_gen_value_requests(gen_value_requests)
                     sae_step_metrics["gen_value/scoring_seconds"] = time.perf_counter() - gen_value_scoring_started_at
                     if self._sp_world_size > 1:
                         # Followers need only the numeric values. Keeping request outputs
@@ -2383,16 +2527,19 @@ class PolicyTrainerRayProcess(RayProcess):
                                     "All generative-value samples from one rollout must use one critic version, "
                                     f"got {sorted(critic_versions)}."
                                 )
-                            _gen_value_training_rollouts.append(
-                                {
-                                    "rollout_id": f"{training_step}:{self.rank}:{i}:{subseq_idx}",
-                                    "policy_training_step": training_step,
-                                    "policy_model_version": int(policy_model_versions[subseq_idx]),
-                                    "policy_rank": self.rank,
-                                    "critic_version": critic_versions.pop(),
-                                    "pairs": rollout_pairs,
-                                }
-                            )
+                            rollout = {
+                                "rollout_id": f"{training_step}:{self.rank}:{i}:{subseq_idx}",
+                                "policy_training_step": training_step,
+                                "policy_model_version": int(policy_model_versions[subseq_idx]),
+                                "policy_rank": self.rank,
+                                "critic_version": critic_versions.pop(),
+                                "pairs": rollout_pairs,
+                            }
+                            rollout_key = (i, subseq_idx)
+                            if rollout_key in _gen_value_training_rollouts_by_sample_subseq:
+                                raise RuntimeError(f"Duplicate generative-critic rollout key: {rollout_key}.")
+                            _gen_value_training_rollouts.append(rollout)
+                            _gen_value_training_rollouts_by_sample_subseq[rollout_key] = rollout
                     resp_masks_np = resp_mask.long().cpu().numpy()
                     logprobs_np = None
                     if self.args.use_sae:
@@ -2651,61 +2798,6 @@ class PolicyTrainerRayProcess(RayProcess):
             if len(progress_deltas) == 2:
                 sae_step_metrics["value/separation_early_to_late_delta"] = (
                     progress_deltas["correct"] - progress_deltas["incorrect"]
-                )
-            # Pipe complete rollouts to the independent critic loop. Enqueueing is
-            # latest-wins and nonblocking; the separate trained-source barrier at
-            # the next step bounds policy progress while still allowing overlap.
-            # The oldest queued shard is explicitly discarded under pressure.
-            if _use_gen_value and self._gen_value_training_queue is not None:
-                if _gen_value_training_rollouts:
-                    sae_step_metrics.update(
-                        value_model_utils.gen_value_sampled_version_metrics(_gen_value_training_rollouts)
-                    )
-                if self._gen_value_training_progress is not None:
-                    ray.get(
-                        self._gen_value_training_progress.register_admitted_policy_step.remote(
-                            training_step, self.rank, len(_gen_value_training_rollouts)
-                        )
-                    )
-                critic_enqueue_started_at = time.perf_counter()
-                evicted_rollouts = self._enqueue_gen_value_rollouts_latest(_gen_value_training_rollouts)
-                sae_step_metrics["gen_value/training_queue_backpressure_seconds"] = (
-                    time.perf_counter() - critic_enqueue_started_at
-                )
-                sae_step_metrics["gen_value/max_async_steps"] = float(self.args.gen_value_max_async_steps)
-                self._gen_value_latest_enqueued_policy_training_step = training_step
-                sae_step_metrics["gen_value/enqueued_rollouts"] = float(len(_gen_value_training_rollouts))
-                sae_step_metrics["gen_value/queue_evicted_rollouts"] = float(len(evicted_rollouts))
-                if _gen_value_training_rollouts:
-                    enqueued_policy_versions = [
-                        int(rollout["policy_model_version"]) for rollout in _gen_value_training_rollouts
-                    ]
-                    self._gen_value_latest_enqueued_policy_model_version = max(enqueued_policy_versions)
-                    sae_step_metrics["gen_value/enqueued_policy_model_version_min"] = float(
-                        min(enqueued_policy_versions)
-                    )
-                    sae_step_metrics["gen_value/enqueued_policy_model_version_max"] = float(
-                        max(enqueued_policy_versions)
-                    )
-                if evicted_rollouts:
-                    evicted_steps = [int(rollout["policy_training_step"]) for rollout in evicted_rollouts]
-                    evicted_policy_versions = [int(rollout["policy_model_version"]) for rollout in evicted_rollouts]
-                    sae_step_metrics["gen_value/queue_evicted_source_step_min"] = float(min(evicted_steps))
-                    sae_step_metrics["gen_value/queue_evicted_source_step_max"] = float(max(evicted_steps))
-                    sae_step_metrics["gen_value/queue_evicted_policy_model_version_min"] = float(
-                        min(evicted_policy_versions)
-                    )
-                    sae_step_metrics["gen_value/queue_evicted_policy_model_version_max"] = float(
-                        max(evicted_policy_versions)
-                    )
-                sae_step_metrics["gen_value/training_queue_size"] = float(self._gen_value_training_queue.qsize())
-            if self._gen_value_latest_enqueued_policy_training_step is not None:
-                sae_step_metrics["gen_value/latest_enqueued_policy_training_step"] = float(
-                    self._gen_value_latest_enqueued_policy_training_step
-                )
-            if self._gen_value_latest_enqueued_policy_model_version is not None:
-                sae_step_metrics["gen_value/latest_enqueued_policy_model_version"] = float(
-                    self._gen_value_latest_enqueued_policy_model_version
                 )
             # Compute global regression diagnostics from additive sufficient
             # statistics, including the second moments needed for exact variance.
@@ -2993,6 +3085,75 @@ class PolicyTrainerRayProcess(RayProcess):
                 self.local_metrics["value/clipfrac_avg"] = float(value_clipfrac_avg)
                 if value_grad_norms:
                     self.local_metrics["value/grad_norm"] = sum(value_grad_norms) / len(value_grad_norms)
+
+            # The stochastic critic-training generation was launched as soon as
+            # actor-facing values arrived. Join it only after policy/value backprop
+            # so vLLM decoding and learner compute overlap without changing the
+            # samples, critic version, or data admitted to the async critic loop.
+            if _pending_gen_value_training_generation is not None:
+                training_pairs_by_request, generation_timing = self._resolve_gen_value_training_generation(
+                    _pending_gen_value_training_generation
+                )
+                self._replace_deferred_gen_value_training_pairs(
+                    _gen_value_training_rollouts_by_sample_subseq, training_pairs_by_request
+                )
+                sae_step_metrics.update(generation_timing)
+
+            # Pipe complete rollouts to the independent critic loop. Enqueueing is
+            # latest-wins and nonblocking; the separate trained-source barrier at
+            # the next step bounds policy progress while still allowing overlap.
+            # The oldest queued shard is explicitly discarded under pressure.
+            if _use_gen_value and self._gen_value_training_queue is not None:
+                if _gen_value_training_rollouts:
+                    sae_step_metrics.update(
+                        value_model_utils.gen_value_sampled_version_metrics(_gen_value_training_rollouts)
+                    )
+                if self._gen_value_training_progress is not None:
+                    ray.get(
+                        self._gen_value_training_progress.register_admitted_policy_step.remote(
+                            training_step, self.rank, len(_gen_value_training_rollouts)
+                        )
+                    )
+                critic_enqueue_started_at = time.perf_counter()
+                evicted_rollouts = self._enqueue_gen_value_rollouts_latest(_gen_value_training_rollouts)
+                sae_step_metrics["gen_value/training_queue_backpressure_seconds"] = (
+                    time.perf_counter() - critic_enqueue_started_at
+                )
+                sae_step_metrics["gen_value/max_async_steps"] = float(self.args.gen_value_max_async_steps)
+                self._gen_value_latest_enqueued_policy_training_step = training_step
+                sae_step_metrics["gen_value/enqueued_rollouts"] = float(len(_gen_value_training_rollouts))
+                sae_step_metrics["gen_value/queue_evicted_rollouts"] = float(len(evicted_rollouts))
+                if _gen_value_training_rollouts:
+                    enqueued_policy_versions = [
+                        int(rollout["policy_model_version"]) for rollout in _gen_value_training_rollouts
+                    ]
+                    self._gen_value_latest_enqueued_policy_model_version = max(enqueued_policy_versions)
+                    sae_step_metrics["gen_value/enqueued_policy_model_version_min"] = float(
+                        min(enqueued_policy_versions)
+                    )
+                    sae_step_metrics["gen_value/enqueued_policy_model_version_max"] = float(
+                        max(enqueued_policy_versions)
+                    )
+                if evicted_rollouts:
+                    evicted_steps = [int(rollout["policy_training_step"]) for rollout in evicted_rollouts]
+                    evicted_policy_versions = [int(rollout["policy_model_version"]) for rollout in evicted_rollouts]
+                    sae_step_metrics["gen_value/queue_evicted_source_step_min"] = float(min(evicted_steps))
+                    sae_step_metrics["gen_value/queue_evicted_source_step_max"] = float(max(evicted_steps))
+                    sae_step_metrics["gen_value/queue_evicted_policy_model_version_min"] = float(
+                        min(evicted_policy_versions)
+                    )
+                    sae_step_metrics["gen_value/queue_evicted_policy_model_version_max"] = float(
+                        max(evicted_policy_versions)
+                    )
+                sae_step_metrics["gen_value/training_queue_size"] = float(self._gen_value_training_queue.qsize())
+            if self._gen_value_latest_enqueued_policy_training_step is not None:
+                sae_step_metrics["gen_value/latest_enqueued_policy_training_step"] = float(
+                    self._gen_value_latest_enqueued_policy_training_step
+                )
+            if self._gen_value_latest_enqueued_policy_model_version is not None:
+                sae_step_metrics["gen_value/latest_enqueued_policy_model_version"] = float(
+                    self._gen_value_latest_enqueued_policy_model_version
+                )
             if tis_mask_enabled:
                 frac_kept = (
                     tis_mask_kept_tokens / tis_mask_total_tokens if tis_mask_total_tokens > 0 else torch.zeros(())

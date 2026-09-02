@@ -119,6 +119,7 @@ def test_genvalue_config_valid():
     cfg = GenValueExperimentConfig(**kwargs)
     assert cfg.use_generative_value_model is True
     assert cfg.gen_value_segmentation == "fixed"
+    assert cfg.gen_value_overlap_training_generation is False
 
 
 def test_genvalue_config_rejects_nonpositive_trainer_world_size():
@@ -357,6 +358,101 @@ def test_actor_values_and_reinforce_samples_use_independent_temperatures(monkeyp
     assert values.tolist() == [0.0]
     assert pairs[0]["request_output"]["temperature"] == 1.0
     assert pairs[0]["critic_version"] == 7
+
+
+def test_deferred_critic_training_generation_submits_before_join(monkeypatch):
+    trainer_cls = grpo_fast.PolicyTrainerRayProcess.__ray_metadata__.modified_class
+    trainer = object.__new__(trainer_cls)
+    trainer._gen_value_version = 9
+    trainer.args = SimpleNamespace(
+        gen_value_max_new_tokens=16, gen_value_temperature=1.0, gen_value_inference_temperature=0.0
+    )
+
+    engine = MagicMock()
+    engine.generate_request_outputs.remote.side_effect = lambda prompts, **kwargs: [
+        {"temperature": kwargs["temperature"], "prompt": prompt} for prompt in prompts
+    ]
+    trainer._gen_value_engines = [engine]
+    ray_get_descriptions: list[str] = []
+
+    def resolve(refs, desc, **_):
+        ray_get_descriptions.append(desc)
+        return refs, None
+
+    monkeypatch.setattr(grpo_fast, "ray_get_with_progress", resolve)
+
+    def finish(_, request, outputs):
+        temperature = float(outputs[0]["temperature"])
+        return torch.tensor([temperature]), [{"request_output": outputs[0], "request": request}]
+
+    trainer._finish_gen_value_scoring_request = MethodType(finish, trainer)
+    actor_results, pending = trainer._score_gen_value_requests_deferred_training([{"prompts": ["a"]}])
+
+    assert pending is not None
+    assert engine.generate_request_outputs.remote.call_count == 2
+    assert ray_get_descriptions == ["Scoring rollouts with actor-facing generative critic"]
+    actor_values, actor_pairs = actor_results[0]
+    assert actor_values.tolist() == [0.0]
+    assert actor_pairs[0]["request_output"]["temperature"] == 0.0
+    assert actor_pairs[0]["critic_version"] == 9
+
+    training_pairs_by_request, timing = trainer._resolve_gen_value_training_generation(pending)
+
+    assert ray_get_descriptions == [
+        "Scoring rollouts with actor-facing generative critic",
+        "Joining stochastic generative-critic training samples",
+    ]
+    assert training_pairs_by_request[0][0]["request_output"]["temperature"] == 1.0
+    assert training_pairs_by_request[0][0]["critic_version"] == 9
+    assert timing["gen_value/training_generation_elapsed_seconds"] >= 0.0
+    assert timing["gen_value/training_generation_submit_to_join_seconds"] >= 0.0
+    assert timing["gen_value/training_generation_join_wait_seconds"] >= 0.0
+
+
+def test_deferred_critic_training_pairs_replace_placeholders_and_preserve_outcome():
+    placeholder = {
+        "subseq_idx": 0,
+        "response_tokens_used": 512,
+        "trajectory_fraction": 0.5,
+        "response_token_limit": 8192,
+        "state_kind": "prefix",
+        "critic_version": 9,
+        "outcome": 1.0,
+        "request_output": "greedy",
+    }
+    stochastic = {
+        **placeholder,
+        "outcome": 0.0,
+        "request_output": "stochastic",
+    }
+    rollout = {"critic_version": 9, "pairs": [placeholder]}
+
+    grpo_fast.PolicyTrainerRayProcess.__ray_metadata__.modified_class._replace_deferred_gen_value_training_pairs(
+        {(0, 0): rollout}, [[stochastic]]
+    )
+
+    assert rollout["pairs"] == [stochastic]
+    assert rollout["pairs"][0]["request_output"] == "stochastic"
+    assert rollout["pairs"][0]["outcome"] == 1.0
+
+
+def test_deferred_critic_training_pairs_reject_metadata_drift():
+    placeholder = {
+        "subseq_idx": 0,
+        "response_tokens_used": 512,
+        "trajectory_fraction": 0.5,
+        "response_token_limit": 8192,
+        "state_kind": "prefix",
+        "critic_version": 9,
+        "outcome": 1.0,
+    }
+    stochastic = {**placeholder, "response_tokens_used": 513}
+    rollout = {"critic_version": 9, "pairs": [placeholder]}
+
+    with pytest.raises(RuntimeError, match="metadata changed"):
+        grpo_fast.PolicyTrainerRayProcess.__ray_metadata__.modified_class._replace_deferred_gen_value_training_pairs(
+            {(0, 0): rollout}, [[stochastic]]
+        )
 
 
 def test_matching_critic_temperatures_reuse_one_completion(monkeypatch):

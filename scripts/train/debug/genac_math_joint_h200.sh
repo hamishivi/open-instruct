@@ -81,6 +81,9 @@ GEN_VALUE_SYNC_FREQ="${GEN_VALUE_SYNC_FREQ:-1}"
 GEN_VALUE_MAX_ASYNC_STEPS="${GEN_VALUE_MAX_ASYNC_STEPS:-1}"
 GEN_VALUE_VLLM_NUM_ENGINES="${GEN_VALUE_VLLM_NUM_ENGINES:-1}"
 GEN_VALUE_TRAINER_NUM_GPUS="${GEN_VALUE_TRAINER_NUM_GPUS:-1}"
+# Actor values remain on the critical path; sample the independent stochastic
+# critic-training completion during policy backpropagation.
+GEN_VALUE_OVERLAP_TRAINING_GENERATION="${GEN_VALUE_OVERLAP_TRAINING_GENERATION:-true}"
 # Zero preserves full-batch critic optimization. A positive value requests a
 # shared-state-preserving stochastic minibatch of approximately this many critic
 # examples per fresh policy batch.
@@ -169,7 +172,7 @@ if [[ ! "${ASYNC_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: ASYNC_STEPS must be a positive integer" >&2
     exit 1
 fi
-for bool_var in ACTIVE_SAMPLING FILTER_ZERO_STD_SAMPLES INFLIGHT_UPDATES USE_VLLM_LOGPROBS DEEPSPEED_OFFLOAD_OPTIMIZER; do
+for bool_var in ACTIVE_SAMPLING FILTER_ZERO_STD_SAMPLES INFLIGHT_UPDATES USE_VLLM_LOGPROBS DEEPSPEED_OFFLOAD_OPTIMIZER GEN_VALUE_OVERLAP_TRAINING_GENERATION; do
     case "${!bool_var}" in
         true | false)
             ;;
@@ -291,6 +294,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --gen_value_train_pack_length "${GEN_VALUE_TRAIN_PACK_LENGTH}" \
     --gen_value_temperature 1.0 \
     --gen_value_inference_temperature 0.0 \
+    --gen_value_overlap_training_generation "${GEN_VALUE_OVERLAP_TRAINING_GENERATION}" \
     --gen_value_conditioning "${GEN_VALUE_CONDITIONING}" \
     --gen_value_use_icc true \
     --gen_value_icc_momentum 0.9 \

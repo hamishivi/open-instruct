@@ -983,6 +983,11 @@ class GenValueExperimentConfig(grpo_utils.GRPOExperimentConfig):
     # behavior by reusing ``gen_value_temperature``; zero enables greedy value
     # inference while the independent REINFORCE completion remains stochastic.
     gen_value_inference_temperature: float | None = None
+    # Submit the distinct stochastic REINFORCE completion after actor-facing
+    # values arrive, then join it after policy backpropagation. This changes
+    # scheduling only: prompts, temperatures, samples, targets, and freshness
+    # metadata are identical to the synchronous two-pass path.
+    gen_value_overlap_training_generation: bool = False
     # vLLM/trainer context length for the generative critic. When unset, use the
     # critic model's declared maximum. Requests must fit the full prompt and full
     # gen_value_max_new_tokens budget; neither side is silently shortened.
