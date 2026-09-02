@@ -72,9 +72,18 @@ class MakeDatasetConfig:
     continuations_per_probe: int = 32
     probe_interval: int = 1000
     min_probe_remaining_tokens: int = 64
-    # Probe selection mode: "fixed" (every probe_interval tokens) or "sae" (SAE boundaries
+    # Probe selection mode: "fixed" (every probe_interval tokens), "fraction"
+    # (fixed fractions of each sampled trajectory), or "sae" (SAE boundaries
     # from segment_rollout — tokens with prob < sae_threshold, downsampled to max_probes).
     probe_mode: str = "fixed"
+    probe_fractions: str = "0,0.25,0.5,0.75"
+    """Comma-separated trajectory fractions used when ``probe_mode=fraction``.
+
+    The causal final-action state is still added separately when
+    ``include_final_action_probe`` is enabled. Fractional probes make held-out
+    calibration cover early and middle sampled-trajectory states even when most
+    rollouts terminate before the first fixed token interval.
+    """
     sae_threshold: float = 0.2
     max_probes: int = 16
     include_final_action_probe: bool = True
@@ -471,6 +480,48 @@ def _fixed_probe_positions(
     return [positions[index] for index in sorted(set(selected_indices.tolist()))]
 
 
+def _parse_probe_fractions(specification: str) -> list[float]:
+    """Parse and validate trajectory-relative probe fractions."""
+    if not specification.strip():
+        raise ValueError("probe_fractions must contain at least one fraction.")
+    try:
+        fractions = [float(value.strip()) for value in specification.split(",")]
+    except ValueError as error:
+        raise ValueError(f"probe_fractions contains a nonnumeric value: {specification!r}.") from error
+    if any(not np.isfinite(fraction) or not 0.0 <= fraction <= 1.0 for fraction in fractions):
+        raise ValueError(f"probe_fractions values must be finite and in [0, 1], got {fractions}.")
+    return fractions
+
+
+def _fraction_probe_positions(
+    rollout_length: int, response_token_limit: int, probe_fractions: Sequence[float], include_final_action_probe: bool
+) -> list[int]:
+    """Choose causal states at fixed fractions of the sampled trajectory.
+
+    This mode is primarily for balanced held-out Monte Carlo panels. The
+    continuation budget remains the full configured response horizon; only the
+    locations of the diagnostic prefixes are trajectory-relative.
+    """
+    if rollout_length < 0 or response_token_limit <= 0 or rollout_length > response_token_limit:
+        raise ValueError(
+            "rollout_length must be nonnegative and no larger than the positive response_token_limit, got "
+            f"{rollout_length} and {response_token_limit}."
+        )
+    if not probe_fractions:
+        raise ValueError("probe_fractions must contain at least one fraction.")
+    fractions = [float(fraction) for fraction in probe_fractions]
+    if any(not np.isfinite(fraction) or not 0.0 <= fraction <= 1.0 for fraction in fractions):
+        raise ValueError(f"probe_fractions values must be finite and in [0, 1], got {fractions}.")
+    if rollout_length == 0:
+        return []
+
+    final_action_probe = rollout_length - 1
+    positions = [int(round(final_action_probe * fraction)) for fraction in fractions]
+    if include_final_action_probe:
+        positions.append(final_action_probe)
+    return sorted(set(positions))
+
+
 def _sae_probe_positions(
     rollout_tokens: Sequence[int],
     response_logprobs: Sequence[float],
@@ -699,9 +750,7 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
                 probe_positions = _sae_probe_positions(
                     tokens, logprobs, cfg.sae_threshold, cfg.max_probes, cfg.include_final_action_probe
                 )
-            else:
-                if cfg.probe_mode != "fixed":
-                    raise ValueError(f"Unknown probe_mode: {cfg.probe_mode!r}; expected 'fixed' or 'sae'.")
+            elif cfg.probe_mode == "fixed":
                 probe_positions = _fixed_probe_positions(
                     rollout_length=length,
                     response_token_limit=cfg.max_response_length,
@@ -710,6 +759,15 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
                     max_probes=cfg.max_probes,
                     include_final_action_probe=cfg.include_final_action_probe,
                 )
+            elif cfg.probe_mode == "fraction":
+                probe_positions = _fraction_probe_positions(
+                    rollout_length=length,
+                    response_token_limit=cfg.max_response_length,
+                    probe_fractions=_parse_probe_fractions(cfg.probe_fractions),
+                    include_final_action_probe=cfg.include_final_action_probe,
+                )
+            else:
+                raise ValueError(f"Unknown probe_mode: {cfg.probe_mode!r}; expected 'fixed', 'fraction', or 'sae'.")
             row = {
                 "prompt": prompt,
                 "problem": problems[orig_idx],
@@ -727,11 +785,11 @@ def make_dataset(cfg: MakeDatasetConfig) -> str:
                 "actor_model_name": cfg.actor_model_name or cfg.model_name_or_path,
                 "actor_success_rate": observed_actor_success_rate,
                 "probe_mode": cfg.probe_mode,
-                "probe_semantics": (
-                    "online_segment_starts_plus_final_action"
-                    if cfg.probe_mode == "sae"
-                    else "fixed_intervals_plus_final_action"
-                ),
+                "probe_semantics": {
+                    "sae": "online_segment_starts_plus_final_action",
+                    "fixed": "fixed_intervals_plus_final_action",
+                    "fraction": "trajectory_fractions_plus_final_action",
+                }[cfg.probe_mode],
             }
             row_idx = len(rows)
             rows.append(row)

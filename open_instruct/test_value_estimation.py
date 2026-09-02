@@ -567,6 +567,39 @@ class TestValueEstimationStates(unittest.TestCase):
         self.assertEqual(len(positions), 4)
         self.assertEqual(positions[-1], 7999)
 
+    def test_fraction_probes_cover_trajectory_and_preserve_final_action(self):
+        positions = value_estimation._fraction_probe_positions(
+            rollout_length=1000,
+            response_token_limit=8192,
+            probe_fractions=value_estimation._parse_probe_fractions("0,0.25,0.5,0.75"),
+            include_final_action_probe=True,
+        )
+
+        self.assertEqual(positions, [0, 250, 500, 749, 999])
+
+    def test_fraction_probes_deduplicate_short_trajectory_states(self):
+        positions = value_estimation._fraction_probe_positions(
+            rollout_length=2,
+            response_token_limit=8192,
+            probe_fractions=[0.0, 0.25, 0.5, 0.75, 1.0],
+            include_final_action_probe=True,
+        )
+
+        self.assertEqual(positions, [0, 1])
+
+    def test_fraction_probes_reject_invalid_configuration(self):
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            value_estimation._parse_probe_fractions("")
+        with self.assertRaisesRegex(ValueError, "nonnumeric"):
+            value_estimation._parse_probe_fractions("0,quarter")
+        with self.assertRaisesRegex(ValueError, "finite and in"):
+            value_estimation._fraction_probe_positions(
+                rollout_length=100,
+                response_token_limit=8192,
+                probe_fractions=[0.0, 1.1],
+                include_final_action_probe=True,
+            )
+
     def test_numpy_correlations_do_not_require_scipy(self):
         self.assertAlmostEqual(value_estimation._pearson_correlation([1, 2, 3], [2, 4, 6]), 1.0)
         self.assertAlmostEqual(value_estimation._spearman_correlation([1, 2, 2, 3], [3, 2, 2, 1]), -1.0)
