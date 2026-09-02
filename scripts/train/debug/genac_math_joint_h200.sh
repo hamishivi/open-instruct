@@ -5,6 +5,8 @@
 #
 # GPU layout: one learner, one policy vLLM, one critic vLLM, one critic trainer.
 # By default total_episodes = 300 joint steps * 32 prompts * 8 samples = 76,800.
+# The prompt and group dimensions are environment-overridable so matched
+# paper-scale runs can increase optimizer batch size without editing this file.
 # Optional critic-only warmup steps are added before those 300 policy updates;
 # they do not reduce the requested number of joint-training steps.
 # Two half-rate actor epochs make DAPO clipping active on the second pass while
@@ -86,8 +88,8 @@ GEN_VALUE_MIN_ADVANTAGE_GAP="${GEN_VALUE_MIN_ADVANTAGE_GAP:-disabled}"
 GEN_VALUE_MODEL_SNAPSHOT_FREQ="${GEN_VALUE_MODEL_SNAPSHOT_FREQ:-25}"
 JOINT_TRAINING_STEPS="${JOINT_TRAINING_STEPS:-300}"
 VALUE_WARMUP_STEPS="${VALUE_WARMUP_STEPS:-0}"
-NUM_UNIQUE_PROMPTS_ROLLOUT=32
-NUM_SAMPLES_PER_PROMPT_ROLLOUT=8
+NUM_UNIQUE_PROMPTS_ROLLOUT="${NUM_UNIQUE_PROMPTS_ROLLOUT:-32}"
+NUM_SAMPLES_PER_PROMPT_ROLLOUT="${NUM_SAMPLES_PER_PROMPT_ROLLOUT:-8}"
 
 if [[ ! "${JOINT_TRAINING_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: JOINT_TRAINING_STEPS must be at least 1" >&2
@@ -103,6 +105,14 @@ if [[ ! "${GEN_VALUE_SCORE_MAX}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [[ ! "${GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE}" =~ ^[0-9]+$ ]]; then
     echo "ERROR: GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE must be a nonnegative integer" >&2
+    exit 1
+fi
+if [[ ! "${NUM_UNIQUE_PROMPTS_ROLLOUT}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: NUM_UNIQUE_PROMPTS_ROLLOUT must be a positive integer" >&2
+    exit 1
+fi
+if [[ ! "${NUM_SAMPLES_PER_PROMPT_ROLLOUT}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: NUM_SAMPLES_PER_PROMPT_ROLLOUT must be a positive integer" >&2
     exit 1
 fi
 GEN_VALUE_TRAIN_TARGET_ARGS=()
