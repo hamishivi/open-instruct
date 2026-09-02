@@ -9,7 +9,12 @@ import unittest
 from unittest import mock
 
 import numpy as np
-from scripts.data import prepare_gen_value_mc_sft, prepare_gen_value_sft, synthesize_gen_value_sft
+from scripts.data import (
+    prepare_gen_value_mc_sft,
+    prepare_gen_value_sft,
+    split_gen_value_mc_dataset,
+    synthesize_gen_value_sft,
+)
 from scripts.eval.value_estimation import compare_gen_value_scores
 
 from open_instruct import value_estimation
@@ -25,6 +30,50 @@ class _FakeTokenizer:
 
 
 class TestValueEstimationStates(unittest.TestCase):
+    def test_mc_dataset_split_keeps_normalized_problem_pairs_disjoint(self):
+        rows = [
+            {"id": "a1", "problem": "problem  a\n", "ground_truth": "1", "rollout_is_correct": True},
+            {"id": "a0", "problem": "problem a", "ground_truth": "1", "rollout_is_correct": False},
+            {"id": "b1", "problem": "problem b", "ground_truth": "2", "rollout_is_correct": True},
+            {"id": "b0", "problem": "problem b", "ground_truth": "2", "rollout_is_correct": False},
+            {"id": "c1", "problem": "problem c", "ground_truth": "3", "rollout_is_correct": True},
+            {"id": "c0", "problem": "problem c", "ground_truth": "3", "rollout_is_correct": False},
+        ]
+
+        train_rows, heldout_rows, summary = split_gen_value_mc_dataset.split_paired_mc_rows(
+            rows, heldout_problem_count=1, seed=37
+        )
+
+        train_identities = {value_estimation.normalize_problem_identity(row["problem"]) for row in train_rows}
+        heldout_identities = {value_estimation.normalize_problem_identity(row["problem"]) for row in heldout_rows}
+        self.assertFalse(train_identities & heldout_identities)
+        self.assertCountEqual([row["id"] for row in train_rows + heldout_rows], [row["id"] for row in rows])
+        self.assertEqual(len(train_rows), 4)
+        self.assertEqual(len(heldout_rows), 2)
+        self.assertEqual(summary["formatting_variant_identities"], 1)
+
+    def test_mc_dataset_split_rejects_unpaired_problem(self):
+        rows = [
+            {"problem": "broken", "ground_truth": "1", "rollout_is_correct": True},
+            {"problem": "broken", "ground_truth": "1", "rollout_is_correct": True},
+            {"problem": "other", "ground_truth": "2", "rollout_is_correct": True},
+            {"problem": "other", "ground_truth": "2", "rollout_is_correct": False},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "exactly one correct and one incorrect"):
+            split_gen_value_mc_dataset.split_paired_mc_rows(rows, heldout_problem_count=1, seed=37)
+
+    def test_mc_dataset_split_rejects_missing_ground_truth(self):
+        rows = [
+            {"problem": "broken", "ground_truth": None, "rollout_is_correct": True},
+            {"problem": "broken", "ground_truth": None, "rollout_is_correct": False},
+            {"problem": "other", "ground_truth": "2", "rollout_is_correct": True},
+            {"problem": "other", "ground_truth": "2", "rollout_is_correct": False},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "no nonempty ground truth"):
+            split_gen_value_mc_dataset.split_paired_mc_rows(rows, heldout_problem_count=1, seed=37)
+
     def test_mc_value_sft_wrapper_forwards_absolute_prefix_gate(self):
         repository_root = pathlib.Path(__file__).parents[1]
         with tempfile.TemporaryDirectory(prefix="gen-value-wrapper-test-") as directory:
