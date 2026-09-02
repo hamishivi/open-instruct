@@ -38,6 +38,7 @@ INFLIGHT_UPDATES="${INFLIGHT_UPDATES:-false}"
 ASYNC_STEPS="${ASYNC_STEPS:-1}"
 NO_RESAMPLING_PASS_RATE="${NO_RESAMPLING_PASS_RATE:-none}"
 TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP="${TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP:-0.0}"
+DEEPSPEED_OFFLOAD_OPTIMIZER="${DEEPSPEED_OFFLOAD_OPTIMIZER:-true}"
 
 if [[ ! "${CONTROL_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: CONTROL_STEPS must be at least 1" >&2
@@ -67,7 +68,7 @@ if [[ ! "${ASYNC_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: ASYNC_STEPS must be at least 1" >&2
     exit 1
 fi
-for bool_var in ACTIVE_SAMPLING FILTER_ZERO_STD_SAMPLES INFLIGHT_UPDATES; do
+for bool_var in ACTIVE_SAMPLING FILTER_ZERO_STD_SAMPLES INFLIGHT_UPDATES DEEPSPEED_OFFLOAD_OPTIMIZER; do
     case "${!bool_var}" in
         true | false) ;;
         *)
@@ -83,6 +84,10 @@ fi
 NO_RESAMPLING_ARGS=()
 if [[ "${NO_RESAMPLING_PASS_RATE}" != "none" ]]; then
     NO_RESAMPLING_ARGS+=(--no_resampling_pass_rate "${NO_RESAMPLING_PASS_RATE}")
+fi
+DEEPSPEED_OFFLOAD_ARGS=()
+if [[ "${DEEPSPEED_OFFLOAD_OPTIMIZER}" == "true" ]]; then
+    DEEPSPEED_OFFLOAD_ARGS+=(--deepspeed_offload_optimizer)
 fi
 TOTAL_EPISODES=$((CONTROL_STEPS * NUM_UNIQUE_PROMPTS_ROLLOUT * NUM_SAMPLES_PER_PROMPT_ROLLOUT))
 
@@ -146,7 +151,7 @@ python open_instruct/grpo_fast.py \
     --num_epochs "${NUM_EPOCHS}" \
     --num_mini_batches 1 \
     --deepspeed_stage 3 \
-    --deepspeed_offload_optimizer \
+    "${DEEPSPEED_OFFLOAD_ARGS[@]}" \
     --num_learners_per_node "${NUM_POLICY_LEARNERS}" \
     --sequence_parallel_size 1 \
     --vllm_num_engines "${NUM_POLICY_VLLM_ENGINES}" \
