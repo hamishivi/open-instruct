@@ -38,6 +38,7 @@ INFLIGHT_UPDATES="${INFLIGHT_UPDATES:-false}"
 ASYNC_STEPS="${ASYNC_STEPS:-1}"
 NO_RESAMPLING_PASS_RATE="${NO_RESAMPLING_PASS_RATE:-none}"
 TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP="${TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP:-0.0}"
+USE_VLLM_LOGPROBS="${USE_VLLM_LOGPROBS:-true}"
 DEEPSPEED_OFFLOAD_OPTIMIZER="${DEEPSPEED_OFFLOAD_OPTIMIZER:-true}"
 
 if [[ ! "${CONTROL_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
@@ -68,7 +69,7 @@ if [[ ! "${ASYNC_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: ASYNC_STEPS must be at least 1" >&2
     exit 1
 fi
-for bool_var in ACTIVE_SAMPLING FILTER_ZERO_STD_SAMPLES INFLIGHT_UPDATES DEEPSPEED_OFFLOAD_OPTIMIZER; do
+for bool_var in ACTIVE_SAMPLING FILTER_ZERO_STD_SAMPLES INFLIGHT_UPDATES USE_VLLM_LOGPROBS DEEPSPEED_OFFLOAD_OPTIMIZER; do
     case "${!bool_var}" in
         true | false) ;;
         *)
@@ -88,6 +89,10 @@ fi
 DEEPSPEED_OFFLOAD_ARGS=()
 if [[ "${DEEPSPEED_OFFLOAD_OPTIMIZER}" == "true" ]]; then
     DEEPSPEED_OFFLOAD_ARGS+=(--deepspeed_offload_optimizer)
+fi
+VLLM_LOGPROB_ARGS=()
+if [[ "${USE_VLLM_LOGPROBS}" == "true" ]]; then
+    VLLM_LOGPROB_ARGS+=(--use_vllm_logprobs)
 fi
 TOTAL_EPISODES=$((CONTROL_STEPS * NUM_UNIQUE_PROMPTS_ROLLOUT * NUM_SAMPLES_PER_PROMPT_ROLLOUT))
 
@@ -142,7 +147,7 @@ python open_instruct/grpo_fast.py \
     --beta "${POLICY_BETA}" \
     --loss_fn dapo \
     --clip_higher 0.272 \
-    --use_vllm_logprobs \
+    "${VLLM_LOGPROB_ARGS[@]}" \
     --truncated_importance_sampling_ratio_cap "${TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP}" \
     --advantage_normalization_type centered \
     --learning_rate "${POLICY_LEARNING_RATE}" \
