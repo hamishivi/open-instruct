@@ -141,7 +141,6 @@ def evaluate(config: EvalConfig) -> dict[str, object]:
         max_model_len=config.max_model_len,
         enable_prefix_caching=config.enable_prefix_caching,
         generation_config="vllm",
-        enforce_eager=True,
     )
     started = time.perf_counter()
     outputs = llm.generate(
