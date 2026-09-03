@@ -4396,8 +4396,10 @@ def maybe_evaluate(
                 )
                 return False
 
-        # Wait for final-step evals if needed; otherwise consume immediately after the queue size gate above.
-        timeout = 100 if is_final_step else 0.01
+        # A final panel is part of the experiment result, so give it a realistic
+        # generation timeout and fail loudly instead of silently dropping it.
+        final_eval_timeout_seconds = getattr(args, "final_eval_timeout_seconds", 1800.0)
+        timeout = final_eval_timeout_seconds if is_final_step else 0.01
 
         # Accumulate evaluation results from all vLLM engines
         eval_result, eval_batch, eval_reward_metrics, _ = accumulate_inference_batches(
@@ -4424,6 +4426,18 @@ def maybe_evaluate(
             eval_result.finish_reasons
         )
         eval_reward_metrics = {f"eval/{key}": val for key, val in eval_reward_metrics.items()}
+        eval_model_step_min = eval_reward_metrics.get("eval/model_step_min")
+        eval_model_step_max = eval_reward_metrics.get("eval/model_step_max")
+        if eval_model_step_min is not None and eval_model_step_max is not None:
+            eval_model_step_spread = float(eval_model_step_max - eval_model_step_min)
+            eval_reward_metrics["eval/model_step_spread"] = eval_model_step_spread
+            if eval_model_step_spread > 0:
+                logger.warning(
+                    "Evaluation panel mixes policy model steps %s through %s; "
+                    "use a frozen-checkpoint evaluation for an exact comparison.",
+                    eval_model_step_min,
+                    eval_model_step_max,
+                )
         eval_pass_at_k_metrics: dict[str, float] = {}
         scores = np.array(eval_batch.scores)
         eval_k = eval_generation_config.n
@@ -4470,7 +4484,11 @@ def maybe_evaluate(
             print_rich_table(df.iloc[:1])
         del table
         return True
-    except Empty:
+    except Empty as exc:
+        if is_final_step:
+            raise RuntimeError(
+                f"Final evaluation did not produce a complete panel within {final_eval_timeout_seconds:.1f} seconds."
+            ) from exc
         logger.warning("[Main Thread] 🙈 Evaluation responses not received")
         return False
 

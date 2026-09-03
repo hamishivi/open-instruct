@@ -410,12 +410,15 @@ class TestMaybeEvaluate(unittest.TestCase):
         mock_accumulate.assert_not_called()
 
     def test_final_step_calls_accumulate_even_when_queue_is_incomplete(self):
-        args = SimpleNamespace(num_training_steps=10, with_tracking=False)
+        args = SimpleNamespace(num_training_steps=10, with_tracking=False, final_eval_timeout_seconds=1800.0)
         eval_dataset = self._build_eval_dataset(num_prompts=3)
         eval_queue = _QueueWithSize(size=0)
         eval_generation_config = SimpleNamespace(n=32)
 
-        with patch("open_instruct.grpo_fast.accumulate_inference_batches", side_effect=Empty) as mock_accumulate:
+        with (
+            patch("open_instruct.grpo_fast.accumulate_inference_batches", side_effect=Empty) as mock_accumulate,
+            self.assertRaisesRegex(RuntimeError, "Final evaluation did not produce a complete panel"),
+        ):
             maybe_evaluate(
                 args=args,
                 training_step=10,
@@ -430,6 +433,7 @@ class TestMaybeEvaluate(unittest.TestCase):
             )
 
         mock_accumulate.assert_called_once()
+        self.assertEqual(mock_accumulate.call_args.kwargs["timeout"], 1800.0)
 
     def test_records_eval_model_step_summary(self):
         args = SimpleNamespace(num_training_steps=200, with_tracking=False)
@@ -479,6 +483,7 @@ class TestMaybeEvaluate(unittest.TestCase):
         self.assertEqual(logged["eval/model_step_min"], 102.0)
         self.assertEqual(logged["eval/model_step_max"], 104.0)
         self.assertEqual(logged["eval/model_step_mean"], 103.0)
+        self.assertEqual(logged["eval/model_step_spread"], 2.0)
 
     def test_records_pass_at_k_metrics(self):
         args = SimpleNamespace(num_training_steps=200, with_tracking=False)
