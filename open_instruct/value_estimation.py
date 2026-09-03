@@ -142,6 +142,7 @@ class ScoreDatasetConfig:
     vllm_gpu_memory_utilization: float = 0.85
     vllm_max_model_len: int = 32768
     vllm_max_num_batched_tokens: int | None = None
+    vllm_max_num_seqs: int | None = None
     vllm_enable_prefix_caching: bool = True
     vllm_disable_custom_all_reduce: bool = False
     vllm_enforce_eager: bool = False
@@ -1507,6 +1508,7 @@ def _score_with_generative_value(
         gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
         max_model_len=cfg.vllm_max_model_len,
         max_num_batched_tokens=cfg.vllm_max_num_batched_tokens,
+        max_num_seqs=cfg.vllm_max_num_seqs,
         enable_prefix_caching=cfg.vllm_enable_prefix_caching,
         disable_custom_all_reduce=cfg.vllm_disable_custom_all_reduce,
         enforce_eager=cfg.vllm_enforce_eager,

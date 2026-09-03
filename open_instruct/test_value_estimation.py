@@ -40,6 +40,7 @@ class TestValueEstimationStates(unittest.TestCase):
         )
 
         self.assertEqual(config.vllm_max_model_len, 32768)
+        self.assertIsNone(config.vllm_max_num_seqs)
         self.assertTrue(config.vllm_enable_prefix_caching)
         self.assertFalse(config.vllm_disable_custom_all_reduce)
         self.assertFalse(config.vllm_enforce_eager)
