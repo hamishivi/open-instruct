@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Joint actor/critic run using a separately validated generative critic. The
-# critic path must be the final `gen_value_model` directory produced by
-# genac_math_value_pretrain_h200.sh.
+# critic path must be a separately initialized generative-critic model
+# directory, such as the final model produced by value pretraining.
 #
 # Default GPU layout: one learner, one policy vLLM, one critic vLLM, and one
 # critic trainer. Critic inference and data-parallel trainer counts are
@@ -64,6 +64,7 @@ mkdir -p "${HOME}/.triton/autotune"
 EXP_NAME="${EXP_NAME:-genac-math-joint-h200}"
 RUN_OUTPUT_DIR="${RUN_OUTPUT_DIR:-${PWD}/outputs/${EXP_NAME}}"
 CHECKPOINT_STATE_DIR="${CHECKPOINT_STATE_DIR:-${RUN_OUTPUT_DIR}/checkpoint_states}"
+POLICY_MODEL_PATH="${POLICY_MODEL_PATH:-Qwen/Qwen3-4B-Base}"
 GEN_VALUE_CONDITIONING="${GEN_VALUE_CONDITIONING:-none}"
 GEN_VALUE_REINFORCE_BASELINE="${GEN_VALUE_REINFORCE_BASELINE:-leave_one_out_by_outcome}"
 GEN_VALUE_SCORE_MAX="${GEN_VALUE_SCORE_MAX:-10}"
@@ -235,7 +236,7 @@ python open_instruct/grpo_fast_genvalue.py \
     --active_sampling "${ACTIVE_SAMPLING}" \
     --filter_zero_std_samples "${FILTER_ZERO_STD_SAMPLES}" \
     "${NO_RESAMPLING_ARGS[@]}" \
-    --model_name_or_path Qwen/Qwen3-4B-Base \
+    --model_name_or_path "${POLICY_MODEL_PATH}" \
     --chat_template_name qwen_instruct_user_boxed_math \
     --temperature 1.0 \
     --apply_verifiable_reward true \
