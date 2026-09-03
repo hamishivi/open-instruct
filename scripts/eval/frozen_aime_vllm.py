@@ -40,9 +40,10 @@ class EvalConfig:
     tensor_parallel_size: int = 1
     gpu_memory_utilization: float = 0.85
     # vLLM 0.19's Qwen3 profile path fails in GEMM initialization when this is
-    # reduced enough for the scheduler to choose an 8,192-token batch. The
-    # default 512-sequence capacity selects the known-good 16,384-token profile.
+    # paired with a reduced scheduler token batch. Keep the sequence capacity
+    # aligned with the known-good production-style profile below.
     max_num_seqs: int = 512
+    max_num_batched_tokens: int = 16384
     enable_prefix_caching: bool = True
 
 
@@ -63,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tensor_parallel_size", type=int, default=EvalConfig.tensor_parallel_size)
     parser.add_argument("--gpu_memory_utilization", type=float, default=EvalConfig.gpu_memory_utilization)
     parser.add_argument("--max_num_seqs", type=int, default=EvalConfig.max_num_seqs)
+    parser.add_argument("--max_num_batched_tokens", type=int, default=EvalConfig.max_num_batched_tokens)
     parser.add_argument(
         "--disable_prefix_caching",
         action="store_false",
@@ -86,6 +88,8 @@ def validate_config(config: EvalConfig) -> None:
         raise ValueError("top_p must be in (0, 1]")
     if config.max_num_seqs < 1:
         raise ValueError("max_num_seqs must be at least 1")
+    if config.max_num_batched_tokens < 1:
+        raise ValueError("max_num_batched_tokens must be at least 1")
 
 
 def evaluate(config: EvalConfig) -> dict[str, object]:
@@ -147,6 +151,7 @@ def evaluate(config: EvalConfig) -> dict[str, object]:
         gpu_memory_utilization=config.gpu_memory_utilization,
         max_model_len=config.max_model_len,
         max_num_seqs=config.max_num_seqs,
+        max_num_batched_tokens=config.max_num_batched_tokens,
         enable_prefix_caching=config.enable_prefix_caching,
         generation_config="vllm",
     )
