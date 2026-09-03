@@ -17,17 +17,17 @@ export NUM_POLICY_VLLM_ENGINES="${NUM_POLICY_VLLM_ENGINES:-1}"
 export GEN_VALUE_VLLM_NUM_ENGINES="${GEN_VALUE_VLLM_NUM_ENGINES:-1}"
 export GEN_VALUE_TRAINER_NUM_GPUS="${GEN_VALUE_TRAINER_NUM_GPUS:-1}"
 
-# Match the paper's actor optimizer and symmetric PPO clipping. Keep the
-# critic's conservative learning rate from the completed 4B run. The critic
-# consumes all fresh rollouts but uses an unbiased bounded optimizer subset so
-# its long-context backward pass can remain concurrent with policy training.
+# Match the paper's actor and critic learning rates and symmetric PPO clipping.
+# The critic consumes all fresh rollouts but uses an unbiased bounded optimizer
+# subset so its long-context backward pass can remain concurrent with policy
+# training.
 export POLICY_LEARNING_RATE="${POLICY_LEARNING_RATE:-1e-6}"
 export POLICY_WEIGHT_DECAY="${POLICY_WEIGHT_DECAY:-0.01}"
 export POLICY_BETA="${POLICY_BETA:-0.0}"
 export POLICY_CLIP_LOWER="${POLICY_CLIP_LOWER:-0.2}"
 export POLICY_CLIP_HIGHER="${POLICY_CLIP_HIGHER:-0.2}"
 export NUM_EPOCHS="${NUM_EPOCHS:-1}"
-export GEN_VALUE_LEARNING_RATE="${GEN_VALUE_LEARNING_RATE:-2e-7}"
+export GEN_VALUE_LEARNING_RATE="${GEN_VALUE_LEARNING_RATE:-1e-6}"
 export GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE="${GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE:-1536}"
 export GEN_VALUE_OPTIMIZER_SAMPLING_STRATEGY="${GEN_VALUE_OPTIMIZER_SAMPLING_STRATEGY:-length_outcome_stratified}"
 export GEN_VALUE_MAX_ASYNC_STEPS="${GEN_VALUE_MAX_ASYNC_STEPS:-4}"
