@@ -107,6 +107,8 @@ NUM_POLICY_VLLM_ENGINES="${NUM_POLICY_VLLM_ENGINES:-1}"
 POLICY_LEARNING_RATE="${POLICY_LEARNING_RATE:-5e-7}"
 POLICY_WEIGHT_DECAY="${POLICY_WEIGHT_DECAY:-0.01}"
 POLICY_BETA="${POLICY_BETA:-0.01}"
+POLICY_CLIP_LOWER="${POLICY_CLIP_LOWER:-0.2}"
+POLICY_CLIP_HIGHER="${POLICY_CLIP_HIGHER:-0.272}"
 NUM_EPOCHS="${NUM_EPOCHS:-2}"
 ACTIVE_SAMPLING="${ACTIVE_SAMPLING:-false}"
 FILTER_ZERO_STD_SAMPLES="${FILTER_ZERO_STD_SAMPLES:-false}"
@@ -244,7 +246,8 @@ python open_instruct/grpo_fast_genvalue.py \
     --non_stop_penalty false \
     --beta "${POLICY_BETA}" \
     --loss_fn dapo \
-    --clip_higher 0.272 \
+    --clip_lower "${POLICY_CLIP_LOWER}" \
+    --clip_higher "${POLICY_CLIP_HIGHER}" \
     "${VLLM_LOGPROB_ARGS[@]}" \
     --truncated_importance_sampling_ratio_cap "${TRUNCATED_IMPORTANCE_SAMPLING_RATIO_CAP}" \
     --advantage_normalization_type centered \

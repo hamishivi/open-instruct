@@ -5,7 +5,7 @@
 # the validated async critic objective; it is not a synchronous paper replica.
 set -euo pipefail
 
-export POLICY_MODEL_PATH="${POLICY_MODEL_PATH:-Qwen/Qwen3-8B}"
+export POLICY_MODEL_PATH="${POLICY_MODEL_PATH:-Qwen/Qwen3-8B-Base}"
 export NUM_UNIQUE_PROMPTS_ROLLOUT="${NUM_UNIQUE_PROMPTS_ROLLOUT:-128}"
 export NUM_SAMPLES_PER_PROMPT_ROLLOUT="${NUM_SAMPLES_PER_PROMPT_ROLLOUT:-8}"
 
@@ -17,14 +17,15 @@ export NUM_POLICY_VLLM_ENGINES="${NUM_POLICY_VLLM_ENGINES:-2}"
 export GEN_VALUE_VLLM_NUM_ENGINES="${GEN_VALUE_VLLM_NUM_ENGINES:-3}"
 export GEN_VALUE_TRAINER_NUM_GPUS="${GEN_VALUE_TRAINER_NUM_GPUS:-1}"
 
-# Keep the policy and critic learning recipes used by the completed 4B run,
-# while allowing the larger rollout batch to improve actor statistics. The
-# critic consumes all fresh rollouts but uses an unbiased bounded optimizer
-# subset so its long-context backward pass can remain concurrent with policy
-# training.
-export POLICY_LEARNING_RATE="${POLICY_LEARNING_RATE:-5e-7}"
+# Match the paper's actor optimizer and symmetric PPO clipping. Keep the
+# critic's conservative learning rate from the completed 4B run. The critic
+# consumes all fresh rollouts but uses an unbiased bounded optimizer subset so
+# its long-context backward pass can remain concurrent with policy training.
+export POLICY_LEARNING_RATE="${POLICY_LEARNING_RATE:-1e-6}"
 export POLICY_WEIGHT_DECAY="${POLICY_WEIGHT_DECAY:-0.01}"
-export POLICY_BETA="${POLICY_BETA:-0.01}"
+export POLICY_BETA="${POLICY_BETA:-0.0}"
+export POLICY_CLIP_LOWER="${POLICY_CLIP_LOWER:-0.2}"
+export POLICY_CLIP_HIGHER="${POLICY_CLIP_HIGHER:-0.2}"
 export NUM_EPOCHS="${NUM_EPOCHS:-1}"
 export GEN_VALUE_LEARNING_RATE="${GEN_VALUE_LEARNING_RATE:-2e-7}"
 export GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE="${GEN_VALUE_TRAIN_TARGET_EXAMPLES_PER_UPDATE:-1536}"
@@ -48,5 +49,5 @@ export JOINT_TRAINING_STEPS="${JOINT_TRAINING_STEPS:-200}"
 export DEEPSPEED_OFFLOAD_OPTIMIZER="${DEEPSPEED_OFFLOAD_OPTIMIZER:-true}"
 
 exec bash scripts/train/debug/genac_math_joint_h200.sh \
-    --gen_value_batch_size 1024 \
+    --gen_value_batch_size 256 \
     "$@"
