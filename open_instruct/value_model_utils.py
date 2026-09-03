@@ -2652,9 +2652,9 @@ def build_generative_value_prompt(
         "first substantive error or unsupported step, if one exists.\n"
         "3. Explain what remains to be done and whether the active actor can recover and finish "
         "within the remaining token budget.\n"
-        "4. Write a concise, visible rationale that supports your probability estimate. You must "
-        "reason before scoring; a score-only response is invalid.\n"
-        f"5. On the final line, output one integer between {int(score_min)} and "
+        "4. Write a concise rationale inside <think>...</think> that supports your probability "
+        "estimate. You must reason before scoring; a score-only response is invalid.\n"
+        f"5. After </think>, output one integer between {int(score_min)} and "
         f"{int(score_max)} inclusive, wrapped in <answer>...</answer>. Output nothing after it."
     )
     problem_block = f"Problem:\n{problem}\n\n" if problem else ""
@@ -2665,7 +2665,7 @@ def build_generative_value_prompt(
         f"{problem_block}"
         f"{conditioning_block}"
         f"Partial response:\n<rollout>{partial_response}</rollout>\n"
-        "Value analysis (required before the score):"
+        "Value analysis (required before the score):\n<think>\n"
     )
 
 

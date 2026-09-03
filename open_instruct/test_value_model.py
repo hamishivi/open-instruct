@@ -750,7 +750,8 @@ class TestScoreParsing(unittest.TestCase):
         self.assertIn("The correct answer is 42", p)
         self.assertIn("<rollout>", p)
         self.assertIn("You must reason before scoring; a score-only response is invalid", p)
-        self.assertIn("Value analysis (required before the score):", p)
+        self.assertIn("Write a concise rationale inside <think>...</think>", p)
+        self.assertTrue(p.endswith("Value analysis (required before the score):\n<think>\n"))
         self.assertNotIn("\nAnswer:", p)
 
     def test_prompt_has_actor_and_remaining_budget_context(self):
