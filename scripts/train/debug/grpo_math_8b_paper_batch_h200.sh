@@ -10,10 +10,10 @@ export POLICY_MODEL_PATH="${POLICY_MODEL_PATH:-Qwen/Qwen3-8B-Base}"
 export NUM_UNIQUE_PROMPTS_ROLLOUT="${NUM_UNIQUE_PROMPTS_ROLLOUT:-128}"
 export NUM_SAMPLES_PER_PROMPT_ROLLOUT="${NUM_SAMPLES_PER_PROMPT_ROLLOUT:-8}"
 
-# Spend the same eight-H200 budget entirely on the actor: four DeepSpeed
-# learners and four independent policy vLLM engines.
-export NUM_POLICY_LEARNERS="${NUM_POLICY_LEARNERS:-4}"
-export NUM_POLICY_VLLM_ENGINES="${NUM_POLICY_VLLM_ENGINES:-4}"
+# Spend the same four-H200 budget entirely on the actor: two DeepSpeed learners
+# and two independent policy vLLM engines.
+export NUM_POLICY_LEARNERS="${NUM_POLICY_LEARNERS:-2}"
+export NUM_POLICY_VLLM_ENGINES="${NUM_POLICY_VLLM_ENGINES:-2}"
 
 export POLICY_LEARNING_RATE="${POLICY_LEARNING_RATE:-1e-6}"
 export POLICY_WEIGHT_DECAY="${POLICY_WEIGHT_DECAY:-0.01}"

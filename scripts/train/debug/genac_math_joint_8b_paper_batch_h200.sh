@@ -9,12 +9,12 @@ export POLICY_MODEL_PATH="${POLICY_MODEL_PATH:-Qwen/Qwen3-8B-Base}"
 export NUM_UNIQUE_PROMPTS_ROLLOUT="${NUM_UNIQUE_PROMPTS_ROLLOUT:-128}"
 export NUM_SAMPLES_PER_PROMPT_ROLLOUT="${NUM_SAMPLES_PER_PROMPT_ROLLOUT:-8}"
 
-# Use all eight H200s without relying on the not-yet-production-validated
-# data-parallel critic: two actor learners, two actor vLLM engines, three critic
-# vLLM engines, and one critic trainer.
-export NUM_POLICY_LEARNERS="${NUM_POLICY_LEARNERS:-2}"
-export NUM_POLICY_VLLM_ENGINES="${NUM_POLICY_VLLM_ENGINES:-2}"
-export GEN_VALUE_VLLM_NUM_ENGINES="${GEN_VALUE_VLLM_NUM_ENGINES:-3}"
+# Use the durable four-H200 allocation without relying on the
+# not-yet-production-validated data-parallel critic: one actor learner, one
+# actor vLLM engine, one critic vLLM engine, and one critic trainer.
+export NUM_POLICY_LEARNERS="${NUM_POLICY_LEARNERS:-1}"
+export NUM_POLICY_VLLM_ENGINES="${NUM_POLICY_VLLM_ENGINES:-1}"
+export GEN_VALUE_VLLM_NUM_ENGINES="${GEN_VALUE_VLLM_NUM_ENGINES:-1}"
 export GEN_VALUE_TRAINER_NUM_GPUS="${GEN_VALUE_TRAINER_NUM_GPUS:-1}"
 
 # Match the paper's actor optimizer and symmetric PPO clipping. Keep the
