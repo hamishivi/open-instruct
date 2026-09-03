@@ -284,6 +284,54 @@ class MathVerifier(VerifierFunction):
         return VerificationResult(score=0.0)
 
 
+_FINAL_BOXED_SUFFIX_RE = re.compile(
+    r"(?:"
+    r"\s|[.$,;:!?]|\\[\]\)]|"
+    r"\\end\{(?:equation\*?|align\*?|displaymath|gather\*?)\}|"
+    r"</answer>|<\|endoftext\|>|<\|im_end\|>"
+    r")*\Z"
+)
+
+
+class FinalBoxedMathVerifier(VerifierFunction):
+    """Verify a boxed math answer only when no substantive content follows it.
+
+    This is intentionally a final-answer integrity check rather than a stopping or
+    length constraint. A response may stop through EOS, a stop string, or its token
+    budget, but it cannot receive credit for an earlier correct box followed by a
+    different answer or an arbitrarily long unrelated continuation.
+    """
+
+    def __init__(self, verifier_config: VerifierConfig | None = None) -> None:
+        super().__init__("final_boxed_math", verifier_config=verifier_config, weight=1.0)
+
+    def __call__(
+        self,
+        tokenized_prediction: list[int],
+        prediction: str,
+        label: str,
+        query: str | None = None,
+        rollout_state: dict | None = None,
+    ) -> VerificationResult:
+        boxed_answer = last_boxed_only_string(prediction)
+        if boxed_answer is None:
+            return VerificationResult(score=0.0)
+
+        boxed_start = prediction.rfind(boxed_answer)
+        if boxed_start < 0:
+            return VerificationResult(score=0.0)
+        suffix = prediction[boxed_start + len(boxed_answer) :]
+        if _FINAL_BOXED_SUFFIX_RE.fullmatch(suffix) is None:
+            return VerificationResult(score=0.0)
+
+        try:
+            answer = remove_boxed(boxed_answer)
+        except AssertionError:
+            return VerificationResult(score=0.0)
+        score = float(is_equiv(answer, label) or hendrycks_is_equiv(answer, label))
+        return VerificationResult(score=score)
+
+
 class StrictMathVerifier(VerifierFunction):
     """
     Strict verifier for math problems using only the Minerva format extraction.
@@ -1191,6 +1239,25 @@ class RubricVerifier(VerifierFunction):
         return RubricVerifierConfig
 
 
+def apply_verifier_remaps(
+    verifiers: dict[str, VerifierFunction], remap_spec: str | None
+) -> dict[str, VerifierFunction]:
+    """Apply one or more comma-separated ``source=target`` verifier aliases."""
+    if not remap_spec:
+        return verifiers
+
+    for raw_mapping in remap_spec.split(","):
+        mapping = raw_mapping.strip()
+        parts = mapping.split("=", maxsplit=1)
+        if len(parts) != 2 or not all(part.strip() for part in parts):
+            raise ValueError(f"Verifier remaps must be comma-separated source=target pairs, got {remap_spec!r}.")
+        old_name, new_name = (part.strip().lower() for part in parts)
+        if new_name not in verifiers:
+            raise ValueError(f"Verifier remap target {new_name!r} was not found in the verifier registry.")
+        verifiers[old_name] = verifiers[new_name]
+    return verifiers
+
+
 def build_all_verifiers(args, streaming_config=None) -> dict[str, VerifierFunction]:
     """
     Build all verifiers with the given configs.
@@ -1219,16 +1286,8 @@ def build_all_verifiers(args, streaming_config=None) -> dict[str, VerifierFuncti
         instance = LMJudgeVerifier(judge_type, LMJudgeVerifierConfig.from_args(args, streaming_config))
         verifiers[instance.name.lower()] = instance
 
-    # if we have remap arg, remap!
-    if streaming_config and streaming_config.remap_verifier:
-        remap = streaming_config.remap_verifier.split("=")
-        assert len(remap) == 2, "Remap must be in the format old_name=new_name"
-        old_name, new_name = remap
-        # map so that the old name calls the new verifier
-        assert new_name.lower() in verifiers, f"{new_name} not found in verifiers during remapping"
-        verifiers[old_name.lower()] = verifiers[new_name.lower()]
-
-    return verifiers
+    remap_spec = streaming_config.remap_verifier if streaming_config is not None else None
+    return apply_verifier_remaps(verifiers, remap_spec)
 
 
 # special case, we use this outside our general verifier loop.

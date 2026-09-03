@@ -220,6 +220,8 @@ class PackedSequences(Generic[T]):
     hints: list[list[str | None]] | None = None
     """per-pack list of per-sub-sequence hint strings. Populated when the dataset has a hint column
     and answer_prefix conditioning is used."""
+    policy_model_versions: list[list[int]] | None = None
+    """per-pack list of the vLLM policy-weight version that generated each sub-sequence."""
     segment_boundaries: list[torch.Tensor] | None = None
     """packed SAE segment boundary mask (batch_size, pack_length); 1 at a boundary token."""
 
@@ -452,6 +454,25 @@ def calculate_length_adaptive_lambda(response_length: int, alpha: float = 0.05) 
     effective_length = max(response_length, 1)
     lam = 1.0 - 1.0 / (alpha * effective_length)
     return max(0.0, min(0.999, lam))
+
+
+def estimate_sae_terminal_credit_retention(
+    boundary_fraction: float, boundary_lambda: float, token_distance: int
+) -> float:
+    """Estimate how much terminal credit survives across an SAE token distance.
+
+    SAE uses lambda=1 away from boundaries and ``boundary_lambda`` at boundaries. Treating the
+    observed boundary fraction as the per-token boundary probability gives a transparent early-warning
+    estimate: ``(1 - boundary_fraction * (1 - boundary_lambda)) ** token_distance``.
+    """
+    if not 0.0 <= boundary_fraction <= 1.0:
+        raise ValueError(f"boundary_fraction must be in [0, 1], got {boundary_fraction}.")
+    if not 0.0 <= boundary_lambda <= 1.0:
+        raise ValueError(f"boundary_lambda must be in [0, 1], got {boundary_lambda}.")
+    if token_distance < 0:
+        raise ValueError(f"token_distance must be nonnegative, got {token_distance}.")
+    mean_lambda = 1.0 - boundary_fraction * (1.0 - boundary_lambda)
+    return mean_lambda**token_distance
 
 
 def _next_response_token_indices(response_masks: np.ndarray, dones: np.ndarray) -> np.ndarray:

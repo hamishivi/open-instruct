@@ -74,6 +74,7 @@ uv run python mason.py \
     --gen_value_score_min 0 \
     --gen_value_score_max 10 \
     --gen_value_max_new_tokens 2048 \
+    --gen_value_max_model_len 32768 \
     --gen_value_conditioning gt \
     --gen_value_reinforce_coef 1.0 \
     --value_warmup_steps 9999

@@ -18,7 +18,7 @@
 #   PARTITION / ACCOUNT via: sbatch --partition=... --account=... this_script.sh
 #   EXP_NAME, RUN_NAME, WANDB_PROJECT, NUM_LEARNERS_PER_NODE,
 #   VLLM_NUM_ENGINES, ASYNC_STEPS, POLICY_LEARNING_RATE,
-#   VALUE_LEARNING_RATE, VALUE_NUM_EPOCHS, VALUE_LOSS, SAE_THRESHOLD,
+#   VALUE_LEARNING_RATE, VALUE_NUM_EPOCHS, VALUE_LOSS, GAE_LAMBDA, SAE_THRESHOLD,
 #   VALUE_MODEL_GROUND_TRUTH_CONDITIONING, GT_CONDITIONING_TEMPLATE,
 #   WHITEN_ADVANTAGES,
 #   ACTIVE_SAMPLING, FILTER_ZERO_STD_SAMPLES,
@@ -59,6 +59,7 @@ POLICY_LEARNING_RATE="${POLICY_LEARNING_RATE:-1e-6}"
 VALUE_LEARNING_RATE="${VALUE_LEARNING_RATE:-5e-6}"
 VALUE_NUM_EPOCHS="${VALUE_NUM_EPOCHS:-2}"
 VALUE_LOSS="${VALUE_LOSS:-mse}"
+GAE_LAMBDA="${GAE_LAMBDA:-0.95}"
 SAE_THRESHOLD="${SAE_THRESHOLD:-0.2}"
 VALUE_MODEL_GROUND_TRUTH_CONDITIONING="${VALUE_MODEL_GROUND_TRUTH_CONDITIONING:-true}"
 GT_CONDITIONING_TEMPLATE="${GT_CONDITIONING_TEMPLATE:-answer_prefix}"
@@ -246,7 +247,7 @@ echo "Off-policy correction: use_vllm_logprobs=${USE_VLLM_LOGPROBS}  tis_cap=${T
 echo "Schedule: total_episodes=${TOTAL_EPISODES}"
 echo "Dataset: ${DATASET_NAME} weight=${DATASET_WEIGHT} messages=${SFT_MESSAGES_KEY} ground_truth=${GROUND_TRUTHS_KEY} verifier=${VERIFIER_SOURCE_KEY} hints=${HINTS_KEY}"
 echo "Chat template: ${CHAT_TEMPLATE_NAME:-model default}"
-echo "Tuning: policy_lr=${POLICY_LEARNING_RATE}  value_lr=${VALUE_LEARNING_RATE}  value_epochs=${VALUE_NUM_EPOCHS}  value_loss=${VALUE_LOSS}  sae_threshold=${SAE_THRESHOLD}"
+echo "Tuning: policy_lr=${POLICY_LEARNING_RATE}  value_lr=${VALUE_LEARNING_RATE}  value_epochs=${VALUE_NUM_EPOCHS}  value_loss=${VALUE_LOSS}  gae_lambda=${GAE_LAMBDA}  sae_threshold=${SAE_THRESHOLD}"
 echo "GAE advantage whitening: ${WHITEN_ADVANTAGES}"
 echo "Resume state: every ${CHECKPOINT_STATE_FREQ} steps -> ${CHECKPOINT_STATE_DIR}"
 if [[ "${VALUE_MODEL_GROUND_TRUTH_CONDITIONING}" == "true" ]]; then
@@ -334,7 +335,7 @@ srun --cpu-bind=none "${SRUN_PREFIX[@]}" bash -c '
       --value_learning_rate "'"${VALUE_LEARNING_RATE}"'" \
       --value_num_epochs "'"${VALUE_NUM_EPOCHS}"'" \
       --value_loss "'"${VALUE_LOSS}"'" \
-      --gae_lambda 0.95 \
+      --gae_lambda "'"${GAE_LAMBDA}"'" \
       --decoupled_gae \
       "${advantage_whitening_args[@]}" \
       --use_sae \

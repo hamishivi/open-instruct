@@ -4,15 +4,15 @@
 # Exercises end-to-end:
 #   1. Policy learner + policy vLLM engine (colocated via --single_gpu_mode, IPC).
 #   2. Second vLLM pool hosting the generative critic.
-#   3. GenValueTrainerActor (PyTorch copy of the critic) running REINFORCE.
-#   4. NCCL weight sync from trainer actor → critic vLLM pool every policy step
+#   3. GenValueTrainerActor (DeepSpeed-wrapped critic) running REINFORCE.
+#   4. NCCL weight sync from trainer actor → critic vLLM pool every critic update
 #      (gen_value_sync_freq=1).
 #
 # Compute footprint: 4 GPUs minimum.
 #   GPU 0: policy learner (DeepSpeed)
 #   GPU 1: policy vLLM engine
 #   GPU 2: generative-critic vLLM engine
-#   GPU 3: generative-critic PyTorch trainer actor (GenValueTrainerActor)
+#   GPU 3: generative-critic DeepSpeed trainer actor (GenValueTrainerActor)
 #
 # NOTE: this script intentionally does NOT use --single_gpu_mode. That mode
 # forces vLLM's IPC weight-transfer backend, which relies on pidfd_getfd()
@@ -27,7 +27,9 @@
 # on a 4×A100 / 4×L40S box.
 set -euo pipefail
 
-unset LD_LIBRARY_PATH
+if [[ "${PRESERVE_LD_LIBRARY_PATH:-0}" != "1" ]]; then
+    unset LD_LIBRARY_PATH
+fi
 export NCCL_CUMEM_ENABLE=0
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -36,13 +38,13 @@ export HF_HOME=${HF_HOME:-/tmp/hf_home}
 export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-/tmp/hf_home/datasets}
 export VLLM_ALLOW_INSECURE_SERIALIZATION=1
 
-.venv/bin/ray stop --force 2>/dev/null || true
-.venv/bin/ray start --head --port=8888 --dashboard-host=0.0.0.0
-trap ".venv/bin/ray stop --force" EXIT
+ray stop --force 2>/dev/null || true
+ray start --head --port=8888 --dashboard-host=0.0.0.0
+trap "ray stop --force" EXIT
 
 mkdir -p "$HOME/.triton/autotune"
 
-.venv/bin/python open_instruct/grpo_fast_genvalue.py \
+python open_instruct/grpo_fast_genvalue.py \
     --exp_name genac_smoke \
     --dataset_mixer_list ai2-adapt-dev/rlvr_gsm8k_zs 64 \
     --dataset_mixer_list_splits train \
@@ -61,7 +63,7 @@ mkdir -p "$HOME/.triton/autotune"
     --apply_verifiable_reward true \
     --ground_truths_key ground_truth \
     --chat_template_name r1_simple_chat_postpend_think \
-    --temperature 0.7 \
+    --temperature 1.0 \
     --beta 0.0 \
     --learning_rate 3e-7 \
     --total_episodes 32 \
@@ -98,7 +100,9 @@ mkdir -p "$HOME/.triton/autotune"
     --gen_value_score_min 0 \
     --gen_value_score_max 10 \
     --gen_value_max_new_tokens 128 \
+    --gen_value_max_model_len 8192 \
     --gen_value_conditioning none \
     --gen_value_learning_rate 1e-6 \
+    --gen_value_batch_size 2 \
     --gen_value_sync_freq 1 \
     "${@}"

@@ -19,10 +19,14 @@ laptop and in CI. They focus on:
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
+from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from open_instruct import grpo_utils
 from open_instruct.rl_utils import (
@@ -32,19 +36,290 @@ from open_instruct.rl_utils import (
     calculate_advantages_packed_sae_vapo,
     calculate_advantages_packed_vapo,
     calculate_length_adaptive_lambda,
+    estimate_sae_terminal_credit_retention,
 )
 from open_instruct.value_model_utils import (
+    GenValueTrainingProgressState,
+    accumulation_group_token_counts,
+    add_observation_segment_boundaries,
+    balanced_accumulation_group_ids,
+    bounded_value_prediction,
     build_conditioning_text,
+    build_gen_value_validation_holdout,
     build_generative_value_prompt,
+    causal_final_action_prefix_token_ids,
+    causal_segment_start_prefix_token_ids,
     causal_value_mask,
     compute_value_loss,
+    flatten_gen_value_pack,
+    gen_value_pair_sample_id,
+    gen_value_sampled_version_metrics,
+    gen_value_training_queue_capacity,
+    gen_value_validation_metrics,
+    gen_value_validation_prediction_change_metrics,
+    generative_value_reinforce_reward,
+    generative_value_reinforce_weights,
+    generative_value_reinforce_weights_with_replay,
+    grouped_token_counts,
     is_postfix_template,
+    missing_value_fallback,
+    normalize_value_loss,
+    pack_gen_value_examples,
     parse_generative_value_score,
     predict_values,
+    regression_metric_sums,
+    regression_metrics_from_sums,
+    replay_gen_value_final_actions,
     resolve_num_siblings_to_sample,
+    reward_to_unit_value,
     segment_rollout,
+    select_fresh_gen_value_rollouts,
+    select_gen_value_sft_traces,
+    unique_replayed_gen_value_pairs,
+    unit_value_to_reward,
+    update_gen_value_success_rate_ema,
+    validate_terminal_rewards,
     value_clipped_mse_loss,
+    value_metric_sums,
+    value_metrics_from_sums,
+    write_gen_value_training_trace_reservoir,
+    write_gen_value_validation_snapshot,
 )
+
+
+class TestGenValueTrainingQueueCapacity(unittest.TestCase):
+    def test_default_retains_inclusive_freshness_window(self):
+        self.assertEqual(gen_value_training_queue_capacity(world_size=2, max_async_steps=1), 4)
+
+    def test_explicit_capacity_retains_more_frozen_policy_batches(self):
+        self.assertEqual(gen_value_training_queue_capacity(world_size=2, max_async_steps=1, capacity_steps=25), 50)
+
+    def test_explicit_capacity_does_not_accept_negative_values(self):
+        with self.assertRaisesRegex(ValueError, "capacity_steps must be nonnegative"):
+            gen_value_training_queue_capacity(world_size=1, max_async_steps=1, capacity_steps=-1)
+
+    def test_explicit_capacity_covers_inclusive_freshness_window(self):
+        with self.assertRaisesRegex(ValueError, "at least the inclusive freshness window"):
+            gen_value_training_queue_capacity(world_size=1, max_async_steps=2, capacity_steps=2)
+
+
+class TestFreshGenValueRolloutSelection(unittest.TestCase):
+    @staticmethod
+    def _rollout(identifier: str, policy_model_version: int, policy_training_step: int) -> dict:
+        return {
+            "id": identifier,
+            "policy_model_version": policy_model_version,
+            "policy_training_step": policy_training_step,
+        }
+
+    def test_selects_latest_versions_and_steps_then_partitions_stale_rollouts(self):
+        pending = [
+            self._rollout("old", 8, 8),
+            self._rollout("v9-old-step", 9, 9),
+            self._rollout("v10-old-step", 10, 10),
+            self._rollout("v10-new-step", 10, 11),
+            self._rollout("v9-new-step", 9, 12),
+        ]
+
+        selected, retained, stale = select_fresh_gen_value_rollouts(pending, batch_size=2, max_async_steps=1)
+
+        self.assertEqual([rollout["id"] for rollout in selected], ["v10-old-step", "v10-new-step"])
+        self.assertEqual([rollout["id"] for rollout in retained], ["v9-old-step", "v9-new-step"])
+        self.assertEqual([rollout["id"] for rollout in stale], ["old"])
+
+    def test_external_newest_version_discards_samples_outside_inclusive_window(self):
+        pending = [self._rollout("v8", 8, 8), self._rollout("v9", 9, 9)]
+
+        selected, retained, stale = select_fresh_gen_value_rollouts(
+            pending, batch_size=2, max_async_steps=1, newest_policy_model_version=10
+        )
+
+        self.assertEqual(selected, [])
+        self.assertEqual([rollout["id"] for rollout in retained], ["v9"])
+        self.assertEqual([rollout["id"] for rollout in stale], ["v8"])
+
+    def test_incomplete_fresh_batch_waits_without_losing_eligible_rollouts(self):
+        pending = [self._rollout("fresh", 10, 11), self._rollout("stale", 8, 8)]
+
+        selected, retained, stale = select_fresh_gen_value_rollouts(pending, batch_size=2, max_async_steps=1)
+
+        self.assertEqual(selected, [])
+        self.assertEqual([rollout["id"] for rollout in retained], ["fresh"])
+        self.assertEqual([rollout["id"] for rollout in stale], ["stale"])
+
+
+class TestGenValueTrainingProgressState(unittest.TestCase):
+    def test_newer_completed_steps_wait_for_older_steps_to_resolve(self):
+        progress = GenValueTrainingProgressState(latest_trained_policy_step=74, policy_world_size=2)
+        for step in (75, 76):
+            progress.register_admitted_policy_step(step, policy_rank=0, num_rollouts=2)
+            progress.register_admitted_policy_step(step, policy_rank=1, num_rollouts=2)
+
+        progress.record_trained_policy_steps([76, 76, 76, 76])
+
+        self.assertEqual(progress.get_latest_processed_policy_step(), 74)
+        progress.record_discarded_policy_steps([75, 75, 75, 75])
+        self.assertEqual(progress.get_latest_processed_policy_step(), 76)
+        self.assertEqual(
+            progress.get_rollout_accounting(),
+            {
+                "latest_processed_policy_step": 76,
+                "latest_trained_policy_step": 76,
+                "admitted_rollouts": 8,
+                "trained_rollouts": 4,
+                "discarded_rollouts": 4,
+            },
+        )
+
+
+def _packing_example(sequence_ids, generated_ids, rollout_logprobs, reward):
+    return {
+        "sequence_ids": sequence_ids,
+        "generated_ids": generated_ids,
+        "rollout_logprobs": rollout_logprobs,
+        "reward": reward,
+    }
+
+
+class TestGenValuePacking(unittest.TestCase):
+    def test_uses_policy_token_budget_without_truncation(self):
+        examples = [
+            _packing_example([1, 2, 3, 4], [4], [-0.1], 0.2),
+            _packing_example([5, 6], [6], [-0.2], 0.4),
+            _packing_example(list(range(7, 15)), [14], [-0.3], 0.6),
+        ]
+
+        packs = pack_gen_value_examples(examples, target_tokens=6)
+
+        self.assertEqual([[len(example["sequence_ids"]) for example in pack] for pack in packs], [[4, 2], [8]])
+        self.assertEqual(packs[1][0]["sequence_ids"], list(range(7, 15)))
+
+    def test_resets_positions_and_selects_unequal_generated_tokens(self):
+        examples = [
+            _packing_example([10, 11, 12, 13, 14], [13, 14], [-0.1, -0.2], 0.25),
+            _packing_example([20, 21, 22, 23, 24], [22, 23, 24], [-0.3, -0.4, -0.5], 0.75),
+        ]
+
+        flattened = flatten_gen_value_pack(examples)
+
+        input_ids, position_ids, logit_positions, target_ids, rollout_logprobs, token_rewards = flattened
+        self.assertEqual(input_ids, [10, 11, 12, 13, 14, 20, 21, 22, 23, 24])
+        self.assertEqual(position_ids, [0, 1, 2, 3, 4, 0, 1, 2, 3, 4])
+        self.assertEqual(logit_positions, [2, 3, 6, 7, 8])
+        self.assertEqual(target_ids, [13, 14, 22, 23, 24])
+        self.assertEqual(rollout_logprobs, [-0.1, -0.2, -0.3, -0.4, -0.5])
+        self.assertEqual(token_rewards, [0.25, 0.25, 0.75, 0.75, 0.75])
+
+    def test_packed_logits_match_isolated_sequences_with_unequal_token_counts(self):
+        torch.manual_seed(1)
+        config = Qwen3Config(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=64,
+            use_cache=False,
+        )
+        model = Qwen3ForCausalLM(config).eval()
+        examples = [
+            _packing_example([1, 2, 3, 4, 5], [4, 5], [-0.1, -0.2], 0.25),
+            _packing_example([6, 7, 8, 9, 10, 11], [9, 10, 11], [-0.3, -0.4, -0.5], 0.75),
+        ]
+
+        serial_logits = []
+        for example in examples:
+            sequence_ids = torch.tensor([example["sequence_ids"]])
+            generated_length = len(example["generated_ids"])
+            prompt_length = sequence_ids.shape[1] - generated_length
+            logit_positions = torch.arange(prompt_length - 1, sequence_ids.shape[1] - 1)
+            serial_logits.append(
+                model(
+                    input_ids=sequence_ids,
+                    attention_mask=None,
+                    position_ids=torch.arange(sequence_ids.shape[1]).unsqueeze(0),
+                    logits_to_keep=logit_positions,
+                ).logits
+            )
+
+        input_ids, position_ids, logit_positions, *_ = flatten_gen_value_pack(examples)
+        packed_logits = model(
+            input_ids=torch.tensor([input_ids]),
+            attention_mask=None,
+            position_ids=torch.tensor([position_ids]),
+            logits_to_keep=torch.tensor(logit_positions),
+        ).logits
+
+        torch.testing.assert_close(packed_logits, torch.cat(serial_logits, dim=1), rtol=1e-5, atol=1e-5)
+
+
+class TestCausalGenValuePrefixes(unittest.TestCase):
+    def test_observation_gap_starts_a_new_segment(self):
+        response_mask = [False, True, False, False, True, True]
+
+        boundaries = add_observation_segment_boundaries(response_mask, [2])
+
+        self.assertEqual(boundaries, [0, 2])
+
+    def test_observation_boundaries_merge_with_existing_segments(self):
+        response_mask = [False, True, True, False, True, True, True]
+
+        boundaries = add_observation_segment_boundaries(response_mask, [1, 4])
+
+        self.assertEqual(boundaries, [1, 4])
+
+    def test_scores_segment_starts_instead_of_segment_ends(self):
+        # prompt=[10, 11], response actions=[20, 21, 22, 23, 24, 25]
+        sequence = [10, 11, 20, 21, 22, 23, 24, 25]
+        response_mask = [False, False, True, True, True, True, True, True]
+
+        prefixes = causal_segment_start_prefix_token_ids(sequence, response_mask, [2, 5])
+
+        self.assertEqual(prefixes, [[], [20, 21, 22]])
+
+    def test_retains_masked_tool_observations_before_next_action(self):
+        # The first segment contains action 20. Tokens 30 and 31 are a masked
+        # tool observation that must remain visible before action 21.
+        sequence = [10, 11, 20, 30, 31, 21, 22]
+        response_mask = [False, False, True, False, False, True, True]
+
+        prefixes = causal_segment_start_prefix_token_ids(sequence, response_mask, [0, 2])
+
+        self.assertEqual(prefixes, [[], [20, 30, 31]])
+
+    def test_requires_terminal_boundary(self):
+        with self.assertRaisesRegex(ValueError, "final segment boundary"):
+            causal_segment_start_prefix_token_ids([10, 20, 21], [False, True, True], [0])
+
+
+class TestValueRewardBounds(unittest.TestCase):
+    def test_missing_prediction_falls_back_to_zero_when_supported(self):
+        self.assertEqual(missing_value_fallback(-2.0, 3.0), 0.0)
+
+    def test_missing_prediction_uses_endpoint_closest_to_zero(self):
+        self.assertEqual(missing_value_fallback(1.0, 3.0), 1.0)
+        self.assertEqual(missing_value_fallback(-3.0, -1.0), -1.0)
+
+    def test_accepts_terminal_rewards_inside_declared_support(self):
+        rewards = torch.tensor([[0.0, -1.0, 0.0, 2.0]])
+        dones = torch.tensor([[0, 1, 0, 1]])
+
+        validate_terminal_rewards(rewards, dones, -1.0, 2.0)
+
+    def test_rejects_terminal_rewards_outside_declared_support(self):
+        rewards = torch.tensor([[0.0, 3.0]])
+        dones = torch.tensor([[0, 1]])
+
+        with self.assertRaisesRegex(ValueError, "outside the configured value range"):
+            validate_terminal_rewards(rewards, dones, 0.0, 1.0)
+
+    def test_ignores_nonterminal_values(self):
+        rewards = torch.tensor([[100.0, 1.0]])
+        dones = torch.tensor([[0, 1]])
+
+        validate_terminal_rewards(rewards, dones, 0.0, 1.0)
 
 
 class TestGAEVariants(unittest.TestCase):
@@ -87,6 +362,57 @@ class TestGAEVariants(unittest.TestCase):
         self.assertAlmostEqual(bf, expected_frac, places=6)
         self.assertEqual(adv.shape, v.shape)
 
+    def test_sae_lambda_one_propagates_terminal_outcome_across_packed_sequences(self):
+        # Two episodes share one packed row. With gamma=lambda=1 and no intermediate
+        # rewards, every response action must receive exactly outcome - V(s),
+        # regardless of SAE boundaries or intervening prompt tokens.
+        values = np.array([[0.0, 0.0, 0.2, 0.4, 0.7, 0.0, 0.0, 0.3, 0.5, 0.6, 0.8]])
+        rewards = np.zeros_like(values)
+        rewards[0, 4] = 1.0
+        dones = np.zeros_like(values)
+        dones[0, [4, 10]] = 1.0
+        response_masks = np.zeros_like(values)
+        response_masks[0, [2, 3, 4, 7, 8, 9, 10]] = 1.0
+        logprobs = np.full_like(values, -0.1)
+        logprobs[0, [3, 8, 10]] = -2.5
+
+        advantages, _, boundary_fraction = calculate_advantages_packed_sae(
+            values,
+            rewards,
+            gamma=1.0,
+            lam=1.0,
+            dones=dones,
+            response_masks=response_masks,
+            logprobs=logprobs,
+            sae_threshold=0.2,
+        )
+
+        np.testing.assert_allclose(advantages[0, [2, 3, 4]], 1.0 - values[0, [2, 3, 4]])
+        np.testing.assert_allclose(advantages[0, [7, 8, 9, 10]], -values[0, [7, 8, 9, 10]])
+        self.assertTrue((advantages[0, [2, 3, 4]] >= 0.0).all())
+        self.assertTrue((advantages[0, [7, 8, 9, 10]] <= 0.0).all())
+        self.assertGreater(boundary_fraction, 0.0)
+
+        # A perfectly calibrated critic leaves no residual actor signal. In
+        # particular, the correct-minus-incorrect advantage gap is then zero;
+        # it is not a standalone measure of critic discrimination at lambda=1.
+        perfect_values = np.zeros_like(values)
+        perfect_values[0, [2, 3, 4]] = 1.0
+        perfect_advantages, _, _ = calculate_advantages_packed_sae(
+            perfect_values,
+            rewards,
+            gamma=1.0,
+            lam=1.0,
+            dones=dones,
+            response_masks=response_masks,
+            logprobs=logprobs,
+            sae_threshold=0.2,
+        )
+        correct_mean = perfect_advantages[0, [2, 3, 4]].mean()
+        incorrect_mean = perfect_advantages[0, [7, 8, 9, 10]].mean()
+        np.testing.assert_allclose(perfect_advantages[response_masks > 0], 0.0)
+        self.assertAlmostEqual(correct_mean - incorrect_mean, 0.0)
+
     def test_sae_vapo_combines_variants(self):
         v, r, d, m, logp = self._inputs()
         pa, cr, metrics = calculate_advantages_packed_sae_vapo(
@@ -103,6 +429,11 @@ class TestGAEVariants(unittest.TestCase):
         self.assertEqual(calculate_length_adaptive_lambda(1, alpha=1.0), 0.0)
         # alpha*length = 100 -> lambda close to 1
         self.assertGreater(calculate_length_adaptive_lambda(100, alpha=1.0), 0.98)
+
+    def test_estimated_sae_terminal_credit_exposes_short_trace(self):
+        self.assertEqual(estimate_sae_terminal_credit_retention(0.48, 1.0, 1024), 1.0)
+        self.assertAlmostEqual(estimate_sae_terminal_credit_retention(0.48, 0.95, 128), 0.0446, places=3)
+        self.assertLess(estimate_sae_terminal_credit_retention(0.48, 0.95, 1024), 1e-10)
 
     def test_skip_tool_outputs_bootstraps_across_observation_gap(self):
         # Prompt [0], action0 [1,2], tool [3,4], action1 [5,6] with terminal reward at t=6.
@@ -200,6 +531,22 @@ class TestGAEVariants(unittest.TestCase):
 
 
 class TestTISMask(unittest.TestCase):
+    def test_cap_and_mask_match_policy_token_weighting(self):
+        ratios = torch.tensor([[0.25, 1.0, 3.0]])
+        trainer_logprobs = torch.log(ratios)
+        rollout_logprobs = torch.zeros_like(trainer_logprobs)
+        response_mask = torch.ones_like(trainer_logprobs, dtype=torch.bool)
+
+        clamped, _ = grpo_utils.compute_tis_weights(
+            trainer_logprobs.detach(), rollout_logprobs, response_mask, cap=2.0
+        )
+        mask = grpo_utils.compute_tis_mask(
+            trainer_logprobs, rollout_logprobs, response_mask, lower_bound=0.5, upper_bound=2.0
+        )
+        combined = grpo_utils.combine_tis_terms(clamped, mask)
+
+        torch.testing.assert_close(combined, torch.tensor([[0.0, 1.0, 0.0]]))
+
     def test_upper_and_lower_bounds(self):
         ratios = torch.tensor([[0.49, 0.5, 1.0, 1.99, 2.0, 3.0]])
         new_logprobs = torch.log(ratios)
@@ -237,6 +584,47 @@ class TestSiblingAssembly(unittest.TestCase):
         rm = [torch.tensor([[1, 1, 1, 0, 2, 2, 2]]), torch.tensor([[3, 3, 0, 0]])]
         got = _extract_subseq_indices_per_pack(rm)
         self.assertEqual(got, [[1, 2], [3]])
+
+    def test_populate_policy_model_versions_uses_packed_subsequence_indices(self):
+        from open_instruct.data_loader import populate_policy_model_versions  # noqa: PLC0415
+
+        ps = PackedSequences(
+            query_responses=[torch.tensor([[0, 1, 2, 3]])],
+            attention_masks=[torch.tensor([[1, 1, 2, 2]])],
+            response_masks=[torch.tensor([[0, 1, 0, 2]])],
+            original_responses=[[1], [3]],
+        )
+
+        populate_policy_model_versions(ps, [7, 11])
+
+        self.assertEqual(ps.policy_model_versions, [[7, 11]])
+
+    def test_policy_model_versions_survive_worker_collation(self):
+        from open_instruct.data_loader import prepare_collated_data_for_workers  # noqa: PLC0415
+
+        ps = PackedSequences(
+            query_responses=[torch.tensor([1, 2]), torch.tensor([3, 4])],
+            attention_masks=[torch.ones(2, dtype=torch.long), torch.ones(2, dtype=torch.long)],
+            response_masks=[torch.tensor([0, 1]), torch.tensor([0, 2])],
+            original_responses=[[2], [4]],
+            advantages=[torch.zeros(2), torch.zeros(2)],
+            position_ids=[torch.arange(2), torch.arange(2)],
+            vllm_logprobs=[torch.zeros(2), torch.zeros(2)],
+            policy_model_versions=[[7], [11]],
+        )
+
+        worker_data = prepare_collated_data_for_workers(
+            ps, dp_world_size=1, per_device_train_batch_size=1, pad_token_id=0, pin_memory=False
+        )[0]
+
+        self.assertIsNotNone(worker_data.policy_model_versions)
+        collated_versions = sorted(
+            version
+            for microbatch in worker_data.policy_model_versions or []
+            for pack in microbatch
+            for version in pack
+        )
+        self.assertEqual(collated_versions, [7, 11])
 
     def test_populate_value_model_fields_minimal(self):
         from open_instruct.data_loader import populate_value_model_fields  # noqa: PLC0415
@@ -361,15 +749,107 @@ class TestScoreParsing(unittest.TestCase):
         p = build_generative_value_prompt("partial", conditioning="gt", ground_truth="42")
         self.assertIn("The correct answer is 42", p)
         self.assertIn("<rollout>", p)
-        self.assertIn("Answer:", p)
+        self.assertIn("You must reason before scoring; a score-only response is invalid", p)
+        self.assertIn("Write a concise rationale inside <think>...</think>", p)
+        self.assertTrue(p.endswith("Value analysis (required before the score):\n<think>\n"))
+        self.assertNotIn("\nAnswer:", p)
+
+    def test_prompt_has_actor_and_remaining_budget_context(self):
+        p = build_generative_value_prompt(
+            "partial",
+            conditioning="none",
+            actor_model_name="Qwen/Qwen3-4B-Base",
+            actor_success_rate=0.125,
+            response_tokens_used=7000,
+            response_token_limit=8192,
+        )
+
+        self.assertIn("The active actor is Qwen/Qwen3-4B-Base", p)
+        self.assertIn("success rate on this task distribution is 12.5%", p)
+        self.assertIn("used 7000 of its 8192 token budget; 1192 tokens remain", p)
+
+    def test_prompt_rejects_invalid_remaining_budget_context(self):
+        with self.assertRaisesRegex(ValueError, "response_tokens_used must be in"):
+            build_generative_value_prompt(
+                "partial", conditioning="none", response_tokens_used=8193, response_token_limit=8192
+            )
 
 
 class TestValueLoss(unittest.TestCase):
+    def test_gen_value_success_rate_ema_starts_from_first_observation(self):
+        first = update_gen_value_success_rate_ema(None, batch_success_rate=0.18, momentum=0.9)
+        second = update_gen_value_success_rate_ema(first, batch_success_rate=0.08, momentum=0.9)
+
+        self.assertEqual(first, 0.18)
+        self.assertAlmostEqual(second, 0.17)
+
+    def test_gen_value_success_rate_ema_validates_inputs(self):
+        with self.assertRaisesRegex(ValueError, "batch_success_rate"):
+            update_gen_value_success_rate_ema(None, batch_success_rate=-0.1, momentum=0.9)
+        with self.assertRaisesRegex(ValueError, "momentum"):
+            update_gen_value_success_rate_ema(None, batch_success_rate=0.1, momentum=1.0)
+        with self.assertRaisesRegex(ValueError, "previous_rate"):
+            update_gen_value_success_rate_ema(1.1, batch_success_rate=0.1, momentum=0.9)
+
+    def test_gen_value_sampled_version_metrics(self):
+        metrics = gen_value_sampled_version_metrics(
+            [{"critic_version": 5}, {"critic_version": 5}, {"critic_version": 6}]
+        )
+
+        self.assertEqual(metrics["gen_value/sampled_value_version_min"], 5.0)
+        self.assertEqual(metrics["gen_value/sampled_value_version_max"], 6.0)
+        self.assertEqual(metrics["gen_value/sampled_value_version_spread"], 1.0)
+        self.assertEqual(gen_value_sampled_version_metrics([]), {})
+
+    def test_gen_value_sampled_version_metrics_rejects_negative_versions(self):
+        with self.assertRaisesRegex(ValueError, "must be nonnegative"):
+            gen_value_sampled_version_metrics([{"critic_version": -1}])
+
     def test_defaults(self):
         config = grpo_utils.GRPOExperimentConfig()
         self.assertEqual(config.value_loss, "mse")
         self.assertEqual(config.value_loss_coef, 1.0)
+        self.assertTrue(config.bound_value_predictions)
         self.assertTrue(config.skip_tool_outputs)
+
+    def test_bounded_value_default_is_inert_without_value_model(self):
+        config = grpo_utils.GRPOExperimentConfig(use_value_model=False)
+
+        self.assertTrue(config.bound_value_predictions)
+
+    def test_dppo_is_a_configured_loss_option(self):
+        config = grpo_utils.GRPOExperimentConfig(loss_fn=grpo_utils.GRPOLossType.dppo, dppo_clip=0.02)
+        self.assertEqual(config.loss_fn, grpo_utils.GRPOLossType.dppo)
+
+    def test_dppo_requires_an_explicit_clip(self):
+        with self.assertRaisesRegex(ValueError, "requires an explicit --dppo_clip"):
+            grpo_utils.GRPOExperimentConfig(loss_fn=grpo_utils.GRPOLossType.dppo)
+
+    def test_dppo_rejects_out_of_range_clip(self):
+        with self.assertRaisesRegex(ValueError, "dppo_clip must be in"):
+            grpo_utils.GRPOExperimentConfig(loss_fn=grpo_utils.GRPOLossType.dppo, dppo_clip=0.0)
+
+    def test_bounded_value_prediction_uses_reward_range(self):
+        logits = torch.tensor([-10.0, 0.0, 10.0])
+        values = bounded_value_prediction(logits, value_min=-2.0, value_max=4.0)
+
+        self.assertTrue(bool((values > -2.0).all()))
+        self.assertTrue(bool((values < 4.0).all()))
+        torch.testing.assert_close(values[1], torch.tensor(1.0))
+        self.assertLess(float(values[0]), 0.0)
+        self.assertGreater(float(values[2]), 2.0)
+
+    def test_predict_values_can_bound_mse_head(self):
+        logits = torch.tensor([[[-100.0], [0.0], [100.0]]])
+        values = predict_values(logits, "mse", bound_predictions=True, value_min=0.0, value_max=10.0)
+
+        self.assertTrue(bool((values > 0.0).all()))
+        self.assertTrue(bool((values < 10.0).all()))
+        torch.testing.assert_close(values[0, 1], torch.tensor(5.0))
+
+    def test_gen_value_unit_score_maps_to_reward_range(self):
+        self.assertEqual(unit_value_to_reward(0.25, value_min=-2.0, value_max=6.0), 0.0)
+        self.assertEqual(reward_to_unit_value(0.0, value_min=-2.0, value_max=6.0), 0.25)
 
     def test_classification_supports_ground_truth_conditioning(self):
         config = grpo_utils.GRPOExperimentConfig(
@@ -385,6 +865,629 @@ class TestValueLoss(unittest.TestCase):
         response_mask = torch.tensor([[False, False, True, False, True]])
         expected = torch.tensor([[False, True, False, True]])
         torch.testing.assert_close(causal_value_mask(response_mask), expected)
+
+    def test_accumulation_group_token_counts_handles_variable_pack_lengths(self):
+        masks = [
+            torch.tensor([[True, True, False]]),
+            torch.tensor([[True, True, True, False]]),
+            torch.tensor([[False, True]]),
+        ]
+
+        counts = accumulation_group_token_counts(masks, accumulation_steps=2)
+
+        torch.testing.assert_close(counts, torch.tensor([5.0, 1.0]))
+
+    def test_balanced_accumulation_groups_use_exact_requested_step_count(self):
+        self.assertEqual(balanced_accumulation_group_ids(num_samples=5, num_groups=2), [0, 0, 0, 1, 1])
+
+    def test_balanced_accumulation_groups_reject_more_steps_than_packs(self):
+        with self.assertRaisesRegex(ValueError, "num_groups cannot exceed num_samples"):
+            balanced_accumulation_group_ids(num_samples=2, num_groups=5)
+
+    def test_grouped_token_counts_follow_balanced_accumulation_groups(self):
+        masks = [torch.ones(1, token_count, dtype=torch.bool) for token_count in (1, 2, 3, 4, 5)]
+        group_ids = balanced_accumulation_group_ids(num_samples=len(masks), num_groups=2)
+
+        counts = grouped_token_counts(masks, group_ids)
+
+        torch.testing.assert_close(counts, torch.tensor([6.0, 9.0]))
+
+    def test_value_loss_contributions_form_one_token_weighted_mean(self):
+        short_pack = torch.tensor([1.0, 3.0])
+        long_pack = torch.tensor([5.0, 7.0, 9.0])
+        global_token_count = short_pack.numel() + long_pack.numel()
+
+        loss = normalize_value_loss(short_pack, global_token_count, loss_coef=0.5, data_parallel_world_size=1)
+        loss += normalize_value_loss(long_pack, global_token_count, loss_coef=0.5, data_parallel_world_size=1)
+
+        expected = torch.cat((short_pack, long_pack)).mean() * 0.5
+        torch.testing.assert_close(loss, expected)
+
+    def test_value_loss_normalization_compensates_for_dp_averaging(self):
+        rank_0 = normalize_value_loss(
+            torch.tensor([1.0, 3.0]), global_token_count=5, loss_coef=1.0, data_parallel_world_size=2
+        )
+        rank_1 = normalize_value_loss(
+            torch.tensor([5.0, 7.0, 9.0]), global_token_count=5, loss_coef=1.0, data_parallel_world_size=2
+        )
+
+        deepspeed_averaged_loss = (rank_0 + rank_1) / 2
+        torch.testing.assert_close(deepspeed_averaged_loss, torch.tensor(5.0))
+
+    def test_value_metrics_are_token_weighted_across_packs(self):
+        short_pack_stats = value_metric_sums(torch.tensor([1.0, 3.0]), torch.tensor(0.5), torch.tensor([True, True]))
+        long_pack_stats = value_metric_sums(
+            torch.tensor([5.0, 7.0, 9.0]), torch.tensor(1 / 3), torch.tensor([True, True, True])
+        )
+
+        value_loss, clipfrac = value_metrics_from_sums(short_pack_stats + long_pack_stats, loss_coef=0.5)
+
+        torch.testing.assert_close(value_loss, torch.tensor(2.5, dtype=torch.float64))
+        torch.testing.assert_close(clipfrac, torch.tensor(0.4, dtype=torch.float64))
+
+    def test_regression_diagnostics_are_exact_with_unequal_rank_token_counts(self):
+        rank_0 = regression_metric_sums(torch.tensor([0.0]), torch.tensor([0.2]))
+        rank_1 = regression_metric_sums(torch.tensor([1.0, 1.0, 1.0]), torch.tensor([0.5, 0.75, 1.0]))
+
+        metrics = regression_metrics_from_sums(rank_0 + rank_1)
+        returns = np.array([0.0, 1.0, 1.0, 1.0])
+        predictions = np.array([0.2, 0.5, 0.75, 1.0])
+        residuals = returns - predictions
+
+        self.assertAlmostEqual(metrics["value/returns_mean"], float(returns.mean()))
+        self.assertAlmostEqual(metrics["value/returns_std"], float(returns.std()))
+        self.assertAlmostEqual(metrics["value/predictions_mean"], float(predictions.mean()))
+        self.assertAlmostEqual(metrics["value/predictions_std"], float(predictions.std()))
+        self.assertAlmostEqual(
+            metrics["value/explained_variance"], 1.0 - float(residuals.var()) / (float(returns.var()) + 1e-8)
+        )
+
+    def test_gen_value_parse_failure_has_zero_reinforce_reward(self):
+        reward, squared_error = generative_value_reinforce_reward(outcome=0.0, prediction=None)
+
+        self.assertEqual(reward, 0.0)
+        self.assertIsNone(squared_error)
+
+    def test_gen_value_parsed_prediction_uses_mse_shaped_reward(self):
+        reward, squared_error = generative_value_reinforce_reward(outcome=1.0, prediction=0.25)
+
+        self.assertEqual(squared_error, 0.75**2)
+        self.assertEqual(reward, 1.0 - 0.75**2)
+
+    def test_gen_value_leave_one_out_baseline_rewards_relative_accuracy(self):
+        weights = generative_value_reinforce_weights([1.0, 0.75, 0.0], baseline="leave_one_out")
+
+        np.testing.assert_allclose(weights, [0.625, 0.25, -0.875])
+        self.assertAlmostEqual(sum(weights), 0.0)
+
+    def test_gen_value_leave_one_out_baseline_keeps_single_sample_reward(self):
+        self.assertEqual(generative_value_reinforce_weights([0.4], baseline="leave_one_out"), [0.4])
+
+    def test_gen_value_leave_one_out_baseline_can_be_stratified_by_outcome(self):
+        weights = generative_value_reinforce_weights(
+            [1.0, 0.8, 0.6, 0.2], baseline="leave_one_out_by_outcome", outcomes=[0.0, 0.0, 1.0, 1.0]
+        )
+
+        np.testing.assert_allclose(weights, [0.2, -0.2, 0.4, -0.4])
+        self.assertAlmostEqual(sum(weights[:2]), 0.0)
+        self.assertAlmostEqual(sum(weights[2:]), 0.0)
+
+    def test_gen_value_replay_does_not_contaminate_leave_one_out_baseline(self):
+        weights = generative_value_reinforce_weights_with_replay(
+            [1.0, 1.0, 1.0, 0.5, 0.25],
+            baseline="leave_one_out_by_outcome",
+            sample_ids=[10, 10, 10, 20, 30],
+            outcomes=[0.0, 0.0, 0.0, 0.0, 0.0],
+        )
+
+        np.testing.assert_allclose(weights, [0.625, 0.625, 0.625, -0.125, -0.5])
+
+    def test_gen_value_replay_requires_consistent_sample_metadata(self):
+        with self.assertRaisesRegex(ValueError, "identical rewards and outcomes"):
+            generative_value_reinforce_weights_with_replay([1.0, 0.5], baseline="leave_one_out", sample_ids=[10, 10])
+
+    def test_gen_value_outcome_baseline_requires_aligned_outcomes(self):
+        with self.assertRaisesRegex(ValueError, "requires one outcome for every reward"):
+            generative_value_reinforce_weights([1.0, 0.0], baseline="leave_one_out_by_outcome", outcomes=[1.0])
+
+    def test_gen_value_final_action_replay_only_repeats_exact_final_states(self):
+        segment = {"state_kind": "segment_start", "id": 1}
+        final = {"state_kind": "final_action", "id": 2}
+
+        replayed = replay_gen_value_final_actions([segment, final], replay_weight=4)
+
+        self.assertEqual([pair["id"] for pair in replayed], [1, 2, 2, 2, 2])
+        self.assertEqual([gen_value_pair_sample_id(pair) for pair in replayed], [0, 1, 1, 1, 1])
+        self.assertEqual(segment, {"state_kind": "segment_start", "id": 1})
+        self.assertEqual(final, {"state_kind": "final_action", "id": 2})
+
+    def test_gen_value_replay_deduplication_preserves_unique_state_order(self):
+        segment = {"state_kind": "segment_start", "id": 1}
+        final = {"state_kind": "final_action", "id": 2}
+        replayed = replay_gen_value_final_actions([segment, final], replay_weight=4)
+
+        unique = unique_replayed_gen_value_pairs(replayed)
+        self.assertEqual([pair["id"] for pair in unique], [1, 2])
+        self.assertEqual([gen_value_pair_sample_id(pair) for pair in unique], [0, 1])
+
+    def test_gen_value_reinforce_baseline_rejects_unknown_mode(self):
+        with self.assertRaisesRegex(ValueError, "Unknown generative-value REINFORCE baseline"):
+            generative_value_reinforce_weights([1.0, 0.0], baseline="centered")
+
+    def test_gen_value_validation_holdout_averages_siblings_and_excludes_whole_trajectories(self):
+        def pair(prompt_ids, outcome, used):
+            return {
+                "request_output": SimpleNamespace(prompt_token_ids=prompt_ids),
+                "outcome": outcome,
+                "response_tokens_used": used,
+                "response_token_limit": 100,
+                "state_kind": "final_action" if used >= 90 else "segment_start",
+            }
+
+        a0, a1 = pair([1, 2], 0.0, 0), pair([1, 3], 0.0, 90)
+        b0, b1 = pair([1, 2], 1.0, 0), pair([1, 4], 1.0, 95)
+        middle = pair([9], 0.0, 50)
+        examples, training_pairs = build_gen_value_validation_holdout(
+            [{"pairs": [a0, middle, a1]}, {"pairs": [b0, b1]}], max_examples=3, seed=1
+        )
+
+        initial = [example for example in examples if example["kind"] == "initial"]
+        self.assertEqual(len(initial), 1)
+        self.assertEqual(initial[0]["target"], 0.5)
+        self.assertEqual(initial[0]["target_source"], "sibling_empirical_return")
+        self.assertTrue(
+            all(
+                example["target_source"] == "single_sample_return"
+                for example in examples
+                if example["kind"] != "initial"
+            )
+        )
+        self.assertEqual(len(examples), 3)
+        self.assertEqual(training_pairs, [])
+
+    def test_gen_value_validation_holdout_keeps_nonheldout_prompt_groups_for_training(self):
+        def pair(prompt_ids, outcome, used):
+            return {
+                "request_output": SimpleNamespace(prompt_token_ids=prompt_ids),
+                "outcome": outcome,
+                "response_tokens_used": used,
+                "response_token_limit": 100,
+                "state_kind": "final_action" if used >= 90 else "segment_start",
+            }
+
+        rollouts = [
+            {"pairs": [pair([group_index, 0], 0.0, 0), pair([group_index, 1], 0.0, 95)]} for group_index in range(8)
+        ]
+
+        examples, training_pairs = build_gen_value_validation_holdout(rollouts, max_examples=16, seed=3)
+
+        initial = [example for example in examples if example["kind"] == "initial"]
+        self.assertEqual(len(initial), 1)
+        heldout_group = initial[0]["prompt_token_ids"][0]
+        self.assertEqual(len(training_pairs), 14)
+        self.assertTrue(all(pair_["request_output"].prompt_token_ids[0] != heldout_group for pair_ in training_pairs))
+
+    def test_gen_value_validation_holdout_reserves_rare_near_horizon_failure(self):
+        def pair(group_index, outcome, used, kind="segment_start"):
+            return {
+                "request_output": SimpleNamespace(prompt_token_ids=[group_index, used]),
+                "outcome": outcome,
+                "response_tokens_used": used,
+                "response_token_limit": 1000,
+                "state_kind": kind,
+            }
+
+        rollouts = []
+        for group_index in range(8):
+            final_tokens = 950 if group_index == 7 else 400
+            rollouts.append(
+                {"pairs": [pair(group_index, 0.0, 0), pair(group_index, 0.0, final_tokens, "final_action")]}
+            )
+
+        examples, training_pairs = build_gen_value_validation_holdout(
+            rollouts, max_examples=8, seed=0, prompt_holdout_fraction=0.125
+        )
+
+        heldout_groups = {example["prompt_token_ids"][0] for example in examples}
+        self.assertEqual(heldout_groups, {7})
+        self.assertTrue(any(example["response_tokens_used"] == 950 for example in examples))
+        self.assertTrue(all(pair_["request_output"].prompt_token_ids[0] != 7 for pair_ in training_pairs))
+
+    def test_gen_value_validation_holdout_covers_trajectory_prefixes_and_final_action(self):
+        def pair(prompt_ids, outcome, used, kind="segment_start"):
+            return {
+                "request_output": SimpleNamespace(prompt_token_ids=prompt_ids),
+                "outcome": outcome,
+                "response_tokens_used": used,
+                "response_token_limit": 100,
+                "state_kind": kind,
+            }
+
+        pairs = [
+            pair([1, 0], 0.0, 0),
+            pair([1, 1], 0.0, 20),
+            pair([1, 2], 0.0, 45),
+            pair([1, 3], 0.0, 70),
+            pair([1, 4], 0.0, 95, "final_action"),
+        ]
+
+        examples, training_pairs = build_gen_value_validation_holdout([{"pairs": pairs}], max_examples=8, seed=2)
+
+        self.assertEqual(training_pairs, [])
+        self.assertEqual([example["kind"] for example in examples].count("initial"), 1)
+        self.assertEqual([example["kind"] for example in examples].count("segment_start"), 3)
+        self.assertEqual([example["kind"] for example in examples].count("final_action"), 1)
+        self.assertEqual(
+            sorted(example["response_tokens_used"] for example in examples if example["kind"] == "segment_start"),
+            [20, 45, 70],
+        )
+        self.assertEqual(
+            [example["trajectory_fraction"] for example in examples if example["kind"] == "final_action"], [1.0]
+        )
+
+    def test_gen_value_validation_metrics_separate_terminal_failures(self):
+        examples = [
+            {"kind": "initial", "target": 0.25, "response_tokens_used": 0, "response_token_limit": 1000},
+            {"kind": "final_action", "target": 0.0, "response_tokens_used": 950, "response_token_limit": 1000},
+            {"kind": "final_action", "target": 1.0, "response_tokens_used": 900, "response_token_limit": 1000},
+        ]
+
+        metrics = gen_value_validation_metrics(examples, [0.5, 0.4, None])
+
+        self.assertAlmostEqual(metrics["gen_value/validation_parse_rate"], 2 / 3)
+        self.assertAlmostEqual(metrics["gen_value/validation_mse"], (0.25**2 + 0.4**2) / 2)
+        self.assertAlmostEqual(metrics["gen_value/validation_penalized_mse"], (0.25**2 + 0.4**2 + 1.0) / 3)
+        self.assertEqual(metrics["gen_value/validation_final_incorrect_v_hat_mean"], 0.4)
+        self.assertEqual(metrics["gen_value/validation_final_action_incorrect_v_hat_mean"], 0.4)
+        self.assertEqual(metrics["gen_value/validation_near_horizon_incorrect_v_hat_mean"], 0.4)
+
+    def test_gen_value_validation_metrics_distinguish_empirical_and_sampled_targets(self):
+        examples = [
+            {"kind": "initial", "target": 0.25, "target_source": "sibling_empirical_return"},
+            {"kind": "segment_start", "target": 0.0, "target_source": "single_sample_return"},
+        ]
+
+        metrics = gen_value_validation_metrics(examples, [0.5, 0.4])
+
+        self.assertEqual(metrics["gen_value/validation_empirical_return_examples"], 1.0)
+        self.assertEqual(metrics["gen_value/validation_single_sample_return_examples"], 1.0)
+        self.assertAlmostEqual(metrics["gen_value/validation_empirical_return_mse"], 0.25**2)
+        self.assertAlmostEqual(metrics["gen_value/validation_single_sample_return_mse"], 0.4**2)
+
+    def test_gen_value_validation_metrics_measure_prefix_ranking_and_near_horizon_failures(self):
+        examples = [
+            {"kind": "segment_start", "target": 1.0, "response_tokens_used": 4000, "response_token_limit": 8192},
+            {"kind": "segment_start", "target": 0.0, "response_tokens_used": 5000, "response_token_limit": 8192},
+            {"kind": "segment_start", "target": 0.0, "response_tokens_used": 8000, "response_token_limit": 8192},
+        ]
+
+        metrics = gen_value_validation_metrics(examples, [0.8, 0.3, 0.1])
+
+        self.assertAlmostEqual(metrics["gen_value/validation_prefix_correct_v_hat_mean"], 0.8)
+        self.assertAlmostEqual(metrics["gen_value/validation_prefix_incorrect_v_hat_mean"], 0.2)
+        self.assertAlmostEqual(metrics["gen_value/validation_prefix_value_gap"], 0.6)
+        self.assertAlmostEqual(metrics["gen_value/validation_near_horizon_incorrect_v_hat_mean"], 0.1)
+
+    def test_gen_value_validation_metrics_measure_trajectory_position_ranking(self):
+        examples = [
+            {"kind": "segment_start", "target": 1.0, "trajectory_fraction": 0.25},
+            {"kind": "segment_start", "target": 0.0, "trajectory_fraction": 0.25},
+            {"kind": "segment_start", "target": 1.0, "trajectory_fraction": 0.50},
+            {"kind": "segment_start", "target": 0.0, "trajectory_fraction": 0.50},
+            {"kind": "segment_start", "target": 1.0, "trajectory_fraction": 0.75},
+            {"kind": "segment_start", "target": 0.0, "trajectory_fraction": 0.75},
+        ]
+
+        metrics = gen_value_validation_metrics(examples, [0.6, 0.4, 0.7, 0.5, 0.9, 0.2])
+
+        self.assertAlmostEqual(metrics["gen_value/validation_prefix_early_value_gap"], 0.2)
+        self.assertAlmostEqual(metrics["gen_value/validation_prefix_middle_value_gap"], 0.2)
+        self.assertAlmostEqual(metrics["gen_value/validation_prefix_late_value_gap"], 0.7)
+        self.assertAlmostEqual(metrics["gen_value/validation_prefix_late_incorrect_v_hat_mean"], 0.2)
+
+    def test_gen_value_validation_position_bands_do_not_overlap_at_boundaries(self):
+        examples = [
+            {"kind": "segment_start", "target": 1.0, "trajectory_fraction": 0.0},
+            {"kind": "segment_start", "target": 0.0, "trajectory_fraction": 0.374},
+            {"kind": "segment_start", "target": 1.0, "trajectory_fraction": 0.375},
+            {"kind": "segment_start", "target": 0.0, "trajectory_fraction": 0.624},
+            {"kind": "segment_start", "target": 1.0, "trajectory_fraction": 0.625},
+            {"kind": "segment_start", "target": 0.0, "trajectory_fraction": 1.0},
+        ]
+
+        metrics = gen_value_validation_metrics(examples, [0.6, 0.4, 0.7, 0.5, 0.9, 0.2])
+
+        self.assertEqual(metrics["gen_value/validation_prefix_early_correct_examples"], 1.0)
+        self.assertEqual(metrics["gen_value/validation_prefix_early_incorrect_examples"], 1.0)
+        self.assertEqual(metrics["gen_value/validation_prefix_middle_correct_examples"], 1.0)
+        self.assertEqual(metrics["gen_value/validation_prefix_middle_incorrect_examples"], 1.0)
+        self.assertEqual(metrics["gen_value/validation_prefix_late_correct_examples"], 1.0)
+        self.assertEqual(metrics["gen_value/validation_prefix_late_incorrect_examples"], 1.0)
+
+    def test_gen_value_validation_absolute_prefix_bands_do_not_overlap_at_boundaries(self):
+        examples = [
+            {"kind": "segment_start", "target": 1.0, "response_tokens_used": 1023},
+            {"kind": "segment_start", "target": 0.0, "response_tokens_used": 1024},
+            {"kind": "segment_start", "target": 1.0, "response_tokens_used": 2047},
+            {"kind": "segment_start", "target": 0.0, "response_tokens_used": 2048},
+            {"kind": "segment_start", "target": 1.0, "response_tokens_used": 4095},
+            {"kind": "segment_start", "target": 0.0, "response_tokens_used": 4096},
+            {"kind": "final_action", "target": 1.0, "response_tokens_used": 8192},
+        ]
+
+        metrics = gen_value_validation_metrics(examples, [0.6, 0.4, 0.7, 0.5, 0.9, 0.2, 1.0])
+
+        self.assertEqual(metrics["gen_value/validation_prefix_tokens_lt_1024_correct_examples"], 1.0)
+        self.assertEqual(metrics["gen_value/validation_prefix_tokens_1024_2048_correct_examples"], 1.0)
+        self.assertEqual(metrics["gen_value/validation_prefix_tokens_1024_2048_incorrect_examples"], 1.0)
+        self.assertEqual(metrics["gen_value/validation_prefix_tokens_2048_4096_correct_examples"], 1.0)
+        self.assertEqual(metrics["gen_value/validation_prefix_tokens_2048_4096_incorrect_examples"], 1.0)
+        self.assertEqual(metrics["gen_value/validation_prefix_tokens_ge_4096_incorrect_examples"], 1.0)
+        self.assertAlmostEqual(metrics["gen_value/validation_prefix_tokens_1024_2048_value_gap"], 0.3)
+        self.assertAlmostEqual(metrics["gen_value/validation_prefix_tokens_2048_4096_value_gap"], 0.4)
+        self.assertNotIn("gen_value/validation_prefix_tokens_ge_4096_correct_examples", metrics)
+
+    def test_gen_value_validation_prediction_change_metrics_measure_serving_drift(self):
+        metrics = gen_value_validation_prediction_change_metrics([0.2, 0.7, None, 0.4], [0.3, 0.5, 0.8, None])
+
+        self.assertEqual(metrics["gen_value/validation_prediction_change_examples"], 4.0)
+        self.assertEqual(metrics["gen_value/validation_prediction_change_paired_examples"], 2.0)
+        self.assertAlmostEqual(metrics["gen_value/validation_prediction_parse_status_changed_fraction"], 0.5)
+        self.assertAlmostEqual(metrics["gen_value/validation_prediction_mean_change"], -0.05)
+        self.assertAlmostEqual(metrics["gen_value/validation_prediction_mean_abs_change"], 0.15)
+        self.assertAlmostEqual(metrics["gen_value/validation_prediction_max_abs_change"], 0.2)
+        self.assertEqual(metrics["gen_value/validation_prediction_changed_fraction"], 1.0)
+
+    def test_gen_value_validation_prediction_change_metrics_validate_lengths(self):
+        with self.assertRaisesRegex(ValueError, "differ in length"):
+            gen_value_validation_prediction_change_metrics([0.1], [0.1, 0.2])
+
+    def test_gen_value_validation_snapshot_preserves_inspectable_outputs(self):
+        examples = [
+            {
+                "prompt_token_ids": [1, 2, 3],
+                "kind": "final_action",
+                "target": 0.0,
+                "response_tokens_used": 99,
+                "response_token_limit": 100,
+            }
+        ]
+        with tempfile.TemporaryDirectory() as output_dir:
+            snapshot_path = write_gen_value_validation_snapshot(
+                output_dir,
+                version=25,
+                examples=examples,
+                predictions=[0.2],
+                prompts=["critic prompt"],
+                generations=["reasoning <answer>2</answer>"],
+            )
+
+            self.assertEqual(snapshot_path, Path(output_dir) / "gen_value_validation/version_000025.jsonl")
+            row = json.loads(snapshot_path.read_text())
+            self.assertNotIn("prompt_token_ids", row)
+            self.assertEqual(row["version"], 25)
+            self.assertEqual(row["prediction"], 0.2)
+            self.assertEqual(row["prompt"], "critic prompt")
+            self.assertEqual(row["generation"], "reasoning <answer>2</answer>")
+
+    def test_gen_value_training_trace_reservoir_is_atomic_and_manifested(self):
+        examples = [
+            {
+                "outcome": 0.0,
+                "prediction": 0.2,
+                "prompt": "critic prompt",
+                "generation": "reasoning <answer>2</answer>",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as output_dir:
+            trace_path = write_gen_value_training_trace_reservoir(
+                output_dir, version=25, examples=examples, seen_by_outcome={"correct": 11, "incorrect": 23}
+            )
+
+            self.assertEqual(trace_path, Path(output_dir) / "gen_value_training_traces/reservoir.jsonl")
+            self.assertEqual(json.loads(trace_path.read_text()), examples[0])
+            manifest = json.loads(trace_path.with_name("manifest.json").read_text())
+            self.assertEqual(manifest["critic_version"], 25)
+            self.assertEqual(manifest["retained_examples"], 1)
+            self.assertEqual(manifest["seen_by_outcome"], {"correct": 11, "incorrect": 23})
+
+    def test_gen_value_sft_trace_selection_is_accurate_balanced_and_deduplicated(self):
+        examples = [
+            {
+                "source_critic_version": 20,
+                "outcome": 1.0,
+                "prediction": 0.8,
+                "squared_error": 0.04,
+                "prompt": "correct-a",
+                "generation": "reasoning <answer>0.8</answer>",
+            },
+            {
+                "source_critic_version": 25,
+                "outcome": 1.0,
+                "prediction": 0.9,
+                "squared_error": 0.01,
+                "prompt": "correct-a",
+                "generation": "better reasoning <answer>0.9</answer>",
+            },
+            {
+                "source_critic_version": 25,
+                "outcome": 1.0,
+                "prediction": 0.95,
+                "squared_error": 0.0025,
+                "prompt": "correct-b",
+                "generation": "reasoning <answer>0.95</answer>",
+            },
+            {
+                "source_critic_version": 25,
+                "outcome": 0.0,
+                "prediction": 0.1,
+                "squared_error": 0.01,
+                "prompt": "incorrect-a",
+                "generation": "reasoning <answer>0.1</answer>",
+            },
+            {
+                "source_critic_version": 25,
+                "outcome": 0.0,
+                "prediction": None,
+                "squared_error": None,
+                "prompt": "parse-failure",
+                "generation": "unparseable",
+            },
+            {
+                "source_critic_version": 25,
+                "outcome": 0.0,
+                "prediction": 0.8,
+                "squared_error": 0.64,
+                "prompt": "inaccurate",
+                "generation": "reasoning <answer>0.8</answer>",
+            },
+        ]
+
+        selected = select_gen_value_sft_traces(examples, max_squared_error=0.04, min_critic_version=25, seed=7)
+
+        self.assertEqual(len(selected), 2)
+        self.assertEqual({example["outcome"] for example in selected}, {0.0, 1.0})
+        selected_by_prompt = {example["prompt"]: example for example in selected}
+        self.assertNotIn("parse-failure", selected_by_prompt)
+        self.assertNotIn("inaccurate", selected_by_prompt)
+        if "correct-a" in selected_by_prompt:
+            self.assertEqual(selected_by_prompt["correct-a"]["prediction"], 0.9)
+
+    def test_gen_value_sft_trace_selection_balances_trajectory_positions(self):
+        examples = []
+        positions = {
+            "early": {"state_kind": "segment_start", "trajectory_fraction": 0.25},
+            "middle": {"state_kind": "segment_start", "trajectory_fraction": 0.5},
+            "late": {"state_kind": "segment_start", "trajectory_fraction": 0.75},
+            "final_action": {"state_kind": "final_action", "trajectory_fraction": 1.0},
+        }
+        for outcome in (0.0, 1.0):
+            for position, metadata in positions.items():
+                examples.append(
+                    {
+                        "source_critic_version": 25,
+                        "outcome": outcome,
+                        "prediction": 0.1 if outcome == 0.0 else 0.9,
+                        "squared_error": 0.01,
+                        "prompt": f"{outcome}-{position}",
+                        "generation": f"reasoning <answer>{1 if outcome == 0.0 else 9}</answer>",
+                        **metadata,
+                    }
+                )
+        # Final-action replay can contribute several copies/prompts. Position
+        # balancing must not let those crowd the intermediate states out.
+        examples.append({**examples[-1], "prompt": "1.0-final-action-extra"})
+
+        selected = select_gen_value_sft_traces(examples, max_squared_error=0.04, min_critic_version=25, seed=3)
+
+        self.assertEqual(len(selected), 8)
+        selected_positions = {
+            (
+                "final_action"
+                if example["state_kind"] == "final_action"
+                else "early"
+                if example["trajectory_fraction"] <= 0.375
+                else "middle"
+                if example["trajectory_fraction"] <= 0.625
+                else "late"
+            )
+            for example in selected
+        }
+        self.assertEqual(selected_positions, set(positions))
+        self.assertEqual(sum(example["outcome"] == 0.0 for example in selected), 4)
+        self.assertEqual(sum(example["outcome"] == 1.0 for example in selected), 4)
+
+    def test_gen_value_sft_trace_selection_prefers_pooled_training_target_error(self):
+        shared_state = {
+            "source_critic_version": 25,
+            "prediction": 0.5,
+            "training_target": 0.5,
+            "training_target_squared_error": 0.0,
+            "state_kind": "segment_start",
+            "trajectory_fraction": 0.5,
+        }
+        examples = [
+            {
+                **shared_state,
+                "outcome": 1.0,
+                "squared_error": 0.25,
+                "prompt": "ambiguous-correct-prefix",
+                "generation": "calibrated reasoning <answer>5</answer>",
+            },
+            {
+                **shared_state,
+                "outcome": 0.0,
+                "squared_error": 0.25,
+                "prompt": "ambiguous-incorrect-prefix",
+                "generation": "calibrated reasoning <answer>5</answer>",
+            },
+        ]
+
+        selected = select_gen_value_sft_traces(examples, max_squared_error=0.04, seed=5)
+
+        self.assertEqual(len(selected), 2)
+        self.assertEqual({example["outcome"] for example in selected}, {0.0, 1.0})
+
+    def test_gen_value_sft_trace_selection_deduplicates_by_pooled_training_target_error(self):
+        examples = [
+            {
+                "source_critic_version": 25,
+                "outcome": 1.0,
+                "prediction": 1.0,
+                "squared_error": 0.0,
+                "training_target": 0.5,
+                "training_target_squared_error": 0.25,
+                "prompt": "shared-prefix",
+                "generation": "sample-accurate but pooled-inaccurate <answer>10</answer>",
+            },
+            {
+                "source_critic_version": 25,
+                "outcome": 1.0,
+                "prediction": 0.5,
+                "squared_error": 0.25,
+                "training_target": 0.5,
+                "training_target_squared_error": 0.0,
+                "prompt": "shared-prefix",
+                "generation": "pooled-accurate <answer>5</answer>",
+            },
+        ]
+
+        selected = select_gen_value_sft_traces(examples, max_squared_error=0.3, balance_outcomes=False, seed=5)
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["generation"], "pooled-accurate <answer>5</answer>")
+
+    def test_gen_value_sft_trace_selection_falls_back_to_sampled_error(self):
+        examples = [
+            {
+                "source_critic_version": 25,
+                "outcome": 1.0,
+                "prediction": 0.9,
+                "squared_error": 0.01,
+                "prompt": "legacy-correct-prefix",
+                "generation": "legacy reasoning <answer>9</answer>",
+            },
+            {
+                "source_critic_version": 25,
+                "outcome": 0.0,
+                "prediction": 0.1,
+                "squared_error": 0.01,
+                "prompt": "legacy-incorrect-prefix",
+                "generation": "legacy reasoning <answer>1</answer>",
+            },
+        ]
+
+        selected = select_gen_value_sft_traces(examples, max_squared_error=0.04, seed=5)
+
+        self.assertEqual(len(selected), 2)
+
+    def test_final_action_prefix_retains_observations_and_is_causal(self):
+        prefix, response_tokens_used = causal_final_action_prefix_token_ids(
+            [10, 11, 20, 21, 30, 31, 22], [False, False, True, True, False, False, True]
+        )
+
+        self.assertEqual(prefix, [20, 21, 30, 31])
+        self.assertEqual(response_tokens_used, 2)
 
     def test_classification_loss_preserves_continuous_targets(self):
         probabilities = torch.tensor([[[0.75, 0.25], [0.25, 0.75]]])
@@ -402,7 +1505,7 @@ class TestValueLoss(unittest.TestCase):
         torch.testing.assert_close(predict_values(logits, "classification"), returns)
 
     def test_classification_loss_rejects_out_of_range_targets(self):
-        with self.assertRaisesRegex(ValueError, "outside \\[0, 1\\]"):
+        with self.assertRaisesRegex(ValueError, "outside \\[0.0, 1.0\\]"):
             compute_value_loss(
                 torch.zeros(1, 1, 2),
                 torch.tensor([[1.1]]),
@@ -411,6 +1514,27 @@ class TestValueLoss(unittest.TestCase):
                 loss_type="classification",
                 clip_range=0.2,
             )
+
+    def test_classification_supports_custom_reward_range(self):
+        probabilities = torch.tensor([[[0.75, 0.25], [0.25, 0.75]]])
+        logits = probabilities.log()
+        returns = torch.tensor([[0.0, 4.0]])
+        mask = torch.tensor([[True, True]])
+
+        per_token, _ = compute_value_loss(
+            logits,
+            returns,
+            old_values=None,
+            mask=mask,
+            loss_type="classification",
+            clip_range=0.2,
+            value_min=-2.0,
+            value_max=6.0,
+        )
+
+        expected = -(probabilities * probabilities.log()).sum(dim=-1)
+        torch.testing.assert_close(per_token, expected)
+        torch.testing.assert_close(predict_values(logits, "classification", value_min=-2.0, value_max=6.0), returns)
 
     def test_mse_loss_no_clip(self):
         new_v = torch.tensor([[1.0, 2.0, 3.0]])
@@ -437,8 +1561,8 @@ class TestValueLoss(unittest.TestCase):
 class TestGenValueSegmentation(unittest.TestCase):
     def test_fixed_segmentation(self):
         boundaries = segment_rollout(list(range(1500)), None, mode="fixed", fixed_chunk_size=500)
-        # Boundaries at 500 and 1000, plus a final boundary at L-1.
-        self.assertEqual(boundaries, [500, 1000, 1499])
+        # Inclusive ends for three exactly 500-token chunks.
+        self.assertEqual(boundaries, [499, 999, 1499])
 
     def test_sae_segmentation(self):
         logps = [-0.1] * 10 + [-3.0] + [-0.1] * 10  # one boundary at t=10

@@ -1,18 +1,52 @@
+import asyncio
 import logging
 import queue
 import threading
 import time
 import unittest
 from concurrent import futures
+from types import SimpleNamespace
 from unittest import mock
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
+import torch
 import vllm
 from parameterized import parameterized
 
 from open_instruct import vllm_utils
 from open_instruct.data_types import PromptRequest
 from open_instruct.utils import ModelDims
+
+
+class TestBroadcastWeightsToVllm(unittest.TestCase):
+    def test_packed_nccl_flag_reaches_sender_and_receiver(self):
+        model = torch.nn.Linear(3, 2, bias=False)
+        engine = MagicMock()
+        model_update_group = object()
+
+        with (
+            mock.patch.object(vllm_utils.ray, "get"),
+            mock.patch.object(vllm_utils.NCCLWeightTransferEngine, "trainer_send_weights") as trainer_send_weights,
+        ):
+            refs = vllm_utils.broadcast_weights_to_vllm(
+                model=model,
+                vllm_engines=[engine],
+                model_update_group=model_update_group,
+                model_step=7,
+                use_packed=True,
+            )
+
+        engine.sleep.remote.assert_called_once_with()
+        names, dtype_names, shapes, packed, model_step = engine.update_weights.remote.call_args.args
+        self.assertEqual(names, ["weight"])
+        self.assertEqual(dtype_names, ["float32"])
+        self.assertEqual(shapes, [[2, 3]])
+        self.assertTrue(packed)
+        self.assertEqual(model_step, 7)
+        trainer_args = trainer_send_weights.call_args.kwargs["trainer_args"]
+        self.assertIs(trainer_args.group, model_update_group)
+        self.assertTrue(trainer_args.packed)
+        self.assertEqual(refs, [engine.update_weights.remote.return_value])
 
 
 class TestTruncateEnvOutputTokens(unittest.TestCase):
@@ -38,17 +72,18 @@ class TestTruncateEnvOutputTokens(unittest.TestCase):
 
 
 class FakeCompletionTokenizer:
+    def __init__(self):
+        self.add_special_tokens_calls = []
+
     def encode(self, prompt, add_special_tokens=False):
+        self.add_special_tokens_calls.append(add_special_tokens)
         return list(range(int(prompt)))
 
 
 class TestBoundCompletionRequestToContext(unittest.TestCase):
     def test_reduces_max_tokens_when_prompt_fits(self):
         prompt_ids, request_max_tokens, prompt_truncated = vllm_utils.bound_completion_request_to_context(
-            FakeCompletionTokenizer(),
-            "20481",
-            max_model_len=21504,
-            max_tokens=1024,
+            FakeCompletionTokenizer(), "20481", max_model_len=21504, max_tokens=1024
         )
 
         self.assertEqual(len(prompt_ids), 20481)
@@ -58,16 +93,122 @@ class TestBoundCompletionRequestToContext(unittest.TestCase):
 
     def test_truncates_prompt_when_prompt_exceeds_context(self):
         prompt_ids, request_max_tokens, prompt_truncated = vllm_utils.bound_completion_request_to_context(
-            FakeCompletionTokenizer(),
-            "12",
-            max_model_len=10,
-            max_tokens=4,
+            FakeCompletionTokenizer(), "12", max_model_len=10, max_tokens=4
         )
 
         self.assertEqual(prompt_ids, [3, 4, 5, 6, 7, 8, 9, 10, 11])
         self.assertEqual(request_max_tokens, 1)
         self.assertTrue(prompt_truncated)
         self.assertLessEqual(len(prompt_ids) + request_max_tokens, 10)
+
+    def test_refuses_prompt_truncation_when_disabled(self):
+        with self.assertRaisesRegex(ValueError, "refusing to truncate the prompt or reduce max_tokens"):
+            vllm_utils.bound_completion_request_to_context(
+                FakeCompletionTokenizer(), "10", max_model_len=10, max_tokens=4, allow_prompt_truncation=False
+            )
+
+    def test_refuses_max_token_reduction_when_prompt_itself_fits(self):
+        with self.assertRaisesRegex(ValueError, "refusing to truncate the prompt or reduce max_tokens"):
+            vllm_utils.bound_completion_request_to_context(
+                FakeCompletionTokenizer(), "20481", max_model_len=21504, max_tokens=1024, allow_prompt_truncation=False
+            )
+
+
+class TestGenerateRequestOutputs(unittest.TestCase):
+    def test_returns_exact_prompt_and_completion_token_ids(self):
+        actor = object.__new__(vllm_utils.LLMRayActor)
+        tokenizer = FakeCompletionTokenizer()
+        actor.llm_engine = SimpleNamespace(model_config=SimpleNamespace(max_model_len=16), tokenizer=tokenizer)
+        actor.model_name = "critic"
+        actor.inference_batch_size = 1
+        actor.current_model_step = 17
+        token_logprobs = [-0.1, -0.2, -0.3]
+        output = SimpleNamespace(
+            text="<answer>7</answer>",
+            token_ids=[11, 12, 13],
+            logprobs=SimpleNamespace(token_logprobs=token_logprobs),
+            finish_reason="stop",
+        )
+        actor.client = SimpleNamespace(
+            completions=SimpleNamespace(create=AsyncMock(return_value=SimpleNamespace(choices=[output])))
+        )
+        actor._run_async = lambda coroutine: asyncio.run(coroutine)
+
+        request_outputs = actor.generate_request_outputs(
+            ["4"], temperature=0.5, max_tokens=3, include_stop_str_in_output=True, allow_prompt_truncation=False
+        )
+
+        self.assertEqual(
+            request_outputs,
+            [
+                vllm_utils.RequestOutput(
+                    request_id="simple_0_0",
+                    prompt_token_ids=[0, 1, 2, 3],
+                    outputs=[
+                        vllm_utils.CompletionOutput(
+                            index=0,
+                            token_ids=[11, 12, 13],
+                            logprobs=token_logprobs,
+                            finish_reason="stop",
+                            text="<answer>7</answer>",
+                            cumulative_logprob=sum(token_logprobs),
+                            mask=[1, 1, 1],
+                        )
+                    ],
+                )
+            ],
+        )
+        kwargs = actor.client.completions.create.await_args.kwargs
+        self.assertEqual(kwargs["prompt"], [0, 1, 2, 3])
+        self.assertEqual(tokenizer.add_special_tokens_calls, [True])
+        self.assertEqual(kwargs["temperature"], 0.5)
+        self.assertEqual(kwargs["logprobs"], 1)
+        self.assertEqual(
+            kwargs["extra_body"],
+            {"return_token_ids": True, "cache_salt": "model-step-17", "include_stop_str_in_output": True},
+        )
+
+    def test_limits_inflight_requests_to_policy_inference_batch_size(self):
+        actor = object.__new__(vllm_utils.LLMRayActor)
+        tokenizer = FakeCompletionTokenizer()
+        actor.llm_engine = SimpleNamespace(model_config=SimpleNamespace(max_model_len=16), tokenizer=tokenizer)
+        actor.model_name = "critic"
+        actor.inference_batch_size = 2
+        actor.current_model_step = 3
+        active_requests = 0
+        max_active_requests = 0
+
+        async def create_completion(**kwargs):
+            nonlocal active_requests, max_active_requests
+            active_requests += 1
+            max_active_requests = max(max_active_requests, active_requests)
+            try:
+                await asyncio.sleep(0.01)
+                completion_token_id = len(kwargs["prompt"])
+                output = SimpleNamespace(
+                    text=str(completion_token_id),
+                    token_ids=[completion_token_id],
+                    logprobs=SimpleNamespace(token_logprobs=[-0.1]),
+                    finish_reason="stop",
+                )
+                return SimpleNamespace(choices=[output])
+            finally:
+                active_requests -= 1
+
+        actor.client = SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(side_effect=create_completion)))
+        actor._run_async = lambda coroutine: asyncio.run(coroutine)
+
+        request_outputs = actor.generate_request_outputs(
+            ["1", "2", "3", "4", "5"], max_tokens=1, allow_prompt_truncation=False
+        )
+
+        self.assertEqual(max_active_requests, actor.inference_batch_size)
+        self.assertEqual([len(output.prompt_token_ids) for output in request_outputs], [1, 2, 3, 4, 5])
+        self.assertEqual([output.outputs[0].token_ids for output in request_outputs], [[1], [2], [3], [4], [5]])
+        self.assertEqual(
+            {call.kwargs["extra_body"]["cache_salt"] for call in actor.client.completions.create.await_args_list},
+            {"model-step-3"},
+        )
 
 
 class TestProcessFromQueue(unittest.TestCase):

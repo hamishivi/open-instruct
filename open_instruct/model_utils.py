@@ -243,6 +243,64 @@ def disable_dropout_in_model(model: torch.nn.Module) -> None:
             module.p = 0
 
 
+def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if hasattr(model, "module") else model
+
+
+def _uses_zero3(model: torch.nn.Module) -> bool:
+    return any(hasattr(parameter, "ds_id") for parameter in model.parameters())
+
+
+def save_model_state_dict(model: torch.nn.Module, checkpoint_path: str | pathlib.Path, rank: int) -> None:
+    """Save a portable model state dict, gathering ZeRO-3 parameters when needed.
+
+    All distributed ranks must call this function. Only rank 0 writes the file.
+    """
+    model_to_save = _unwrap_model(model)
+    expected_keys = set(model_to_save.state_dict().keys())
+    state_dict = OrderedDict()
+
+    for name, parameter in model_to_save.named_parameters(remove_duplicate=False):
+        is_zero3_parameter = hasattr(parameter, "ds_id")
+        with deepspeed.zero.GatheredParameters([parameter], enabled=is_zero3_parameter):
+            if rank == 0:
+                state_dict[name] = parameter.detach().cpu().clone()
+
+    if rank == 0:
+        for name, buffer in model_to_save.named_buffers(remove_duplicate=False):
+            if name in expected_keys:
+                state_dict[name] = buffer.detach().cpu().clone()
+
+        missing_keys = expected_keys - set(state_dict)
+        unexpected_keys = set(state_dict) - expected_keys
+        if missing_keys or unexpected_keys:
+            raise RuntimeError(
+                "Portable checkpoint keys do not match the model state dict: "
+                f"missing={sorted(missing_keys)}, unexpected={sorted(unexpected_keys)}"
+            )
+        empty_parameters = [
+            name
+            for name, parameter in model_to_save.named_parameters(remove_duplicate=False)
+            if state_dict[name].numel() == 0 and getattr(parameter, "ds_numel", parameter.numel()) > 0
+        ]
+        if empty_parameters:
+            raise RuntimeError(f"Portable checkpoint contains empty ZeRO-3 parameters: {empty_parameters}")
+
+        checkpoint_path = pathlib.Path(checkpoint_path)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=checkpoint_path.parent, prefix=f".{checkpoint_path.name}.", suffix=".tmp", delete=False
+            ) as temporary_file:
+                temporary_path = pathlib.Path(temporary_file.name)
+            torch.save(state_dict, temporary_path)
+            temporary_path.replace(checkpoint_path)
+        finally:
+            if temporary_path is not None and temporary_path.exists():
+                temporary_path.unlink()
+
+
 def maybe_load_checkpoint(
     model: torch.nn.Module, checkpoint_path: str, device: torch.device, rank: int, throw_on_error: bool = True
 ) -> None:
@@ -257,14 +315,19 @@ def maybe_load_checkpoint(
     """
 
     def _load_checkpoint(path: str, dev: torch.device):
-        state_dict = torch.load(path, map_location=dev)
-        if hasattr(model, "module"):
-            # Needed if wrapped by DeepSpeed.
-            model.module.load_state_dict(state_dict)
+        model_to_load = _unwrap_model(model)
+        if _uses_zero3(model_to_load):
+            # Rank 0 loads a CPU state dict while all ranks gather the partitioned
+            # parameters. modifier_rank redistributes the loaded weights on exit.
+            state_dict = torch.load(path, map_location="cpu", weights_only=True) if rank == 0 else None
+            with deepspeed.zero.GatheredParameters(list(model_to_load.parameters()), modifier_rank=0):
+                if rank == 0:
+                    model_to_load.load_state_dict(state_dict)
         else:
-            # If a vanilla HF model.
-            model.load_state_dict(state_dict)
-        logger.info(f"{rank=}: Loaded checkpoint from {path}")
+            state_dict = torch.load(path, map_location=dev, weights_only=True)
+            model_to_load.load_state_dict(state_dict)
+        if rank == 0:
+            logger.info(f"{rank=}: Loaded checkpoint from {path}")
 
     if not throw_on_error:
         try:
