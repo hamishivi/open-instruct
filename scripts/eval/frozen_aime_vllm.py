@@ -39,7 +39,10 @@ class EvalConfig:
     seed: int = 1
     tensor_parallel_size: int = 1
     gpu_memory_utilization: float = 0.85
-    max_num_seqs: int = 256
+    # vLLM 0.19's Qwen3 profile path fails in GEMM initialization when this is
+    # reduced enough for the scheduler to choose an 8,192-token batch. The
+    # default 512-sequence capacity selects the known-good 16,384-token profile.
+    max_num_seqs: int = 512
     enable_prefix_caching: bool = True
 
 
