@@ -15,6 +15,7 @@ import numpy as np
 from datasets import load_dataset
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
+from vllm.inputs import TokensPrompt
 
 from open_instruct import grpo_utils, logger_utils
 from open_instruct.ground_truth_utils import FinalBoxedMathVerifier
@@ -140,9 +141,13 @@ def evaluate(config: EvalConfig) -> dict[str, object]:
         max_model_len=config.max_model_len,
         enable_prefix_caching=config.enable_prefix_caching,
         generation_config="vllm",
+        enforce_eager=True,
     )
     started = time.perf_counter()
-    outputs = llm.generate(prompt_token_ids=flat_prompts, sampling_params=sampling_params)
+    outputs = llm.generate(
+        [TokensPrompt(prompt_token_ids=prompt_token_ids) for prompt_token_ids in flat_prompts],
+        sampling_params,
+    )
     generation_seconds = time.perf_counter() - started
     if len(outputs) != len(metadata):
         raise RuntimeError(f"vLLM returned {len(outputs)} requests for {len(metadata)} inputs")
