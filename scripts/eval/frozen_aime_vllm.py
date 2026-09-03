@@ -39,6 +39,7 @@ class EvalConfig:
     seed: int = 1
     tensor_parallel_size: int = 1
     gpu_memory_utilization: float = 0.85
+    max_num_seqs: int = 256
     enable_prefix_caching: bool = True
 
 
@@ -58,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=EvalConfig.seed)
     parser.add_argument("--tensor_parallel_size", type=int, default=EvalConfig.tensor_parallel_size)
     parser.add_argument("--gpu_memory_utilization", type=float, default=EvalConfig.gpu_memory_utilization)
+    parser.add_argument("--max_num_seqs", type=int, default=EvalConfig.max_num_seqs)
     parser.add_argument(
         "--disable_prefix_caching",
         action="store_false",
@@ -79,6 +81,8 @@ def validate_config(config: EvalConfig) -> None:
         raise ValueError("temperature must be positive for stochastic pass@k evaluation")
     if not 0 < config.top_p <= 1:
         raise ValueError("top_p must be in (0, 1]")
+    if config.max_num_seqs < 1:
+        raise ValueError("max_num_seqs must be at least 1")
 
 
 def evaluate(config: EvalConfig) -> dict[str, object]:
@@ -139,6 +143,7 @@ def evaluate(config: EvalConfig) -> dict[str, object]:
         tensor_parallel_size=config.tensor_parallel_size,
         gpu_memory_utilization=config.gpu_memory_utilization,
         max_model_len=config.max_model_len,
+        max_num_seqs=config.max_num_seqs,
         enable_prefix_caching=config.enable_prefix_caching,
         generation_config="vllm",
     )
