@@ -2586,9 +2586,10 @@ def build_generative_value_prompt(
     """Build the gen-value prompt.
 
     Mirrors the template in Figure 3 of GenAC (arXiv:2604.10701): the critic sees the
-    original ``problem`` followed by a ``partial_response`` and is asked to reason
-    briefly before emitting ``<answer>X</answer>`` with X in [score_min, score_max].
-    Generation stops on ``</answer>``; scores are later rescaled to [0, 1].
+    original ``problem`` followed by a ``partial_response`` and must produce a visible
+    value-focused rationale before emitting ``<answer>X</answer>`` with X in
+    [score_min, score_max]. Generation stops on ``</answer>``; scores are later
+    rescaled to [0, 1].
     """
     conditioning_text = ""
     if conditioning == "gt" and ground_truth:
@@ -2637,17 +2638,24 @@ def build_generative_value_prompt(
 
     # Instruction template mirrors Figure 3 of GenAC (arXiv:2604.10701), including
     # policy conditioning and the finite response horizon that defines the value function.
+    # Requiring the rationale *before* the score is important: ending the prompt with
+    # ``Answer:`` allowed a critic to satisfy the parser with only ``<answer>N</answer>``
+    # and bypass the sequential computation that motivates a generative value model.
     instruction = (
         "You will be given a problem and a partial response. Your job is to predict the "
         f"expected value of the response on an integer scale from {int(score_min)} (very "
         f"unlikely to succeed) to {int(score_max)} ({int(score_max)} most likely).\n"
         "\n"
         "Instructions:\n"
-        "1. Evaluate the difficulty of the problem.\n"
-        "2. Skim through the partial solution and detect any progress, error, or confusion.\n"
-        "3. Analyze the probability of success if the model finishes the solution.\n"
-        f"4. Output your final answer as an integer between {int(score_min)} and "
-        f"{int(score_max)} inclusive, wrapped in <answer>...</answer>."
+        "1. Evaluate the mathematical difficulty and identify what a correct solution requires.\n"
+        "2. Inspect the partial solution for concrete progress and check its claims. Identify the "
+        "first substantive error or unsupported step, if one exists.\n"
+        "3. Explain what remains to be done and whether the active actor can recover and finish "
+        "within the remaining token budget.\n"
+        "4. Write a concise, visible rationale that supports your probability estimate. You must "
+        "reason before scoring; a score-only response is invalid.\n"
+        f"5. On the final line, output one integer between {int(score_min)} and "
+        f"{int(score_max)} inclusive, wrapped in <answer>...</answer>. Output nothing after it."
     )
     problem_block = f"Problem:\n{problem}\n\n" if problem else ""
     conditioning_block = f"{conditioning_text}\n" if conditioning_text else ""
@@ -2656,7 +2664,8 @@ def build_generative_value_prompt(
         f"{state_context_block}"
         f"{problem_block}"
         f"{conditioning_block}"
-        f"Partial response:\n<rollout>{partial_response}</rollout>\nAnswer:"
+        f"Partial response:\n<rollout>{partial_response}</rollout>\n"
+        "Value analysis (required before the score):"
     )
 
 

@@ -749,7 +749,9 @@ class TestScoreParsing(unittest.TestCase):
         p = build_generative_value_prompt("partial", conditioning="gt", ground_truth="42")
         self.assertIn("The correct answer is 42", p)
         self.assertIn("<rollout>", p)
-        self.assertIn("Answer:", p)
+        self.assertIn("You must reason before scoring; a score-only response is invalid", p)
+        self.assertIn("Value analysis (required before the score):", p)
+        self.assertNotIn("\nAnswer:", p)
 
     def test_prompt_has_actor_and_remaining_budget_context(self):
         p = build_generative_value_prompt(

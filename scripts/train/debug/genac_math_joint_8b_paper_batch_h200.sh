@@ -42,8 +42,8 @@ export USE_VLLM_LOGPROBS="${USE_VLLM_LOGPROBS:-false}"
 export ACTIVE_SAMPLING="${ACTIVE_SAMPLING:-false}"
 export FILTER_ZERO_STD_SAMPLES="${FILTER_ZERO_STD_SAMPLES:-false}"
 
-# An 8B critic is initialized separately. Frozen-policy warmup adapts that
-# critic to the 8B actor before the requested joint-training phase.
+# A separately initialized reasoning critic is required. Frozen-policy warmup
+# adapts that critic to the 8B actor before the requested joint-training phase.
 export VALUE_WARMUP_STEPS="${VALUE_WARMUP_STEPS:-100}"
 export JOINT_TRAINING_STEPS="${JOINT_TRAINING_STEPS:-200}"
 export DEEPSPEED_OFFLOAD_OPTIMIZER="${DEEPSPEED_OFFLOAD_OPTIMIZER:-true}"
